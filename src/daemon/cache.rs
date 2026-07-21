@@ -85,6 +85,22 @@ pub struct DbCache {
     shard_routes: ShardRouteCache,
     /// 优化 B：mtime 门控的热连接池（`query.rs` 热路径查询用）。
     hot_conns: HotConnPool,
+    /// FIX-MEDIUM：全局作废世代号。`invalidate_shard` 每次调用都递增一次；
+    /// `put_shard_schema` 回写前比对调用方传入的《判定时刻》世代号与当前
+    /// 世代号，不等就放弃写入。用于堵住"扫描 sqlite_master 的窗口期内，
+    /// 另一个并发 RPC 对同一 rel_key（甚至任意 rel_key，见下方 `invalidate_shard`
+    /// 文档的全局粒度权衡）发起 invalidate，随后过期的回写把已作废的路由
+    /// 悄悄复活"这个竞态。`DbCache` 经 `Arc` 被 `server.rs` 每连接
+    /// `tokio::spawn` 共享，这不是理论场景。
+    ///
+    /// LOW-1（"函数内部窗口"加固）：单纯把这个世代号做成 `AtomicU64` 只解决
+    /// 了"调用间"竞态（`find_msg_shards` 判定 Stale 到发起扫描之间），没解决
+    /// "函数内部窗口"——`put_shard_schema` 曾经是"先单独 `load` 世代号、再
+    /// 单独一次 `shard_routes.lock().insert()`"两步分离，中间仍可能被
+    /// `invalidate_shard` 插入。现在 `put_shard_schema` 与 `invalidate_shard`
+    /// 都把"读/改这个世代号"移进了 `shard_routes` 那把锁的临界区内部完成，
+    /// 用锁本身把两者串行化，不再有独立的两步窗口，见两个方法各自的文档。
+    route_generation: AtomicU64,
 }
 
 impl DbCache {
@@ -109,6 +125,7 @@ impl DbCache {
             inner: Arc::new(Mutex::new(HashMap::new())),
             shard_routes: ShardRouteCache::new(),
             hot_conns: HotConnPool::new(),
+            route_generation: AtomicU64::new(0),
         };
 
         cache.load_persistent().await;
@@ -231,6 +248,12 @@ impl DbCache {
     /// 注意：不检查 `all_keys` 是否持有该 rel_key 的解密密钥——即使密钥未知，
     /// 也照常返回 mtime；密钥缺失由调用方后续的 `get_with_mode` 走既有的
     /// `None => continue` 路径处理，不影响这里的"是否可跳过"判断。
+    ///
+    /// FIX 2 后，`query.rs::find_msg_shards` 的热路径改用
+    /// [`SourceSnapshot::freshness_secs`]（复用同一份已读取的快照，不再
+    /// 单独 stat），这个方法在非 test 构建下因此只剩下文档 / 兼容意义，
+    /// 仍保留给未来可能的独立调用方，并继续被下方单元测试直接验证。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn source_freshness_secs(&self, rel_key: &str) -> Option<i64> {
         let db_path = self.db_dir.join(
             rel_key
@@ -471,7 +494,13 @@ impl DbCache {
     /// 与 [`Self::source_freshness_secs`] 共享同一套"WeChat 写消息必然 bump
     /// mtime"的事实基础，只是这里保留分量、提高精度到纳秒，额外带上文件
     /// 长度（正确性加固 1/3，见 [`SourceSnapshot`] 文档），服务不同调用方。
-    fn source_snapshot(&self, rel_key: &str) -> SourceSnapshot {
+    ///
+    /// `pub(crate)`（FIX 2）：`query.rs::find_msg_shards` 需要在每个分片的
+    /// 循环体顶部主动读一次快照，再把同一份值透传给 skip 判定 / 路由
+    /// lookup / 热连接门控三处（见 [`Self::shard_route_lookup_with_snapshot`]
+    /// / [`Self::hot_conn_handle_with_snapshot`]），消除原本三处各自独立
+    /// `fs::metadata` 造成的重复系统调用。
+    pub(crate) fn source_snapshot(&self, rel_key: &str) -> SourceSnapshot {
         let db_path = self.db_dir.join(
             rel_key
                 .replace('\\', std::path::MAIN_SEPARATOR_STR)
@@ -487,8 +516,29 @@ impl DbCache {
     /// 文件"最近太活跃"（未过新鲜度 slack，见 [`SourceSnapshot::trusted_as_of`]）
     /// 都返回 `Stale`（附带《判定这一刻》的快照，调用方重建后必须原样传回，
     /// 不能用重建完成后重新读的快照，见 [`Self::put_shard_schema`] 文档）。
+    ///
+    /// 内部现读一份新快照再委托给 [`Self::shard_route_lookup_with_snapshot`]；
+    /// 保留这个签名给独立调用方（不在 `find_msg_shards` 那种"一次快照喂三处"
+    /// 的循环里、无快照可复用的场景）。FIX 2 后 `find_msg_shards` 改走
+    /// `_with_snapshot` 变体，生产代码暂时没有其它调用点，非 test 构建下
+    /// 因此是 dead_code；继续被下方单元测试直接验证，保留给未来的独立
+    /// 调用方。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn shard_route_lookup(&self, rel_key: &str) -> ShardRouteLookup {
         let snapshot = self.source_snapshot(rel_key);
+        self.shard_route_lookup_with_snapshot(rel_key, snapshot)
+    }
+
+    /// FIX 2：[`Self::shard_route_lookup`] 的去重 I/O 版本——判定逻辑完全
+    /// 相同，只是快照来源从"内部现读"换成"调用方传入"，供 `find_msg_shards`
+    /// 在循环体顶部只读一次 [`SourceSnapshot`] 后，同一份值分别喂给这里、
+    /// skip 判定（[`SourceSnapshot::freshness_secs`]）和
+    /// [`Self::hot_conn_handle_with_snapshot`]。
+    pub(crate) fn shard_route_lookup_with_snapshot(
+        &self,
+        rel_key: &str,
+        snapshot: SourceSnapshot,
+    ) -> ShardRouteLookup {
         let now = now_nanos();
         match self.shard_routes.lock().get(rel_key).cloned() {
             Some(e) if e.snapshot == snapshot && snapshot.trusted_as_of(now) => {
@@ -513,15 +563,73 @@ impl DbCache {
     /// 标签是新的、但缓存内容只反映到重建开始那一刻"的不一致，下次查询会
     /// 因为快照表面匹配而误判为 Fresh、读到过期 schema——这是本模块唯一不
     /// 允许出现的"悄悄查错数据"方向。
+    ///
+    /// # FIX-MEDIUM（TOCTOU：invalidate 与回写的竞态）
+    /// `expected_generation` 必须是《发起判定那一刻》读到的 [`Self::route_generation`]
+    /// （与 `snapshot` 同一时刻读取，见 `query.rs::find_msg_shards` 的调用
+    /// 处）。写入前会与《此刻》的当前世代号比较：不相等就说明扫描
+    /// `sqlite_master` 这段窗口期内，有另一个并发调用（同一 `rel_key` 或
+    /// 任意其它 `rel_key`，见 [`Self::invalidate_shard`] 的全局粒度说明）
+    /// 触发过 `invalidate_shard`——此时必须放弃这次回写，宁可让下一轮因为
+    /// 路由缓存 miss 重新扫一遍，也不能用一份可能已经过期的 schema 悄悄
+    /// 复活刚被作废的路由（复活后该分片通常已经安静过 slack，下一轮又会
+    /// 被判 Fresh，不会自愈）。
+    ///
+    /// # LOW-1（"函数内部窗口"：把世代号校验也纳入 `shard_routes` 锁）
+    /// 旧实现是"先 `self.route_generation.load()`，再单独一次
+    /// `self.shard_routes.lock().insert()`"——两次独立加锁，中间存在一个
+    /// 窗口：若 `invalidate_shard`（同一 `rel_key`）恰好落在《load 已经通过》
+    /// 和《insert 尚未执行》之间，本次 load 时世代号确实还没变，但 insert
+    /// 执行时刻已经晚于那次 invalidate，等价于把一条《本该被作废》的路由
+    /// 又悄悄写回缓存——这是上面 FIX-MEDIUM 想堵的同一竞态在"函数内部"的
+    /// 变体，两次独立加锁本身留出了这个窗口。
+    ///
+    /// 现在改为：先拿到 `shard_routes` 那把锁（`guard`），**在持锁期间**才去
+    /// `load` 世代号并比较，通过才 `insert`，全程只持这一把锁、不释放不
+    /// 重新获取。[`Self::invalidate_shard`] 同样把"移除路由条目"与"世代号
+    /// 自增"放进了同一把 `shard_routes` 锁的临界区（见其文档）。于是 put 与
+    /// invalidate 在 `shard_routes` 这把锁上严格互斥、串行执行，只有两种
+    /// 可能的先后顺序，且都不会遗留"被复活的过期条目"：
+    /// - put 先拿到锁：此时 invalidate 还没发生，世代号仍等于
+    ///   `expected_generation`，校验通过、正常 insert；invalidate 随后拿到
+    ///   锁，把这条刚写入的记录 `remove` 掉、世代号自增——下一次 lookup 会
+    ///   因为 miss 判 Stale，不会读到过期数据。
+    /// - invalidate 先拿到锁：世代号已经自增；put 随后拿到锁、在锁内
+    ///   `load` 到的已经是新世代号，与调用方持有的旧 `expected_generation`
+    ///   不相等，直接放弃写入，不会把作废前的旧数据写回。
+    ///
+    /// 两把子锁（`shard_routes` 用的 `std::sync::Mutex`、`route_generation`
+    /// 用的 `AtomicU64`）本身没有合并——这里说的"同一把锁"专指
+    /// `shard_routes` 那把 `Mutex`：世代号的读/改被移进了这把锁的临界区
+    /// 内部执行，而不是给 `AtomicU64` 自己加锁，因此不引入除
+    /// `shard_routes` 之外的新锁、不产生新的跨锁死锁风险。世代号的
+    /// load/fetch_add 全程使用 `SeqCst` 且都发生在同一把锁的临界区内，
+    /// 因此这里的顺序保证同时来自锁的互斥语义与 `SeqCst` 的内存序，两者
+    /// 一致、不冲突。
     pub fn put_shard_schema(
         &self,
         rel_key: String,
         snapshot: SourceSnapshot,
         msg_tables: HashSet<String>,
+        expected_generation: u64,
     ) {
-        self.shard_routes
-            .lock()
-            .insert(rel_key, ShardSchemaEntry { snapshot, msg_tables });
+        // 先持锁，世代号的读取和校验都必须在这把锁的临界区内部完成——
+        // 这是 LOW-1 修复的关键：不能像旧实现那样在锁外单独 load。
+        let mut guard = self.shard_routes.lock();
+        if self.route_generation.load(Ordering::SeqCst) != expected_generation {
+            // 世代号已经变化：期间发生过至少一次 invalidate_shard，这份
+            // 回写可能反映的是作废之前的旧状态，直接丢弃，不写入。
+            return;
+        }
+        guard.insert(rel_key, ShardSchemaEntry { snapshot, msg_tables });
+    }
+
+    /// FIX-MEDIUM：读取当前作废世代号（同步、非阻塞，纯原子读）。调用方
+    /// （`query.rs::find_msg_shards`）应在"决定重建、真正发起 `spawn_blocking`
+    /// 扫描之前"读一次并保留，扫描完成后连同结果一起交给
+    /// [`Self::put_shard_schema`]。
+    pub(crate) fn route_generation(&self) -> u64 {
+        self.route_generation.load(Ordering::SeqCst)
     }
 
     /// 优化 B：借这一次查询拿到（或复用）某个分片的常驻热连接句柄。
@@ -529,9 +637,25 @@ impl DbCache {
     /// 检查，`source_snapshot` 只做 `fs::metadata`，`hot_conns.slot` 只是
     /// 内存 HashMap 操作）——真正的阻塞 I/O（可能的重建）延后到
     /// [`HotConnHandle::with`] 内部，调用方应在 `spawn_blocking` 里调用它。
+    ///
+    /// 内部现读一份新快照再委托给 [`Self::hot_conn_handle_with_snapshot`]；
+    /// 保留这个签名给所有不经过 `find_msg_shards` 循环、手上没有现成快照的
+    /// 独立调用方（`q_history` / `q_new_messages` 等直接按 `shard.rel_key`
+    /// 要热连接的场景）。
     pub fn hot_conn_handle(&self, rel_key: &str) -> Result<HotConnHandle> {
-        let conn_params = self.resolve_conn_params(rel_key)?;
         let snapshot = self.source_snapshot(rel_key);
+        self.hot_conn_handle_with_snapshot(rel_key, snapshot)
+    }
+
+    /// FIX 2：[`Self::hot_conn_handle`] 的去重 I/O 版本，语义完全相同，只是
+    /// 快照来源从"内部现读"换成"调用方传入"——用法同
+    /// [`Self::shard_route_lookup_with_snapshot`]。
+    pub(crate) fn hot_conn_handle_with_snapshot(
+        &self,
+        rel_key: &str,
+        snapshot: SourceSnapshot,
+    ) -> Result<HotConnHandle> {
+        let conn_params = self.resolve_conn_params(rel_key)?;
         let (slot, rebuild_count) = self.hot_conns.slot(rel_key);
         Ok(HotConnHandle {
             slot,
@@ -539,6 +663,98 @@ impl DbCache {
             snapshot,
             rebuild_count,
         })
+    }
+
+    /// FIX 1：反查"路由缓存里，哪些分片当时记录的 `msg_tables` 包含这个
+    /// 表名"。O(路由缓存条目数)，纯内存只读遍历（`ShardRouteCache` 内部是
+    /// `std::sync::Mutex<HashMap<..>>`，临界区不跨 `.await`），不做任何
+    /// I/O。会话 → 分片的映射本身是稳定的（一个会话的 `Msg_<md5>` 表只会
+    /// 出现在它当初被建表的那一个分片里），只要该分片此前被
+    /// `find_msg_shards` 真正扫描过、写进过路由缓存，这里就能查到；从未
+    /// 被扫描过的分片（典型是全新会话对应的分片）查不到，返回空 —— 调用方
+    /// （见 [`Self::invalidate_shard`] 的用法）不需要对这种情况做任何特殊
+    /// 处理：新建表必然 bump 该分片的 mtime/len，`shard_route_lookup` 的
+    /// 快照比对会自然判 Stale、触发重建，不需要这里额外插手。
+    pub fn route_shard_for_table(&self, table_name: &str) -> Vec<String> {
+        self.shard_routes.rel_keys_containing(table_name)
+    }
+
+    /// FIX 1（核心·焊死"mtime 滞后漏消息"）：强制作废某个分片的路由缓存
+    /// 条目 + 热连接，逼它下次被访问时现场重新 `open()`（`ConnParams::open`
+    /// 内部 `File::open` + 重新扫 WAL 帧头建索引，直接读当前真实字节，不
+    /// 依赖任何 mtime/len 比较）。
+    ///
+    /// 用途：`q_new_messages` 里 `session.db` 是每轮新读、内容可靠的真相
+    /// 源，一旦确认某个会话 `changed`（`session.db` 显示它有新消息），就
+    /// 应该在进入这个会话的消息查询前调用本方法作废其承载分片——绕开
+    /// "两个 mtime 门控缓存靠跨进程读到的文件 mtime 判新鲜，Windows/NTFS
+    /// 上可能滞后于实际写入"这个窗口，不依赖任何时间戳比较，从而不会有
+    /// 假阳性。
+    ///
+    /// 线程安全，走两个子缓存各自既有的锁范式；只在这次调用内做纯内存
+    /// HashMap 操作，不跨越任何 `.await`、不做阻塞 I/O。只影响下一次访问，
+    /// 找不到对应条目（miss）时两个子操作都是安全的空操作。
+    ///
+    /// FIX-MEDIUM：额外递增全局 [`Self::route_generation`]（`SeqCst`，
+    /// 无条件——即便两个子操作都是 miss 也照样递增，调用方无法区分，也不
+    /// 需要区分：递增本身零成本，多余的世代号跳变顶多让个别在飞回写多余地
+    /// 被丢弃一次，不影响正确性）。刻意选用**全局**而非按 `rel_key` 分别计数
+    /// ——任何一次 `invalidate_shard`（不论作用于哪个 `rel_key`）都会让当前
+    /// 所有"正在扫描、尚未回写"的 [`Self::put_shard_schema`] 调用作废，宁可
+    /// 换来一些不相关分片的多余重扫，也不实现更复杂的按 key 世代号（那样
+    /// 才能精确到"只有同一 rel_key 的并发 invalidate 才丢弃回写"）。这个
+    /// 取舍只产生性能代价（多解密/多重扫几次），不产生正确性代价（不会
+    /// 漏读、不会复活已作废的路由）。
+    ///
+    /// # LOW-1（"函数内部窗口"：路由移除与世代号自增现在共享同一把锁）
+    /// 路由条目的 `remove` 与世代号的 `fetch_add` 现在放在 `shard_routes`
+    /// 那把锁的**同一个**临界区内部完成（[`ShardRouteCache::remove_and_bump_generation`]），
+    /// 不再是"remove 内部自己加锁释放锁，外面再单独 fetch_add"这种两步
+    /// 分离的写法。这与 [`Self::put_shard_schema`] 把"世代号校验"也挪进
+    /// 同一把锁的临界区是同一次修复的两面：`shard_routes` 这把锁把 put 与
+    /// invalidate 严格串行化，谁先拿到锁谁的效果先生效，不再存在"remove
+    /// 已释放锁、fetch_add 还没执行"这种独立子窗口。
+    ///
+    /// # LOW-2（已知、故意、有界的不变量：路由失效与热连接逐出非原子）
+    /// 清路由（上面这部分，已纳入 `shard_routes` 锁）与逐出热连接
+    /// （`self.hot_conns.evict(rel_key)`）依然是**两次独立加锁**——
+    /// `shard_routes` 用的 `std::sync::Mutex<HashMap<..>>` 和 `hot_conns`
+    /// 用的 `std::sync::Mutex<HashMap<String, HotShardSlot>>` 是两把完全独立
+    /// 的锁，这里故意不合并成一次跨锁的原子操作。
+    ///
+    /// 理论窗口：路由缓存已经标记为 Stale 之后、热连接实际被逐出之前的这
+    /// 一小段间隙里，如果有另一个并发查询恰好落在这个间隙、并且它读到的
+    /// 《当前快照》与热连接槽位里缓存的旧快照逐字段相等（见
+    /// [`HotConnHandle::with`] 的 `stale` 判定），理论上可能复用到一个
+    /// "应该被作废但还没来得及被逐出"的旧连接。
+    ///
+    /// 这个窗口不是本轮新引入的——它是优化 A（路由缓存）/ 优化 B（热连接池）
+    /// 这两个独立 mtime 门控缓存的既有设计特性，从它们被引入的第一天起就
+    /// 存在。触发它需要同时满足两个苛刻条件：(1) 源文件的跨进程 mtime 可见
+    /// 性持续滞后超过 [`HOT_CACHE_FRESHNESS_SLACK_NANOS`]（600 秒）——否则
+    /// [`SourceSnapshot::trusted_as_of`] 根本不允许把旧快照当作可信，直接
+    /// 强制重建；且 (2) 另一个查询精确撞在"路由已清、热连接未逐出"这几条
+    /// 指令之间的极窄窗口。两个条件叠加发生的概率极低。
+    ///
+    /// 不合并成跨锁原子操作的理由：`shard_routes` 和 `hot_conns` 是两把
+    /// 完全独立、服务不同调用路径的锁（前者被 `shard_route_lookup` /
+    /// `put_shard_schema` 用，后者被 `hot_conn_handle` / `HotConnHandle::with`
+    /// 用），把它们合并成"先拿 A 锁再拿 B 锁"的固定顺序，会给这两把锁引入
+    /// 此前不存在的锁顺序依赖——一旦未来任何新代码路径以相反顺序获取这两把
+    /// 锁（哪怕只是无意为之），就会产生死锁风险。为了堵一个概率极低、且已
+    /// 有其它机制兜底的窗口，去承担真实的死锁风险，得不偿失。
+    ///
+    /// 最终正确性的兜底不是这里的原子性，而是 [`HotConnHandle::with`] 每次
+    /// 使用热连接前都会用《本次查询发起时刻》读到的实时快照，与槽位里缓存
+    /// 的快照做逐字段相等比较，并且同样要求这份快照已经 `trusted_as_of`——
+    /// 双门控叠加之后，这个理论窗口不会导致"读到错误内容被上层当作正确结果
+    /// 使用"，最坏情况也只是多复用一次很快又会被下一次查询判定为 Stale 的
+    /// 连接。把这一条视为"已知、故意、有界"的不变量：后来者不应该因为看到
+    /// 两次独立加锁就误判为遗漏的 bug 去合并它们。
+    pub fn invalidate_shard(&self, rel_key: &str) {
+        self.shard_routes
+            .remove_and_bump_generation(rel_key, &self.route_generation);
+        self.hot_conns.evict(rel_key);
     }
 }
 
@@ -585,24 +801,41 @@ impl ConnParams {
 // 滞后窗口更敏感，必须单独加固。
 
 /// 源文件《某一时刻》的新鲜度快照：db / wal 各自的 mtime（纳秒精度）与文件
-/// 长度（字节）。[`ShardSchemaEntry`]（优化 A）与 [`HotConn`]（优化 B）都
-/// 存这个类型、用同一套 [`Self::trusted_as_of`] 判定逻辑，避免两处独立
-/// 实现同一套"要不要信任缓存"规则、后续改动漏改一处。
+/// 长度（字节），以及 `wal_present` 显式标记 WAL 文件当时是否存在。
+/// [`ShardSchemaEntry`]（优化 A）与 [`HotConn`]（优化 B）都存这个类型、用
+/// 同一套 [`Self::trusted_as_of`] 判定逻辑，避免两处独立实现同一套"要不要
+/// 信任缓存"规则、后续改动漏改一处。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SourceSnapshot {
     db_mtime: u64,
     db_len: u64,
     wal_mtime: u64,
     wal_len: u64,
+    /// FIX 3：显式区分"WAL 文件当时存在"与"WAL 文件当时不存在"。没有这个
+    /// 标志，`wal_mtime == 0` 无法区分"合法的没有 WAL 文件"（已 checkpoint
+    /// 的休眠分片，正常状态）与"WAL 文件存在但 metadata 读取失败"（真正的
+    /// 未知），后者才应该被 [`Self::has_unknown_component`] 拒绝信任。纳入
+    /// `#[derive(PartialEq)]` 的相等比较后，"WAL 从不存在变存在"（微信刚
+    /// 开始写这个分片）天然让快照判定为不同，强制失效重建——不需要额外的
+    /// 特判代码。
+    wal_present: bool,
 }
 
 impl SourceSnapshot {
-    /// 读取 `db_path` / `wal_path`（若存在）当前的 mtime + 长度。wal 不存在
-    /// 时两个分量都固定为 0（与"metadata 失败"共用 0，见
-    /// [`Self::has_unknown_component`] 的说明——这是刻意选择，不是疏漏）。
+    /// 读取 `db_path` / `wal_path`（若存在）当前的 mtime + 长度，并记录 WAL
+    /// 是否存在。三态区分（FIX 3）：
+    /// - WAL 不存在 → `wal_present=false`，mtime/len 固定为 0，是合法的
+    ///   "已 checkpoint 休眠分片"状态，[`Self::has_unknown_component`] 不再
+    ///   因此拒绝信任；
+    /// - WAL 存在且 metadata 读取成功 → `wal_present=true`，使用真实
+    ///   mtime/len；
+    /// - WAL 存在但 metadata 读取失败 → `wal_present=true`、mtime/len 回退
+    ///   为 0（`metadata_mtime_len` 的既有失败语义）——这才是真正的"未知"，
+    ///   由 [`Self::has_unknown_component`] 识别并拒绝信任。
     fn capture(db_path: &Path, wal_path: &Path) -> Self {
         let (db_mtime, db_len) = metadata_mtime_len(db_path);
-        let (wal_mtime, wal_len) = if wal_path.exists() {
+        let wal_present = wal_path.exists();
+        let (wal_mtime, wal_len) = if wal_present {
             metadata_mtime_len(wal_path)
         } else {
             (0, 0)
@@ -612,23 +845,38 @@ impl SourceSnapshot {
             db_len,
             wal_mtime,
             wal_len,
+            wal_present,
         }
     }
 
-    /// 加固点 3（MEDIUM）：db_mtime 或 wal_mtime 任一为 0，代表"metadata
-    /// 读取失败"或"文件缺失"——`mtime_nanos`/`metadata_mtime_len` 用
-    /// `unwrap_or(0)` 把这两种情况和"合法的 0 时间戳"合并成同一个值,
-    /// 不能再被当作可信的相等比较对象参与判 Fresh，否则"连续两次读取失败"
-    /// 会被 0 == 0 误判为"没变"，从而复用一份可能早已过期的路由表/连接。
+    /// 加固点 3（MEDIUM，FIX 3 后语义收紧）：只有以下两种情况才算"未知"：
+    /// - `db_mtime == 0`：主库 metadata 读取失败或文件缺失；
+    /// - `wal_present == true && wal_mtime == 0`：WAL 文件存在，但那一刻
+    ///   metadata 读取失败（`unwrap_or(0)` 回退）。
     ///
-    /// wal 缺失（"没有 WAL 文件"）同样落在这条规则里——`Self::capture` 对
-    /// "文件不存在" 和 "metadata 出错" 统一回退成 0，两者在这里无法区分,
-    /// 因此没有 WAL 文件的分片也永远不会被判 Fresh。这是刻意的保守选择：
-    /// 代价只是这类分片少了一部分缓存命中率，换来的是"任何不确定一律重建"
-    /// 这条线绝不失守——与既有 `source_freshness_secs` 对 0 显式当"未知,
-    /// 不可跳过"的处理方式对称。
+    /// `wal_present == false`（WAL 文件当时确实不存在，已 checkpoint 的
+    /// 休眠分片）不再落入这条规则——这是合法、可信的已知状态，允许参与
+    /// Fresh 判定。这是 FIX 3 相对旧版的唯一语义变化：旧版把"WAL 缺失"和
+    /// "WAL 存在但读取失败"用同一个哨兵值 0 强行合并成"一律未知"，误杀了
+    /// 大量已 checkpoint、不会再变的休眠分片，让它们每轮都被迫重建/重开
+    /// 连接。
     fn has_unknown_component(&self) -> bool {
-        self.db_mtime == 0 || self.wal_mtime == 0
+        self.db_mtime == 0 || (self.wal_present && self.wal_mtime == 0)
+    }
+
+    /// FIX 2：从这份快照推导 `shard_skippable` 所需的"较新 mtime，秒精度"，
+    /// 语义与既有 [`DbCache::source_freshness_secs`] 完全一致（`db_mtime
+    /// == 0` 代表主库不可读，返回 `None`；`wal_mtime`——不论是"WAL 缺失"
+    /// 还是"WAL 存在但读取失败"，两者这里都固定为 0——仍然照常参与 `max`
+    /// 取较新值，不像 [`Self::has_unknown_component`] 那样对 wal 分量单独
+    /// 判"未知"）。这是 `shard_skippable` 24 小时宽松 slack 路径的既有
+    /// 语义，与优化 A/B 的严格 600 秒 slack 规则刻意不同、不能混用，见
+    /// 模块顶部"正确性加固"说明。
+    pub(crate) fn freshness_secs(&self) -> Option<i64> {
+        if self.db_mtime == 0 {
+            return None;
+        }
+        Some((self.db_mtime.max(self.wal_mtime) / 1_000_000_000) as i64)
     }
 
     /// 加固点 2（HIGH，核心兜底）：只有当这份快照里 db / wal 最新的 mtime
@@ -710,36 +958,45 @@ fn now_nanos() -> u64 {
 mod snapshot_tests {
     use super::*;
 
-    fn snap(db_mtime: u64, db_len: u64, wal_mtime: u64, wal_len: u64) -> SourceSnapshot {
+    fn snap(db_mtime: u64, db_len: u64, wal_mtime: u64, wal_len: u64, wal_present: bool) -> SourceSnapshot {
         SourceSnapshot {
             db_mtime,
             db_len,
             wal_mtime,
             wal_len,
+            wal_present,
         }
     }
 
     #[test]
     fn zero_db_mtime_is_unknown() {
-        assert!(snap(0, 10, 1_000_000_000, 5).has_unknown_component());
+        assert!(snap(0, 10, 1_000_000_000, 5, true).has_unknown_component());
     }
 
+    /// FIX 3：WAL 存在但 metadata 读取失败（`wal_present=true` 却
+    /// `wal_mtime=0`）——这才是真正的"未知"，必须拒绝信任。
     #[test]
-    fn zero_wal_mtime_is_unknown() {
-        // wal_mtime=0 既可能是"WAL 缺失"也可能是"metadata 读取失败"，两者
-        // 在这一层无法区分，统一按"未知"处理。
-        assert!(snap(1_000_000_000, 10, 0, 0).has_unknown_component());
+    fn wal_present_but_zero_mtime_is_unknown() {
+        assert!(snap(1_000_000_000, 10, 0, 0, true).has_unknown_component());
+    }
+
+    /// FIX 3（核心语义变化）：WAL 文件当时确实不存在（`wal_present=false`）
+    /// 是合法的已 checkpoint 休眠分片状态，不再被当作"未知"——与上一个测试
+    /// 唯一的区别就是 `wal_present`，用来证明这个标志确实在起区分作用。
+    #[test]
+    fn wal_absent_is_known() {
+        assert!(!snap(1_000_000_000, 10, 0, 0, false).has_unknown_component());
     }
 
     #[test]
     fn nonzero_mtimes_are_known() {
-        assert!(!snap(1_000_000_000, 10, 2_000_000_000, 5).has_unknown_component());
+        assert!(!snap(1_000_000_000, 10, 2_000_000_000, 5, true).has_unknown_component());
     }
 
     #[test]
     fn unknown_component_never_trusted_regardless_of_age() {
         // db_mtime=0（未知）时，即便 wal 那部分"看起来"很旧，也绝不能信任。
-        let s = snap(0, 10, 2_000_000_000, 5);
+        let s = snap(0, 10, 2_000_000_000, 5, true);
         let far_future_now = 10 * HOT_CACHE_FRESHNESS_SLACK_NANOS;
         assert!(!s.trusted_as_of(far_future_now));
     }
@@ -747,7 +1004,7 @@ mod snapshot_tests {
     #[test]
     fn fresh_within_slack_is_not_trusted() {
         let newest = 1_000_000_000_000u64;
-        let s = snap(newest, 10, newest - 1, 5);
+        let s = snap(newest, 10, newest - 1, 5, true);
         // now 只比 newest 早了 (slack - 1) 纳秒的距离，仍落在窗口内。
         let now = newest + HOT_CACHE_FRESHNESS_SLACK_NANOS - 1;
         assert!(!s.trusted_as_of(now), "还没过满一个 slack 周期，不能信任");
@@ -756,15 +1013,26 @@ mod snapshot_tests {
     #[test]
     fn exactly_at_slack_boundary_is_trusted() {
         let newest = 1_000_000_000_000u64;
-        let s = snap(newest, 10, newest - 1, 5);
+        let s = snap(newest, 10, newest - 1, 5, true);
         let now = newest + HOT_CACHE_FRESHNESS_SLACK_NANOS; // 恰好等于 slack
         assert!(s.trusted_as_of(now), "age == slack 应该允许信任（>= 边界）");
+    }
+
+    /// FIX 3：无 WAL 的休眠分片（`wal_present=false`）一样能吃到"安静满一个
+    /// slack 周期即可信任"这条规则——不再被 `has_unknown_component` 提前
+    /// 拦下。
+    #[test]
+    fn dormant_shard_without_wal_is_trusted_beyond_slack() {
+        let newest = 1_000_000_000_000u64;
+        let s = snap(newest, 10, 0, 0, false);
+        let now = newest + HOT_CACHE_FRESHNESS_SLACK_NANOS;
+        assert!(s.trusted_as_of(now), "无 WAL 的休眠分片安静满一个 slack 周期后应该可信");
     }
 
     #[test]
     fn well_beyond_slack_is_trusted() {
         let newest = 1_000_000_000_000u64;
-        let s = snap(newest, 10, newest, 5);
+        let s = snap(newest, 10, newest, 5, true);
         let now = newest + HOT_CACHE_FRESHNESS_SLACK_NANOS * 10;
         assert!(s.trusted_as_of(now));
     }
@@ -774,16 +1042,49 @@ mod snapshot_tests {
         // mtime 比 now 还"新"（时钟回拨/偏斜）：饱和减法把 age 钳制为 0，
         // 必须当作"最新"处理，绝不能被判定为可信。
         let newest = 2_000_000_000_000u64;
-        let s = snap(newest, 10, newest - 1, 5);
+        let s = snap(newest, 10, newest - 1, 5, true);
         let now = 1_000_000_000_000u64; // 早于 newest
         assert!(!s.trusted_as_of(now));
     }
 
     #[test]
     fn different_len_makes_snapshot_unequal_even_with_same_mtime() {
-        let a = snap(1_000, 10, 2_000, 5);
-        let b = snap(1_000, 11, 2_000, 5);
+        let a = snap(1_000, 10, 2_000, 5, true);
+        let b = snap(1_000, 11, 2_000, 5, true);
         assert_ne!(a, b, "长度不同必须视为不同快照，即便 mtime 完全相同");
+    }
+
+    /// FIX 3（TOCTOU 关键点）：`wal_present` 从 `false`（WAL 不存在）变成
+    /// `true`（微信刚开始写这个分片），即便 mtime/len 数值部分因为都固定
+    /// 为 0 而"看起来相同"，两份快照也必须被判定为不同——否则"WAL 刚出现"
+    /// 这个关键事件会被漏检，误判为快照没变、继续信任旧缓存。
+    #[test]
+    fn wal_appearing_makes_snapshot_unequal_even_with_zeroed_mtime_len() {
+        let absent = snap(1_000, 10, 0, 0, false);
+        let present = snap(1_000, 10, 0, 0, true);
+        assert_ne!(
+            absent, present,
+            "wal_present 翻转必须让快照判定为不同，即便数值分量都还是 0"
+        );
+    }
+
+    #[test]
+    fn freshness_secs_none_when_db_mtime_zero() {
+        assert_eq!(snap(0, 10, 5_000_000_000, 5, true).freshness_secs(), None);
+    }
+
+    #[test]
+    fn freshness_secs_takes_newer_of_db_and_wal() {
+        // wal 比 db 新：应取 wal。
+        assert_eq!(
+            snap(1_000_000_000, 10, 5_000_000_000, 5, true).freshness_secs(),
+            Some(5)
+        );
+        // db 比 wal 新（或 wal 缺失/未知回退为 0）：应取 db。
+        assert_eq!(
+            snap(7_000_000_000, 10, 0, 0, false).freshness_secs(),
+            Some(7)
+        );
     }
 }
 
@@ -822,6 +1123,36 @@ impl ShardRouteCache {
         // poison-safe：某次持锁期间的无关 panic 不应该永久传染给后续所有
         // 查询（与 `vfs.rs` 的 `VFS_REGISTRY` 既定风格一致）。
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// FIX 1：反查哪些 rel_key 当时记录的 `msg_tables` 里含有 `table_name`。
+    /// O(条目数) 线性扫描——路由缓存条目数等于"曾经被扫描过的分片数"，量级
+    /// 很小（个位数到十几），不需要额外维护反向索引。
+    fn rel_keys_containing(&self, table_name: &str) -> Vec<String> {
+        self.lock()
+            .iter()
+            .filter(|(_, entry)| entry.msg_tables.contains(table_name))
+            .map(|(rel_key, _)| rel_key.clone())
+            .collect()
+    }
+
+    /// FIX 1 + LOW-1：作废某个分片的路由缓存条目，并在**同一把锁的临界区
+    /// 内部**顺带把 `generation` 自增一次。miss（从未缓存过）是安全的空
+    /// 操作，一样会自增世代号（与旧版 `invalidate_shard` 的"无条件递增"
+    /// 语义保持一致，见 [`DbCache::invalidate_shard`] 文档）。
+    ///
+    /// 之所以把这两步合并成一个方法而不是分别暴露 `remove()` +
+    /// 调用方自己 `fetch_add()`：把它们拆成两次独立调用又会重新引入
+    /// LOW-1 想堵的"函数内部窗口"——调用方在两次调用之间可能被其它线程
+    /// 抢占，即便概率很低也失去了"用锁串行化"的保证。合并成一个方法，
+    /// 让锁的持有范围精确覆盖这两步操作，是唯一能保证原子性的写法。
+    fn remove_and_bump_generation(&self, rel_key: &str, generation: &AtomicU64) {
+        let mut guard = self.lock();
+        guard.remove(rel_key);
+        // 与 `put_shard_schema` 里的 `load` 共享同一把 `shard_routes` 锁的
+        // 临界区语义：这里的 `fetch_add` 和那边的 `load` 谁先执行，由锁的
+        // 获取顺序决定，不会出现两者交错的中间态。
+        generation.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -946,6 +1277,19 @@ impl HotConnPool {
             .last_used
             .store(HOT_CONN_CLOCK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
         (entry.slot.clone(), entry.rebuild_count.clone())
+    }
+
+    /// FIX 1：把某分片逐出热连接池。池子只是放弃自己那份 `Arc`；若此刻有
+    /// 并发查询正 move 着自己 clone 的那份在别处用，它手上那份引用计数仍然
+    /// 存活，直到它自己用完、`with()` 返回、闭包结束才真正 drop、关闭底层
+    /// 文件句柄——不会出现"驱逐时正在用的连接被强制中断"的问题（与
+    /// [`Self::slot`] 容量驱逐分支同一套语义）。miss（从未建立过热连接）是
+    /// 安全的空操作。
+    fn evict(&self, rel_key: &str) {
+        self.shards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(rel_key);
     }
 
     #[cfg(test)]
@@ -1615,7 +1959,7 @@ mod shard_route_tests {
         let mut tables = HashSet::new();
         tables.insert("Msg_aaaa".to_string());
         tables.insert("Msg_bbbb".to_string());
-        cache.put_shard_schema(rel_key.clone(), snapshot, tables.clone());
+        cache.put_shard_schema(rel_key.clone(), snapshot, tables.clone(), cache.route_generation());
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Fresh(got) => assert_eq!(got, tables),
@@ -1628,7 +1972,7 @@ mod shard_route_tests {
         let (cache, db_path, rel_key) = setup("db-bump").await;
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new());
+        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
         assert!(
             matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Fresh(_)),
             "写入后、快照未变、且已安静满 slack，应先命中"
@@ -1651,7 +1995,7 @@ mod shard_route_tests {
         let (cache, db_path, rel_key) = setup("wal-bump").await;
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new());
+        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
         assert!(
             matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Fresh(_)),
             "写入后、快照未变、且已安静满 slack，应先命中"
@@ -1679,7 +2023,7 @@ mod shard_route_tests {
         let (cache, db_path, rel_key) = setup("len-pin").await;
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new());
+        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
         assert!(
             matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Fresh(_)),
             "写入基线后应先命中"
@@ -1737,7 +2081,7 @@ mod shard_route_tests {
             .unwrap();
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new());
+        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Stale(got) => {
@@ -1775,11 +2119,268 @@ mod shard_route_tests {
 
         // 故意把这份"看起来相同"的快照也塞进缓存，模拟"两次读取都失败，
         // 凑巧数值相同"的最坏情况。
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new());
+        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Stale(_) => {}
             ShardRouteLookup::Fresh(_) => panic!("db_mtime=0 是未知哨兵值，永远不能被判 Fresh"),
+        }
+    }
+
+    /// FIX 3（加固点 3 语义收紧后的直接验证）：分片没有 WAL 文件（已
+    /// checkpoint 的休眠分片）是合法、可信的已知状态，db 早已安静满一个
+    /// slack 周期时应该能正常 Fresh 命中——不再被"wal_mtime==0 一律未知"
+    /// 误杀。
+    #[tokio::test]
+    async fn dormant_shard_without_wal_hits_cache() {
+        let root = unique_tmpdir("no-wal-route");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let rel_key = "message_0.db".to_string();
+        let db_path = db_dir.join(&rel_key);
+        std::fs::write(&db_path, b"fake encrypted db").unwrap();
+        backdate_beyond_slack(&db_path); // 没有创建任何 -wal 文件
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, HashMap::new())
+            .await
+            .unwrap();
+
+        let snapshot = cache.source_snapshot(&rel_key);
+        let mut tables = HashSet::new();
+        tables.insert("Msg_aaaa".to_string());
+        cache.put_shard_schema(rel_key.clone(), snapshot, tables.clone(), cache.route_generation());
+
+        match cache.shard_route_lookup(&rel_key) {
+            ShardRouteLookup::Fresh(got) => assert_eq!(got, tables),
+            ShardRouteLookup::Stale(_) => {
+                panic!("无 WAL 的休眠分片安静满一个 slack 周期后应该 Fresh 命中")
+            }
+        }
+    }
+
+    /// FIX 3（TOCTOU 关键点）的直接验证：分片一开始没有 WAL 文件（已被
+    /// 信任、缓存 Fresh 命中），随后微信开始往这个分片写消息、WAL 文件
+    /// 首次出现——即便这里只测"判定"这一层，不推进 slack 窗口，快照的
+    /// `wal_present` 从 `false` 翻到 `true` 也必须让缓存判定为不同，强制
+    /// Stale，不能被"数值部分看起来没变"蒙混过去。
+    #[tokio::test]
+    async fn wal_appearing_invalidates_cached_route() {
+        let root = unique_tmpdir("wal-appears-route");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let rel_key = "message_0.db".to_string();
+        let db_path = db_dir.join(&rel_key);
+        std::fs::write(&db_path, b"fake encrypted db").unwrap();
+        backdate_beyond_slack(&db_path); // 没有创建任何 -wal 文件
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, HashMap::new())
+            .await
+            .unwrap();
+
+        let snapshot = cache.source_snapshot(&rel_key);
+        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
+        assert!(
+            matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Fresh(_)),
+            "测试前提：无 WAL 的休眠分片此刻应该已经 Fresh 命中"
+        );
+
+        // 微信刚开始往这个分片写消息：WAL 文件首次出现。
+        let wal_path = wal_path_for(&db_path);
+        std::fs::write(&wal_path, [0u8; 31]).unwrap();
+
+        match cache.shard_route_lookup(&rel_key) {
+            ShardRouteLookup::Stale(got) => {
+                assert_ne!(
+                    got, snapshot,
+                    "wal_present 翻转必须让快照判定为不同"
+                );
+            }
+            ShardRouteLookup::Fresh(_) => {
+                panic!("WAL 从不存在变为存在必须强制判 Stale，不能继续信任旧路由缓存")
+            }
+        }
+    }
+
+    /// FIX-MEDIUM 基线正向用例：世代号在读取快照之后、回写之前始终未变
+    /// （没有任何并发 invalidate 介入），回写必须正常生效——证明生成号
+    /// 校验本身不会误伤"没有竞态发生"的正常路径。
+    #[tokio::test]
+    async fn matching_generation_write_succeeds() {
+        let (cache, _db_path, rel_key) = setup("gen-match").await;
+
+        let snapshot = cache.source_snapshot(&rel_key);
+        let expected_generation = cache.route_generation();
+        let mut tables = HashSet::new();
+        tables.insert("Msg_ok".to_string());
+        cache.put_shard_schema(rel_key.clone(), snapshot, tables.clone(), expected_generation);
+
+        match cache.shard_route_lookup(&rel_key) {
+            ShardRouteLookup::Fresh(got) => assert_eq!(got, tables, "世代号匹配时应该正常写入"),
+            ShardRouteLookup::Stale(_) => panic!("世代号未变，回写不应该被丢弃"),
+        }
+    }
+
+    /// FIX-MEDIUM 核心场景（invalidate 与 put_shard_schema 回写竞态）：
+    /// 模拟"扫描 sqlite_master 期间，另一个并发 RPC 抢先 invalidate 了同一
+    /// 分片"——回写必须携带《扫描发起前》的旧世代号，此时必须被丢弃，不能
+    /// 用可能过期的 schema 把刚被作废的路由悄悄复活。
+    #[tokio::test]
+    async fn concurrent_invalidate_during_scan_discards_stale_write() {
+        let (cache, _db_path, rel_key) = setup("gen-race").await;
+
+        let snapshot = cache.source_snapshot(&rel_key);
+        // 模拟 find_msg_shards 在判定 Stale、发起扫描之前读到的世代号。
+        let expected_generation = cache.route_generation();
+
+        // 并发场景：扫描仍在进行时，另一个请求先一步作废了这个分片
+        // （典型是 q_new_messages 的 FIX-HIGH 全量/精准作废路径）。
+        cache.invalidate_shard(&rel_key);
+
+        // 扫描"完成"，尝试用旧世代号回写——必须被拒绝。
+        let mut tables = HashSet::new();
+        tables.insert("Msg_stale".to_string());
+        cache.put_shard_schema(rel_key.clone(), snapshot, tables, expected_generation);
+
+        match cache.shard_route_lookup(&rel_key) {
+            ShardRouteLookup::Stale(_) => {}
+            ShardRouteLookup::Fresh(_) => panic!(
+                "过期世代号的回写不应该复活刚被 invalidate_shard 作废的路由缓存"
+            ),
+        }
+    }
+
+    /// FIX-MEDIUM 全局粒度的直接验证：即便被 `invalidate_shard` 的是**另一个
+    /// 不相关**的 rel_key，全局世代号依然会变化，导致本分片手上那份旧世代
+    /// 号的回写同样被丢弃——这是文档里明确接受的权衡（换来实现简单，代价
+    /// 只是多余重扫，不产生漏读）。
+    #[tokio::test]
+    async fn invalidate_of_unrelated_shard_still_discards_stale_write() {
+        let root = unique_tmpdir("gen-global");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        for rel in ["message_0.db", "message_1.db"] {
+            let db_path = db_dir.join(rel);
+            std::fs::write(&db_path, b"fake encrypted db").unwrap();
+            backdate_beyond_slack(&db_path);
+        }
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, HashMap::new())
+            .await
+            .unwrap();
+
+        let rel_key_a = "message_0.db".to_string();
+        let rel_key_b = "message_1.db".to_string();
+
+        let snapshot_a = cache.source_snapshot(&rel_key_a);
+        let expected_generation = cache.route_generation();
+
+        // 只作废 B，A 自身的源文件、路由缓存条目全程都没被碰过。
+        cache.invalidate_shard(&rel_key_b);
+
+        let mut tables = HashSet::new();
+        tables.insert("Msg_a".to_string());
+        cache.put_shard_schema(rel_key_a.clone(), snapshot_a, tables, expected_generation);
+
+        match cache.shard_route_lookup(&rel_key_a) {
+            ShardRouteLookup::Stale(_) => {}
+            ShardRouteLookup::Fresh(_) => panic!(
+                "全局世代号语义下，任何一次 invalidate_shard（即便作用于其它 rel_key）\
+                 都必须让在飞的旧世代号回写失效"
+            ),
+        }
+    }
+
+    /// FIX-MEDIUM 护栏：没有任何并发 invalidate 时，世代号本身不会漂移，
+    /// 连续多次 put_shard_schema（各自读取当时的世代号）都应该正常生效——
+    /// 证明世代号校验不会让稳态下的正常回写链路时断时续。
+    #[tokio::test]
+    async fn generation_stable_across_sequential_writes_without_invalidate() {
+        let (cache, _db_path, rel_key) = setup("gen-stable").await;
+        let gen0 = cache.route_generation();
+
+        let snapshot = cache.source_snapshot(&rel_key);
+        let mut tables1 = HashSet::new();
+        tables1.insert("Msg_one".to_string());
+        cache.put_shard_schema(rel_key.clone(), snapshot, tables1.clone(), gen0);
+        assert!(matches!(
+            cache.shard_route_lookup(&rel_key),
+            ShardRouteLookup::Fresh(_)
+        ));
+
+        // 世代号没有任何 invalidate 介入的情况下应该保持不变。
+        let gen1 = cache.route_generation();
+        assert_eq!(gen0, gen1, "没有 invalidate 发生，世代号不应该漂移");
+
+        let mut tables2 = HashSet::new();
+        tables2.insert("Msg_two".to_string());
+        cache.put_shard_schema(rel_key.clone(), snapshot, tables2.clone(), gen1);
+        match cache.shard_route_lookup(&rel_key) {
+            ShardRouteLookup::Fresh(got) => assert_eq!(got, tables2, "第二次回写应该正常生效"),
+            ShardRouteLookup::Stale(_) => panic!("世代号未变时不应该丢弃回写"),
+        }
+    }
+
+    /// LOW-1 直接验证："函数内部窗口"修复后，`put_shard_schema` 的世代号
+    /// 校验必须与真正的 `insert` 共享同一把 `shard_routes` 锁的临界区。
+    /// 单元测试没有办法确定性地构造出具体的线程抢占顺序，这里改为直接
+    /// 验证锁内串行化之后应有的可观察结果：携带一个已经落后于当前世代号
+    /// 的 `expected_generation`，无论此刻是否真的有 invalidate 正在进行，
+    /// 一定不能 insert；随后换上《当前》世代号重试，必须正常写入成功——
+    /// 这正是"校验"与"写入"必须在同一次加锁过程中原子完成"才能保证的行为，
+    /// 与旧版"先在锁外 load、再单独加锁 insert"两步分离的写法形成对照。
+    #[tokio::test]
+    async fn put_shard_schema_rejects_stale_generation_and_accepts_current() {
+        let (cache, _db_path, rel_key) = setup("gen-lock-scope").await;
+
+        // 记录一个"过期"的旧世代号，再通过 invalidate 一个不相关的
+        // rel_key 让全局世代号跳变几次（本分片的源文件、快照全程不动）。
+        let stale_generation = cache.route_generation();
+        cache.invalidate_shard("message_unrelated.db");
+        cache.invalidate_shard("message_unrelated.db");
+        let current_generation = cache.route_generation();
+        assert!(
+            current_generation > stale_generation,
+            "测试前提：世代号应该已经跳变"
+        );
+
+        let snapshot = cache.source_snapshot(&rel_key);
+
+        // 携带过期世代号回写：必须被拒绝，即便调用时刻并没有并发线程正在
+        // 抢占——只要 expected_generation 落后于当前世代号就不能 insert。
+        let mut stale_tables = HashSet::new();
+        stale_tables.insert("Msg_stale".to_string());
+        cache.put_shard_schema(rel_key.clone(), snapshot, stale_tables, stale_generation);
+        assert!(
+            matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Stale(_)),
+            "过期世代号的回写必须被拒绝，不能 insert"
+        );
+
+        // 换上《当前》世代号重试，必须正常写入成功。
+        let mut fresh_tables = HashSet::new();
+        fresh_tables.insert("Msg_fresh".to_string());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            fresh_tables.clone(),
+            current_generation,
+        );
+        match cache.shard_route_lookup(&rel_key) {
+            ShardRouteLookup::Fresh(got) => {
+                assert_eq!(got, fresh_tables, "携带当前世代号的回写应该正常生效")
+            }
+            ShardRouteLookup::Stale(_) => panic!("携带当前世代号的回写不应该被拒绝"),
         }
     }
 }
@@ -2134,11 +2735,13 @@ mod hot_conn_tests {
         );
     }
 
-    /// 加固点 3（MEDIUM）的直接验证：分片没有 WAL 文件时 wal_mtime 恒为 0
-    /// （"文件缺失"与"metadata 读取失败"共用的哨兵值，无法区分）。即便 db
-    /// 早已安静很久、两次读到的快照逐字段完全相同，也不能被判定为可信。
+    /// FIX 3（加固点 3 语义收紧后的直接验证）：分片没有 WAL 文件（已
+    /// checkpoint 的休眠分片，`wal_present=false`）是合法、可信的已知状态，
+    /// db 早已安静很久、两次读到的快照逐字段完全相同时应该允许复用连接——
+    /// 这是相对旧版行为唯一的语义变化，旧版把"WAL 缺失"和"WAL 存在但读取
+    /// 失败"用同一个哨兵值 0 强行合并成"一律未知"，误杀了这类分片。
     #[tokio::test]
-    async fn missing_wal_zero_mtime_never_allows_reuse() {
+    async fn dormant_shard_without_wal_reuses_connection() {
         let root = unique_tmpdir("no-wal-hotconn");
         let db_dir = root.join("db_storage");
         let cache_dir = root.join("cache");
@@ -2159,13 +2762,307 @@ mod hot_conn_tests {
             .unwrap();
 
         probe(&cache, &rel_key).await;
-        assert_eq!(rebuild_count(&cache, &rel_key), 1);
+        assert_eq!(rebuild_count(&cache, &rel_key), 1, "首次访问必然重建");
+
+        probe(&cache, &rel_key).await;
+        assert_eq!(
+            rebuild_count(&cache, &rel_key),
+            1,
+            "无 WAL 文件是合法已知状态（已 checkpoint 休眠分片），db 早已安静，\
+             应该允许复用连接，不能每轮都被迫重建"
+        );
+    }
+
+    /// FIX 3（TOCTOU 关键点）的直接验证：分片一开始没有 WAL 文件（已被信任、
+    /// 连接被复用），随后微信开始往这个分片写消息、WAL 文件首次出现。即便
+    /// 新出现的 WAL 文件恰好落在新鲜度 slack 窗口内会被 `trusted_as_of`
+    /// 天然拦下，这里额外验证的是"快照相等比较"这一层——`wal_present` 从
+    /// `false` 翻到 `true` 必须让快照判定为不同，强制重建，不能被"数值
+    /// 部分看起来没变"蒙混过去。
+    #[tokio::test]
+    async fn wal_appearing_forces_rebuild_even_though_dormant() {
+        let root = unique_tmpdir("wal-appears-hotconn");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let rel_key = "message_0.db".to_string();
+        let db_path = db_dir.join(&rel_key);
+        let key = key_fixture();
+        build_encrypted_fixture(&db_path, &key, "Msg_test", &[(1, 1000)]);
+        backdate_beyond_slack(&db_path); // 没有创建任何 -wal 文件
+
+        let mut all_keys = HashMap::new();
+        all_keys.insert(rel_key.clone(), key_to_hex(&key));
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+
+        probe(&cache, &rel_key).await;
+        assert_eq!(rebuild_count(&cache, &rel_key), 1, "首次访问必然重建");
+
+        probe(&cache, &rel_key).await;
+        assert_eq!(
+            rebuild_count(&cache, &rel_key),
+            1,
+            "测试前提：无 WAL 的休眠分片此刻应该已经在复用连接"
+        );
+
+        // 微信刚开始往这个分片写消息：WAL 文件首次出现。
+        let wal_path = wal_path_for(&db_path);
+        std::fs::write(&wal_path, [0u8; 31]).unwrap();
 
         probe(&cache, &rel_key).await;
         assert_eq!(
             rebuild_count(&cache, &rel_key),
             2,
-            "wal_mtime=0（WAL 缺失）是未知哨兵值，永远不能被信任为可复用"
+            "WAL 从不存在变为存在必须让快照判定为不同，强制重建，不能继续复用旧连接"
         );
+    }
+}
+
+/// FIX 1（核心·焊死"mtime 滞后漏消息"）的单元测试：`route_shard_for_table`
+/// 反查 + `invalidate_shard` 强制作废，直接验证 `q_new_messages` 里
+/// "changed 会话 → 承载分片 → 强制作废，逼下次现场重开"这条链路的
+/// `DbCache` 一侧行为，不依赖 `query.rs` 的 md5 表名推导（那一层是纯函数
+/// 拼接，不需要重复用集成测试覆盖）。
+#[cfg(test)]
+mod invalidate_tests {
+    use super::test_support::{
+        backdate_beyond_slack, build_encrypted_fixture, key_fixture, key_to_hex, unique_tmpdir,
+    };
+    use super::*;
+
+    /// 借这次调用顺路执行一次最简单的查询，只关心 rebuild_count 的前后
+    /// 差值——与 `hot_conn_tests::probe` 同构。
+    async fn probe(cache: &DbCache, rel_key: &str) {
+        let hot = cache.hot_conn_handle(rel_key).unwrap();
+        tokio::task::spawn_blocking(move || hot.with(|_conn| Ok::<_, anyhow::Error>(())))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    fn rebuild_count(cache: &DbCache, rel_key: &str) -> u64 {
+        cache
+            .hot_conn_handle(rel_key)
+            .unwrap()
+            .rebuild_count
+            .load(Ordering::Relaxed)
+    }
+
+    /// 搭一个"已经被 `find_msg_shards` 扫描过、路由缓存 + 热连接都已建立"
+    /// 的分片：db + WAL 都回拨到早已安静的过去时刻（对应真实场景里"这个
+    /// 分片按 mtime 判断本该继续被信任"的状态），路由缓存记录它携带
+    /// `table_name`，并预热一次热连接。
+    async fn setup_carrying_shard(
+        tag: &str,
+        rel_key: &str,
+        table_name: &str,
+    ) -> (DbCache, std::path::PathBuf) {
+        let root = unique_tmpdir(tag);
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let db_path = db_dir.join(rel_key);
+        let key = key_fixture();
+        build_encrypted_fixture(&db_path, &key, table_name, &[(1, 1000)]);
+        let wal_path = wal_path_for(&db_path);
+        std::fs::write(&wal_path, [0u8; 31]).unwrap();
+        backdate_beyond_slack(&db_path);
+        backdate_beyond_slack(&wal_path);
+
+        let mut all_keys = HashMap::new();
+        all_keys.insert(rel_key.to_string(), key_to_hex(&key));
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+
+        // 路由缓存：记录这个分片当时携带 table_name。
+        let snapshot = cache.source_snapshot(rel_key);
+        let mut tables = HashSet::new();
+        tables.insert(table_name.to_string());
+        cache.put_shard_schema(rel_key.to_string(), snapshot, tables, cache.route_generation());
+
+        // 热连接：预热一次，rebuild_count 从 1 开始。
+        probe(&cache, rel_key).await;
+        assert_eq!(rebuild_count(&cache, rel_key), 1, "预热应该只触发一次重建");
+        assert!(
+            matches!(cache.shard_route_lookup(rel_key), ShardRouteLookup::Fresh(_)),
+            "预热后路由缓存应该已经 Fresh 命中"
+        );
+
+        (cache, db_path)
+    }
+
+    /// FIX 1 核心场景：`route_shard_for_table` 找到承载分片后，
+    /// `invalidate_shard` 必须同时作废路由缓存和热连接——即便源文件的
+    /// mtime/len 全程没有任何变化（模拟"内容已经落盘、但跨进程 mtime 可见性
+    /// 滞后，stat 看起来还是旧值"这个窗口），下一次访问也必须现场重开，
+    /// 不能继续信任任何缓存。
+    ///
+    /// 注意：`invalidate_shard` 是把 `HotShardSlot`（连接槽位 + 它自己的
+    /// `rebuild_count` 计数器）整个从池子里 `remove` 掉，不是"标记为
+    /// stale"——所以作废后 `rebuild_count` 不会延续旧值继续累加，而是随着
+    /// 下一次访问重建出一个全新槽位、全新计数器，从 1 开始。因此这里不能
+    /// 断言"数值递增到 2"，而是先用 `HotConnPool::contains`（`#[cfg(test)]`
+    /// 内部可见方法）直接证明槽位真的被移除了，再证明重建后的计数器确实是
+    /// "从零开始的第一次构建"（值为 1）——两者合起来才完整证明"没有任何
+    /// 旧连接被继续复用"。
+    #[tokio::test]
+    async fn invalidating_carrying_shard_forces_route_and_hotconn_rebuild() {
+        let rel_key = "message_0.db";
+        let table_name = "Msg_target";
+        let (cache, _db_path) = setup_carrying_shard("fix1-core", rel_key, table_name).await;
+        assert!(
+            cache.hot_conns.contains(rel_key),
+            "预热后热连接槽位应该已经建立"
+        );
+
+        let carrying = cache.route_shard_for_table(table_name);
+        assert_eq!(
+            carrying,
+            vec![rel_key.to_string()],
+            "route_shard_for_table 应该准确反查到承载该表名的分片"
+        );
+
+        cache.invalidate_shard(rel_key);
+
+        // 路由缓存：作废后必须 Stale，即便源文件字节上什么都没变。
+        assert!(
+            matches!(cache.shard_route_lookup(rel_key), ShardRouteLookup::Stale(_)),
+            "invalidate_shard 后路由缓存必须强制 Stale，不能继续信任"
+        );
+
+        // 热连接：槽位必须被真正移除，不是"标记为 stale"。
+        assert!(
+            !cache.hot_conns.contains(rel_key),
+            "invalidate_shard 后热连接槽位必须被彻底移除"
+        );
+
+        // 下一次访问必须现场重开，重建出的是一个全新计数器（从 0 累加到 1），
+        // 不可能是"复用作废前的旧连接"（那个槽位已经不存在了）。
+        probe(&cache, rel_key).await;
+        assert_eq!(
+            rebuild_count(&cache, rel_key),
+            1,
+            "invalidate_shard 后重建出的是全新槽位 + 全新计数器"
+        );
+    }
+
+    /// 无关休眠分片保持缓存：作废分片 A 不应该影响分片 B 的路由缓存 /
+    /// 热连接，即便两者都早已安静、都被信任。
+    #[tokio::test]
+    async fn invalidating_one_shard_does_not_touch_unrelated_dormant_shard() {
+        let rel_key_a = "message_0.db";
+        let rel_key_b = "message_1.db";
+
+        // 两个分片必须共享同一个 db_dir / cache_dir 才能被同一个 DbCache
+        // 管理，所以不能直接复用 setup_carrying_shard（它各自建一套目录）；
+        // 这里手动搭两个分片，逻辑与 setup_carrying_shard 一致。
+        let root = unique_tmpdir("fix1-unrelated");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let key = key_fixture();
+        let mut all_keys = HashMap::new();
+        for (rel_key, table_name) in [(rel_key_a, "Msg_a"), (rel_key_b, "Msg_b")] {
+            let db_path = db_dir.join(rel_key);
+            build_encrypted_fixture(&db_path, &key, table_name, &[(1, 1000)]);
+            let wal_path = wal_path_for(&db_path);
+            std::fs::write(&wal_path, [0u8; 31]).unwrap();
+            backdate_beyond_slack(&db_path);
+            backdate_beyond_slack(&wal_path);
+            all_keys.insert(rel_key.to_string(), key_to_hex(&key));
+        }
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+
+        for (rel_key, table_name) in [(rel_key_a, "Msg_a"), (rel_key_b, "Msg_b")] {
+            let snapshot = cache.source_snapshot(rel_key);
+            let mut tables = HashSet::new();
+            tables.insert(table_name.to_string());
+            cache.put_shard_schema(rel_key.to_string(), snapshot, tables, cache.route_generation());
+            probe(&cache, rel_key).await;
+            assert_eq!(rebuild_count(&cache, rel_key), 1);
+        }
+
+        assert!(cache.hot_conns.contains(rel_key_a));
+        assert!(cache.hot_conns.contains(rel_key_b));
+
+        // 只作废分片 A（承载 Msg_a）。
+        for r in cache.route_shard_for_table("Msg_a") {
+            cache.invalidate_shard(&r);
+        }
+
+        // 分片 A：路由缓存必须强制 Stale，热连接槽位必须被真正移除
+        // （见 `invalidating_carrying_shard_forces_route_and_hotconn_rebuild`
+        // 的说明：移除后 `rebuild_count` 从全新槽位的 0 重新累加，不是延续
+        // 旧值递增到 2）。
+        assert!(matches!(
+            cache.shard_route_lookup(rel_key_a),
+            ShardRouteLookup::Stale(_)
+        ));
+        assert!(
+            !cache.hot_conns.contains(rel_key_a),
+            "分片 A 的热连接槽位必须被彻底移除"
+        );
+        probe(&cache, rel_key_a).await;
+        assert_eq!(
+            rebuild_count(&cache, rel_key_a),
+            1,
+            "分片 A 重建出的是全新槽位 + 全新计数器"
+        );
+
+        // 分片 B：完全不受影响，路由缓存仍 Fresh，热连接仍复用（rebuild_count
+        // 保持 1）。
+        assert!(
+            matches!(cache.shard_route_lookup(rel_key_b), ShardRouteLookup::Fresh(_)),
+            "无关分片的路由缓存不应该被误作废"
+        );
+        probe(&cache, rel_key_b).await;
+        assert_eq!(
+            rebuild_count(&cache, rel_key_b),
+            1,
+            "无关分片的热连接不应该被误驱逐，应该继续复用"
+        );
+    }
+
+    /// 全新会话路径不 panic：`route_shard_for_table` 对从未被路由缓存记录过
+    /// 的表名（典型是全新会话——它对应的分片还从未被 `find_msg_shards`
+    /// 真正扫描过）必须返回空集合，而不是 panic 或误报；对空集合调用
+    /// `invalidate_shard` 自然是空操作，同样不能 panic。
+    #[tokio::test]
+    async fn route_shard_for_table_empty_for_never_scanned_table_and_invalidate_is_noop() {
+        let root = unique_tmpdir("fix1-new-session");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, HashMap::new())
+            .await
+            .unwrap();
+
+        let carrying = cache.route_shard_for_table("Msg_never_seen_before");
+        assert!(
+            carrying.is_empty(),
+            "从未被路由缓存记录过的表名必须返回空集合"
+        );
+
+        // 对一个从未出现过的 rel_key 调用 invalidate_shard：两个子缓存都
+        // miss，必须是安全的空操作，不能 panic。
+        cache.invalidate_shard("message_never_opened.db");
     }
 }

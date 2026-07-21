@@ -637,8 +637,15 @@ pub async fn q_search(
     let mut join_set: tokio::task::JoinSet<Result<(String, Vec<Value>)>> =
         tokio::task::JoinSet::new();
     for (rel_key, table_list) in by_rel_key {
-        let conn_params = match db.conn_params(&rel_key) {
-            Ok(p) => p,
+        // FIX 4：具名 chat 分支的 `rel_key` 来自 `find_msg_shards`，已经用
+        // `hot_conn_handle_with_snapshot` 开过（或复用过）一次热连接；全局
+        // 扫描分支的 `rel_key` 虽然还没有热连接（前面列表名时是直接
+        // `conn_params.open()` 的独立一次性打开），但改用 `hot_conn_handle`
+        // 也完全兼容——miss 时照常现开一个，还能顺便把这次打开的连接留进
+        // 热连接池供后续查询复用。两个分支统一走这条路径，消除具名 chat
+        // 分支原本"已经开过热连接又 `conn_params.open()` 二次打开"的浪费。
+        let hot = match db.hot_conn_handle(&rel_key) {
+            Ok(h) => h,
             Err(e) => {
                 eprintln!("[search] skip DB {}: {}", rel_key, e);
                 continue;
@@ -653,7 +660,7 @@ pub async fn q_search(
         let rel_key_for_log = rel_key.clone();
 
         join_set.spawn_blocking(move || {
-            let conn = conn_params.open()?;
+            hot.with(|conn| {
             let mut all = Vec::new();
             let empty_group_nicknames = HashMap::new();
             for (tname, display, uname) in &table_list {
@@ -662,7 +669,7 @@ pub async fn q_search(
                     .get(uname)
                     .unwrap_or(&empty_group_nicknames);
                 match search_in_table(
-                    &conn,
+                    conn,
                     tname,
                     &uname,
                     is_group,
@@ -703,6 +710,7 @@ pub async fn q_search(
                 }
             }
             Ok((rel_key_for_log, all))
+            })
         });
     }
 
@@ -871,34 +879,54 @@ async fn find_msg_shards(
     let mut skipped = 0usize;
     let mut results: Vec<MessageShard> = Vec::new();
     for rel_key in &names.msg_db_keys {
-        if shard_skippable(db.source_freshness_secs(rel_key), since) {
+        // FIX 2：每分片只读一次 SourceSnapshot（至多 1 次主库 metadata + 1 次
+        // WAL exists()/metadata），透传给下面 skip 判定 / 路由 lookup / 热
+        // 连接门控三处，消除原本三处各自独立 stat 造成的 4~6 次重复系统
+        // 调用。三处判定逻辑与去重前完全一致，只是快照来源统一成"调用方
+        // 传入"。三处调用在时间上本就紧挨着（都是同步、非阻塞调用，中间
+        // 没有任何 `.await` 让出点），合并成一次读取不会引入新的 TOCTOU
+        // 窗口。
+        let snapshot = db.source_snapshot(rel_key);
+
+        if shard_skippable(snapshot.freshness_secs(), since) {
             skipped += 1;
             continue;
         }
 
-        // 优化 A（分片路由缓存）：miss / mtime 变了才真正 open() 重建（一次性
-        // 列出该分片全部 Msg_ 表名，不止查目标表）；命中且 mtime 未变、确认
+        // 优化 A（分片路由缓存）：miss / 快照变了才真正 open() 重建（一次性
+        // 列出该分片全部 Msg_ 表名，不止查目标表）；命中且快照未变、确认
         // 不含目标表时零阻塞 I/O 直接跳过。同一个分片被多个不同会话命中时，
         // 只有第一个触发真正的 sqlite_master 扫描，把复杂度从 O(会话×分片)
         // 压到 O(dirty 分片数)。
-        let (cached_tables, need_rebuild, snap_at_judgement) = match db.shard_route_lookup(rel_key)
-        {
-            ShardRouteLookup::Fresh(tables) => (tables, false, None),
-            ShardRouteLookup::Stale(snapshot) => (HashSet::new(), true, Some(snapshot)),
-        };
+        let (cached_tables, need_rebuild, snap_at_judgement) =
+            match db.shard_route_lookup_with_snapshot(rel_key, snapshot) {
+                ShardRouteLookup::Fresh(tables) => (tables, false, None),
+                ShardRouteLookup::Stale(snapshot) => (HashSet::new(), true, Some(snapshot)),
+            };
         if !need_rebuild && !cached_tables.contains(&table_name) {
             continue;
         }
 
         // 优化 B（热连接复用）：借这一次查询顺路拿到（或复用）该分片的常驻
         // 连接。
-        let hot = match db.hot_conn_handle(rel_key) {
+        let hot = match db.hot_conn_handle_with_snapshot(rel_key, snapshot) {
             Ok(h) => h,
             Err(_) => continue,
         };
         let enc_path = hot.enc_db_path().to_path_buf();
         scanned += 1;
         let tname = table_name.clone();
+
+        // FIX-MEDIUM（invalidate 与 put_shard_schema 回写竞态）：在真正发起
+        // `spawn_blocking` 扫描之前读一次当前作废世代号。`DbCache` 经 `Arc`
+        // 被 `server.rs` 每连接 `tokio::spawn` 共享，下面这次扫描（排队 +
+        // sqlite_master I/O）期间完全可能有另一个并发请求对同一分片（或
+        // 任意分片，见 `DbCache::invalidate_shard` 的全局粒度说明）调用
+        // `invalidate_shard`；如果扫描完成后仍然无条件回写，会用一份可能
+        // 已经过期的 schema 把刚被作废的路由悄悄复活。下面 `put_shard_schema`
+        // 调用会拿这份 `expected_generation` 与《回写那一刻》的当前世代号
+        // 比较，不等就放弃写入。
+        let expected_generation = db.route_generation();
 
         let (tables_opt, max_ts): (Option<HashSet<String>>, Option<i64>) =
             tokio::task::spawn_blocking(move || {
@@ -950,7 +978,7 @@ async fn find_msg_shards(
             // true 时这份快照必然是 `Some`（上面 `Stale` 分支赋的值），
             // `expect` 只是让这个不变量在类型上显式可见。
             let snapshot = snap_at_judgement.expect("need_rebuild 时快照必然存在");
-            db.put_shard_schema(rel_key.clone(), snapshot, tables);
+            db.put_shard_schema(rel_key.clone(), snapshot, tables, expected_generation);
         }
 
         if let Some(ts) = max_ts {
@@ -2703,31 +2731,36 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
 
     let mut sender_set: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (rel_key, table_name) in &tables {
-        let conn_params = match db.conn_params(rel_key) {
-            Ok(p) => p,
+        // FIX 4：`tables` 来自 `find_msg_tables` → `find_msg_shards`，后者
+        // 已经用 `hot_conn_handle_with_snapshot` 为这个 rel_key 开过（或
+        // 复用过）一次热连接。这里改用 `hot_conn_handle` 复用同一个槽位，
+        // 消除原本 `conn_params.open()` 造成的第二次物理打开。
+        let hot = match db.hot_conn_handle(rel_key) {
+            Ok(h) => h,
             Err(_) => continue,
         };
         let tname = table_name.clone();
         let uname = username.clone();
 
         let senders: Vec<String> = tokio::task::spawn_blocking(move || {
-            let conn = conn_params.open()?;
-            let id2u = load_id2u(&conn);
-            let mut stmt = conn.prepare(&format!(
-                "SELECT DISTINCT real_sender_id FROM [{}] WHERE real_sender_id > 0",
-                tname
-            ))?;
-            let ids: Vec<i64> = stmt
-                .query_map([], |row| row.get(0))?
-                .filter_map(|r| r.ok())
-                .collect();
-            let senders: Vec<String> = ids
-                .iter()
-                .filter_map(|id| id2u.get(id))
-                .filter(|u| *u != &uname)
-                .cloned()
-                .collect();
-            Ok::<_, anyhow::Error>(senders)
+            hot.with(|conn| {
+                let id2u = load_id2u(conn);
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT DISTINCT real_sender_id FROM [{}] WHERE real_sender_id > 0",
+                    tname
+                ))?;
+                let ids: Vec<i64> = stmt
+                    .query_map([], |row| row.get(0))?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                let senders: Vec<String> = ids
+                    .iter()
+                    .filter_map(|id| id2u.get(id))
+                    .filter(|u| *u != &uname)
+                    .cloned()
+                    .collect();
+                Ok::<_, anyhow::Error>(senders)
+            })
         })
         .await??;
 
@@ -2769,6 +2802,212 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
         "count": members.len(),
         "members": members,
     }))
+}
+
+/// FIX-HIGH（新会话覆盖漏洞）：计算 `q_new_messages` 本轮需要强制作废的
+/// 消息分片集合。
+///
+/// 对每个 `changed` 会话尝试用 `route_shard_for_table` 反查其 `Msg_<md5>`
+/// 表当前记录在哪个（些）分片的路由缓存里：
+/// - 能定位到 → 精准加入该分片（对应旧版 FIX 1 的行为，覆盖"已知会话，
+///   缓存里有记录"的稳态）。
+/// - 定位不到（`route_shard_for_table` 返回空——典型是全新会话，其
+///   `Msg_<md5>` 表从未出现在任何缓存的 `ShardSchemaEntry.msg_tables` 里）
+///   → 记一次"unresolved"，不单独处理这个会话。
+///
+/// # 性能护栏（必须保持）
+/// 全量作废（返回值退化为 `all_msg_db_keys` 全集）**只在本轮确实存在至少
+/// 一个 unresolved 的 changed 会话时触发一次**——绝不能因为"处理了一个全
+/// 新会话"就连带对每一轮都做全量 nuke。稳态下（`changed` 全是已知会话、
+/// 都能精准定位到承载分片）只返回精准命中的分片集合，不触碰
+/// `all_msg_db_keys` 里任何一个无关分片，缓存命中率不受影响——这是唯一
+/// 允许存在的 `if` 分支，新增逻辑时不能绕过它。
+///
+/// 纯函数、同步、只读（`route_shard_for_table` 内部只做一次 `Mutex` 加锁
+/// 后的内存线性扫描，不做任何 I/O），不涉及任何 `.await`，可以在单元测试
+/// 里直接调用、不需要真实 session.db。
+fn shards_to_force_invalidate(
+    db: &DbCache,
+    changed: &[(String, i64)],
+    all_msg_db_keys: &[String],
+) -> HashSet<String> {
+    let mut resolved: HashSet<String> = HashSet::new();
+    let mut has_unresolved = false;
+    for (uname, _) in changed {
+        let table_name = format!("Msg_{:x}", md5::compute(uname.as_bytes()));
+        let carrying = db.route_shard_for_table(&table_name);
+        if carrying.is_empty() {
+            has_unresolved = true;
+        } else {
+            resolved.extend(carrying);
+        }
+    }
+    if has_unresolved {
+        // 性能护栏：只有这一个分支会返回全集，且只在本轮真的存在 unresolved
+        // 会话时才走到这里。
+        all_msg_db_keys.iter().cloned().collect()
+    } else {
+        resolved
+    }
+}
+
+/// [`shards_to_force_invalidate`] 的单元测试：只依赖 `DbCache` 的路由缓存
+/// 这层内存 bookkeeping（`put_shard_schema` / `route_shard_for_table`），
+/// 不需要构造真实的 session.db 或消息分片文件——`route_shard_for_table`
+/// 本身只做内存 `HashMap` 查找，`SourceSnapshot` 的具体数值在这里无关紧要。
+#[cfg(test)]
+mod force_invalidate_tests {
+    use super::super::cache::test_support::unique_tmpdir;
+    use super::*;
+
+    async fn empty_cache(tag: &str) -> DbCache {
+        let root = unique_tmpdir(tag);
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mtime_file = cache_dir.join("_mtimes.json");
+        DbCache::with_dirs(db_dir, cache_dir, mtime_file, HashMap::new())
+            .await
+            .unwrap()
+    }
+
+    fn msg_table_name(uname: &str) -> String {
+        format!("Msg_{:x}", md5::compute(uname.as_bytes()))
+    }
+
+    /// 性能护栏的正向证明：`changed` 里全部是"已知会话"（`route_shard_for_table`
+    /// 都能精准定位到承载分片）时，只返回这些精准命中的分片，绝不触碰
+    /// `all_msg_db_keys` 里其它无关（甚至从未被扫描过）的分片。
+    #[tokio::test]
+    async fn all_known_changed_sessions_only_invalidate_their_precise_shards() {
+        let db = empty_cache("force-inv-known").await;
+
+        let alice_table = msg_table_name("alice");
+        let bob_table = msg_table_name("bob");
+
+        let mut tables0 = HashSet::new();
+        tables0.insert(alice_table.clone());
+        db.put_shard_schema(
+            "message_0.db".to_string(),
+            db.source_snapshot("message_0.db"),
+            tables0,
+            db.route_generation(),
+        );
+
+        let mut tables1 = HashSet::new();
+        tables1.insert(bob_table.clone());
+        db.put_shard_schema(
+            "message_1.db".to_string(),
+            db.source_snapshot("message_1.db"),
+            tables1,
+            db.route_generation(),
+        );
+
+        let changed = vec![("alice".to_string(), 1_i64), ("bob".to_string(), 2_i64)];
+        let all_msg_db_keys = vec![
+            "message_0.db".to_string(),
+            "message_1.db".to_string(),
+            // message_2.db 从未被扫描、从未出现在任何路由缓存条目里——
+            // 代表一个休眠、不相关的分片，绝不应该被牵连作废。
+            "message_2.db".to_string(),
+        ];
+
+        let got = shards_to_force_invalidate(&db, &changed, &all_msg_db_keys);
+
+        let expected: HashSet<String> =
+            ["message_0.db".to_string(), "message_1.db".to_string()]
+                .into_iter()
+                .collect();
+        assert_eq!(
+            got, expected,
+            "changed 全为已知会话时只应精准作废承载分片，不能牵连无关分片 message_2.db"
+        );
+    }
+
+    /// FIX-HIGH 核心场景：`changed` 里存在至少一个"定位不到承载分片"的会话
+    /// （全新会话）时，必须退化为对 `all_msg_db_keys` 全集作废——即便另一个
+    /// 会话本身是已知的、能精准定位。
+    #[tokio::test]
+    async fn unresolved_new_session_forces_full_invalidate_of_all_msg_shards() {
+        let db = empty_cache("force-inv-unresolved").await;
+
+        let alice_table = msg_table_name("alice");
+        let mut tables0 = HashSet::new();
+        tables0.insert(alice_table.clone());
+        db.put_shard_schema(
+            "message_0.db".to_string(),
+            db.source_snapshot("message_0.db"),
+            tables0,
+            db.route_generation(),
+        );
+
+        // "charlie" 是全新会话：它的 Msg_<md5> 表从未被任何 put_shard_schema
+        // 记录过，route_shard_for_table 对它必然返回空。
+        let changed = vec![
+            ("alice".to_string(), 1_i64),
+            ("charlie".to_string(), 2_i64),
+        ];
+        let all_msg_db_keys = vec![
+            "message_0.db".to_string(),
+            "message_1.db".to_string(),
+            "message_2.db".to_string(),
+        ];
+
+        let got = shards_to_force_invalidate(&db, &changed, &all_msg_db_keys);
+
+        let expected: HashSet<String> = all_msg_db_keys.iter().cloned().collect();
+        assert_eq!(
+            got, expected,
+            "存在至少一个定位不到承载分片的 changed 会话时，必须退化为全量作废"
+        );
+    }
+
+    /// 边界情况：`changed` 为空时不应 panic，也不应误触发全量作废（虽然
+    /// `q_new_messages` 实际会在更早的 `changed.is_empty()` 分支直接返回，
+    /// 这里独立验证函数自身在这个输入上的行为是良定义的）。
+    #[tokio::test]
+    async fn empty_changed_returns_empty_set() {
+        let db = empty_cache("force-inv-empty").await;
+        let all_msg_db_keys = vec!["message_0.db".to_string()];
+        let got = shards_to_force_invalidate(&db, &[], &all_msg_db_keys);
+        assert!(got.is_empty());
+    }
+
+    /// 多个 unresolved 会话、且已知会话精准命中了多个不同分片时，返回值
+    /// 仍然是"全部 all_msg_db_keys"，而不是"已知会话命中的分片 ∪ 猜测"——
+    /// 证明 unresolved 分支完全替换掉精准命中结果，语义上不是简单并集。
+    #[tokio::test]
+    async fn full_invalidate_returns_exactly_all_keys_not_a_union() {
+        let db = empty_cache("force-inv-exact").await;
+
+        let alice_table = msg_table_name("alice");
+        let mut tables0 = HashSet::new();
+        tables0.insert(alice_table);
+        db.put_shard_schema(
+            "message_0.db".to_string(),
+            db.source_snapshot("message_0.db"),
+            tables0,
+            db.route_generation(),
+        );
+
+        let changed = vec![
+            ("alice".to_string(), 1_i64),
+            ("new_one".to_string(), 2_i64),
+            ("new_two".to_string(), 3_i64),
+        ];
+        let all_msg_db_keys = vec![
+            "message_0.db".to_string(),
+            "message_1.db".to_string(),
+            "message_2.db".to_string(),
+            "message_3.db".to_string(),
+        ];
+
+        let got = shards_to_force_invalidate(&db, &changed, &all_msg_db_keys);
+        let expected: HashSet<String> = all_msg_db_keys.iter().cloned().collect();
+        assert_eq!(got, expected, "全量作废时结果必须恰好等于 all_msg_db_keys 全集");
+        assert_eq!(got.len(), 4);
+    }
 }
 
 /// 查询新消息：以 session.db 的 last_timestamp 作为 inbox 索引，
@@ -2843,6 +3082,38 @@ pub async fn q_new_messages(
             "new_state": session_ts_map,
             "meta": meta,
         }));
+    }
+
+    // FIX 1（核心·焊死"mtime 滞后漏消息"）：session.db 是本轮新读、内容可靠
+    // 的真相源，`changed` 集合准确反映"哪些会话确实有新消息"——不依赖任何
+    // mtime 比较。在进入下面 per-session 查询循环之前，把"承载了这些
+    // changed 会话消息表"的路由缓存条目 + 热连接强制作废，逼它们下一次被
+    // 访问时现场重新 `open()`（`File::open` + 重新扫 WAL 帧头建索引，直接
+    // 读当前真实字节），绕开 Windows/NTFS 上跨进程 mtime 可见性可能滞后于
+    // 实际写入、导致某轮轮询误判缓存新鲜、漏掉刚落盘新消息的窗口——而漏掉
+    // 的消息不是"下一轮补上"，是随 `lastCheckedAt` 推进后永久跳过。
+    //
+    // FIX-HIGH（新会话覆盖漏洞）：`route_shard_for_table` 对"全新会话"
+    // （其 `Msg_<md5>` 表从未出现在任何缓存的 `ShardSchemaEntry.msg_tables`
+    // 里，典型是本轮才第一次收到消息的会话）必然返回空——不能像旧版那样
+    // 就此放行，指望"新建表必然 bump 该分片 mtime/len，下面
+    // `find_msg_shards` 会自然判 Stale、触发重建"这个兜底：这个兜底本身
+    // 依赖的正是 FIX 1 要绕开的"跨进程 mtime/len 可见性"假设，一旦新表恰好
+    // 建在一个"此前已扫描、已安静超过新鲜度 slack、本次 metadata 又恰好
+    // 滞后报旧值"的分片里，`find_msg_shards` 会把它误判 Fresh（缓存的表集
+    // 不含新表名）直接跳过，导致这个全新会话的首条消息永久漏掉。
+    //
+    // 详见 [`shards_to_force_invalidate`]：只要本轮 `changed` 里存在至少
+    // 一个"定位不到承载分片"的会话，就退化为对 `names.msg_db_keys` 全部
+    // 消息分片各作废一次（逼 `find_msg_shards` 本轮对所有非 dormant 分片
+    // 现场重新 `open()`），代价仅仅是这一轮多几次重扫；changed 全是已知
+    // 会话（都能精准定位到承载分片）的稳态下，只精准作废这些分片，不做
+    // 全量 nuke，缓存命中率不受影响。
+    {
+        let shards_to_invalidate = shards_to_force_invalidate(db, &changed, &names.msg_db_keys);
+        for rel_key in &shards_to_invalidate {
+            db.invalidate_shard(rel_key);
+        }
     }
 
     // 4. 只查询有新消息的会话的消息表
@@ -3183,7 +3454,11 @@ pub async fn q_stats(
     let mut shard_hits = 0usize;
 
     for shard in &shards {
-        let conn_params = db.conn_params(&shard.rel_key)?;
+        // FIX 4：`shards` 来自 `find_msg_shards`，已经用
+        // `hot_conn_handle_with_snapshot` 为这个 rel_key 开过（或复用过）
+        // 一次热连接。这里改用 `hot_conn_handle` 复用同一个槽位，消除原本
+        // `conn_params.open()` 造成的第二次物理打开。
+        let hot = db.hot_conn_handle(&shard.rel_key)?;
         let tname = shard.table.clone();
         let uname = username.clone();
         let is_group2 = is_group;
@@ -3191,8 +3466,8 @@ pub async fn q_stats(
         // 用 SQL GROUP BY 在数据库侧聚合，避免把全量消息内容加载进内存
         let result: (i64, HashMap<String, i64>, HashMap<String, i64>, [i64; 24]) =
             tokio::task::spawn_blocking(move || {
-                let conn = conn_params.open()?;
-                let id2u = load_id2u(&conn);
+                hot.with(|conn| {
+                let id2u = load_id2u(conn);
 
                 let mut clauses = Vec::new();
                 let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -3282,6 +3557,7 @@ pub async fn q_stats(
                 }
 
                 Ok::<_, anyhow::Error>((count, type_c, sender_c, hour_c))
+                })
             }).await??;
 
         let (count, type_c, sender_c, hour_c) = result;
@@ -4234,7 +4510,11 @@ pub async fn q_attachments(
     let mut shard_hits = 0usize;
     // 元组：(local_id, local_type_lo32, create_time, real_sender_id, sender_label, ts_for_sort, db_idx)
     for (db_idx, shard) in shards.iter().enumerate() {
-        let conn_params = db.conn_params(&shard.rel_key)?;
+        // FIX 4：`shards` 来自 `find_msg_shards`，已经用
+        // `hot_conn_handle_with_snapshot` 为这个 rel_key 开过（或复用过）
+        // 一次热连接。这里改用 `hot_conn_handle` 复用同一个槽位，消除原本
+        // `conn_params.open()` 造成的第二次物理打开。
+        let hot = db.hot_conn_handle(&shard.rel_key)?;
         let tname = shard.table.clone();
         let uname = username.clone();
         let is_group2 = is_group;
@@ -4249,8 +4529,8 @@ pub async fn q_attachments(
 
         let rows: Vec<(i64, i64, i64, i64, String, i64, i64)> =
             tokio::task::spawn_blocking(move || {
-                let conn = conn_params.open()?;
-                let id2u = load_id2u(&conn);
+                hot.with(|conn| {
+                let id2u = load_id2u(conn);
 
                 // local_type 在 DB 里可能带高位 flag，过滤要 mask 低 32 bit
                 let placeholders = lo32_types2
@@ -4313,6 +4593,7 @@ pub async fn q_attachments(
                     .filter_map(|r| r.ok())
                     .collect();
                 Ok::<_, anyhow::Error>(rows)
+                })
             })
             .await??;
         if !rows.is_empty() {
