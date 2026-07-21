@@ -1,0 +1,30 @@
+{
+  "name": "wxeasy",
+  "version": "0.3.0",
+  "description": "Query your local WeChat data from the command line. Designed for LLM agent tool calls.",
+  "bin": {
+    "wxeasy": "bin/wxeasy.js"
+  },
+  "scripts": {
+    "postinstall": "node install.js"
+  },
+  "files": [
+    "bin/",
+    "install.js"
+  ],
+  "optionalDependencies": {
+    "wxeasy-darwin-arm64": "0.3.0",
+    "wxeasy-darwin-x64":   "0.3.0",
+    "wxeasy-linux-x64":    "0.3.0",
+    "wxeasy-linux-arm64":  "0.3.0",
+    "wxeasy-win32-x64":    "0.3.0"
+  },
+  "engines": { "node": ">=14" },
+  "keywords": ["wechat", "cli", "wx", "llm", "ai", "sqlite", "sqlcipher"],
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/okooo5km/wxeasy"
+  },
+  "publishConfig": { "access": "public" }
+}
