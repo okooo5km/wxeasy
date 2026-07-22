@@ -155,17 +155,91 @@ pub fn wal_path_for(main_db_path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// 扫描阶段一次底层读的缓冲大小。机械盘上把「每帧 seek + 24 字节小读」的
+/// 跨步模式换成 4MiB 级顺序大块读：100MB WAL 的底层读从 ~2.5 万次 syscall
+/// 降到 ~25 次，且不再依赖 OS readahead 在内存压力下的可靠性（cache
+/// manager 内存吃紧时会收缩 readahead，跨步小读会退化成逐帧等一次旋转
+/// 延迟——这正是慢盘卡死场景的隐藏贡献者之一）。
+const WAL_SCAN_BUF_SZ: usize = 4 * 1024 * 1024;
+
+/// 帧头扫描的纯逻辑段（从 [`build_wal_index`] 抽出以便直接测试两条守护
+/// 语义）。`file_len` 是**扫描开始前**读到的长度快照：
+///
+/// - **长度快照封顶**：只解析 `file_len` 以内的完整帧。扫描期间微信追加的
+///   新帧（reader 可能已经缓冲到其字节）一律不解析——与旧的逐帧 seek 实现
+///   完全一致，保证「索引边界 == 快照时刻」的语义。
+/// - **中途截断 fail-loud**：`file_len` 以内的字节竟然读不满（微信
+///   checkpoint TRUNCATE 把 `-wal` 截短的瞬间）必须原样报错、让整个 open
+///   失败由上层重试——绝不能把文件**中段**的 short read 静默当成「半截
+///   尾帧」成功返回，否则会在主库正被 checkpoint 回填的瞬间产出一个貌似
+///   有效、实则截断的索引，扩大撕裂视图窗口。
+///
+/// 尾部不足一整帧的残留字节（`file_len` 本身没对齐到帧边界）仍视为
+/// 「正在写入中的半截帧」直接忽略——那是写入协议的正常形态，与「快照内
+/// 的字节消失了」是两回事。
+fn scan_wal_frames<R: io::Read + io::Seek>(
+    reader: &mut R,
+    file_len: u64,
+    salt1: u32,
+    salt2: u32,
+) -> io::Result<WalFrameIndex> {
+    let frame_size = (WAL_FRAME_HDR + PAGE_SZ) as u64;
+    let mut frame_offsets: HashMap<u32, u64> = HashMap::new();
+    let mut last_commit_pgcnt: Option<u32> = None;
+    let mut frames_total = 0usize;
+    let mut frames_valid = 0usize;
+
+    let mut pos = WAL_HDR_SZ as u64;
+    let mut fh_buf = [0u8; WAL_FRAME_HDR];
+    reader.seek(SeekFrom::Start(pos))?;
+
+    let mut buffered = io::BufReader::with_capacity(WAL_SCAN_BUF_SZ, reader);
+    while pos + frame_size <= file_len {
+        // read_exact 在快照边界内读不满 ⇒ UnexpectedEof 原样上抛（fail-loud）。
+        buffered.read_exact(&mut fh_buf)?;
+        let fh = FrameHeader::parse(&fh_buf);
+
+        let page_data_offset = pos + WAL_FRAME_HDR as u64;
+        frames_total += 1;
+
+        // pgno 合法性 + salt 匹配，逐字对齐 wxeasy crypto::wal::apply_wal 的判定条件。
+        if fh.pgno != 0 && fh.pgno <= 1_000_000 && fh.salt1 == salt1 && fh.salt2 == salt2 {
+            frames_valid += 1;
+            // 同一 pgno 多次出现时，后出现的（文件序靠后 = 更新）覆盖先出现的。
+            frame_offsets.insert(fh.pgno, page_data_offset);
+            if fh.commit_pgcnt != 0 {
+                last_commit_pgcnt = Some(fh.commit_pgcnt);
+            }
+        }
+
+        // 跳过本帧的 page_data，不读取、不解密。`seek_relative` 在缓冲区内
+        // 命中时纯指针移动、零 syscall——底层 IO 因此聚合成 4MiB 级顺序读。
+        buffered.seek_relative(PAGE_SZ as i64)?;
+        pos += frame_size;
+    }
+
+    Ok(WalFrameIndex {
+        frame_offsets,
+        last_commit_pgcnt,
+        header_salt1: salt1,
+        header_salt2: salt2,
+        frames_total,
+        frames_valid,
+    })
+}
+
 /// 打开 `-wal` 文件并扫描全部帧头，建立索引。
 ///
 /// - 若文件不存在，或存在但小到连一个完整 header 都放不下，返回 `Ok(None)`
 ///   （语义等价于"没有 WAL，请只读主库"，与 `crypto::wal::apply_wal` 遇到同样
 ///   情况时直接 `return Ok(())`——即"不做任何改动"——完全对应）。
-/// - 扫描阶段只读取每帧的 24 字节帧头，然后 `seek` 跳过 `PAGE_SZ` 字节的
-///   page_data，绝不读取、更不解密页内容本身，扫描成本是 `O(帧数 × 24字节)`，
-///   与 WAL 文件总大小（`帧数 × 4120字节`）相比可以忽略。
-/// - 尾部不足一整帧（帧头 + page_data）的残留字节视为"正在写入中的半截帧"，
-///   直接停止扫描（标准 SQLite 行为：WAL writer 总是先写完整帧再推进
-///   commit，读者看到的半截尾巴必然是未完成的追加，理应忽略）。
+/// - 扫描阶段只解析每帧的 24 字节帧头、跳过 page_data，绝不解密页内容；
+///   底层 IO 是 [`WAL_SCAN_BUF_SZ`] 级的顺序大块读（见 [`scan_wal_frames`]，
+///   两条守护语义——长度快照封顶、中途截断 fail-loud——也在那里说明）。
+/// - 扫描用完的 `File` 句柄原样留给 [`WalSource`] 做后续随机页读，**不加**
+///   `FILE_FLAG_SEQUENTIAL_SCAN` 之类的访问模式提示：该句柄的主要用途是
+///   `read_raw_page` 的随机 seek，SEQUENTIAL_SCAN 会让 cache manager 对它
+///   激进 evict-behind，反伤后续随机读。
 pub fn build_wal_index(wal_path: &Path) -> io::Result<Option<WalSource>> {
     let mut file = match File::open(wal_path) {
         Ok(f) => f,
@@ -184,48 +258,9 @@ pub fn build_wal_index(wal_path: &Path) -> io::Result<Option<WalSource>> {
     let salt1 = u32::from_be_bytes(header[16..20].try_into().unwrap());
     let salt2 = u32::from_be_bytes(header[20..24].try_into().unwrap());
 
-    let frame_size = (WAL_FRAME_HDR + PAGE_SZ) as u64;
-    let mut frame_offsets: HashMap<u32, u64> = HashMap::new();
-    let mut last_commit_pgcnt: Option<u32> = None;
-    let mut frames_total = 0usize;
-    let mut frames_valid = 0usize;
+    let index = scan_wal_frames(&mut file, file_len, salt1, salt2)?;
 
-    let mut pos = WAL_HDR_SZ as u64;
-    let mut fh_buf = [0u8; WAL_FRAME_HDR];
-
-    while pos + frame_size <= file_len {
-        file.seek(SeekFrom::Start(pos))?;
-        file.read_exact(&mut fh_buf)?;
-        let fh = FrameHeader::parse(&fh_buf);
-
-        let page_data_offset = pos + WAL_FRAME_HDR as u64;
-        frames_total += 1;
-
-        // pgno 合法性 + salt 匹配，逐字对齐 wxeasy crypto::wal::apply_wal 的判定条件。
-        if fh.pgno != 0 && fh.pgno <= 1_000_000 && fh.salt1 == salt1 && fh.salt2 == salt2 {
-            frames_valid += 1;
-            // 同一 pgno 多次出现时，后出现的（文件序靠后 = 更新）覆盖先出现的。
-            frame_offsets.insert(fh.pgno, page_data_offset);
-            if fh.commit_pgcnt != 0 {
-                last_commit_pgcnt = Some(fh.commit_pgcnt);
-            }
-        }
-
-        // 跳过本帧的 page_data，不读取、不解密。
-        pos += frame_size;
-    }
-
-    Ok(Some(WalSource {
-        file,
-        index: WalFrameIndex {
-            frame_offsets,
-            last_commit_pgcnt,
-            header_salt1: salt1,
-            header_salt2: salt2,
-            frames_total,
-            frames_valid,
-        },
-    }))
+    Ok(Some(WalSource { file, index }))
 }
 
 #[cfg(test)]
@@ -367,6 +402,49 @@ mod tests {
         assert!(build_wal_index(&header_only).unwrap().is_none());
 
         let _ = std::fs::remove_file(&header_only);
+    }
+
+    /// 守护语义 1（长度快照封顶）：扫描以 `file_len` 快照为界——实际字节
+    /// 比快照多（模拟「扫描开始后微信又追加了新帧、且已被缓冲读读进来」）
+    /// 时，快照之外的完整帧必须被忽略，索引边界严格等于快照时刻。
+    #[test]
+    fn frames_beyond_len_snapshot_are_ignored() {
+        let s1 = 0xAB_u32;
+        let s2 = 0xCD_u32;
+        let mut buf = write_wal_header(s1, s2);
+        buf.extend(write_frame(1, 1, s1, s2, 0x1));
+        let snapshot_len = buf.len() as u64;
+        // 快照之后追加的完整帧：字节在 reader 里可读，但不得被解析。
+        buf.extend(write_frame(2, 2, s1, s2, 0x2));
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let index = scan_wal_frames(&mut cursor, snapshot_len, s1, s2).unwrap();
+        assert_eq!(index.frames_total, 1, "快照之外的帧不得被解析");
+        assert!(index.offset_for(1).is_some());
+        assert!(index.offset_for(2).is_none(), "快照后追加的 pgno=2 不得进索引");
+        assert_eq!(index.last_commit_pgcnt(), Some(1));
+    }
+
+    /// 守护语义 2（中途截断 fail-loud）：`file_len` 快照以内的字节读不满
+    /// （微信 checkpoint TRUNCATE 把 -wal 截短的瞬间）必须报错让上层重试，
+    /// 绝不能静默返回一个截断的索引。
+    #[test]
+    fn truncation_inside_len_snapshot_fails_loud() {
+        let s1 = 0x11_u32;
+        let s2 = 0x22_u32;
+        let mut buf = write_wal_header(s1, s2);
+        buf.extend(write_frame(1, 1, s1, s2, 0x1));
+        buf.extend(write_frame(2, 2, s1, s2, 0x2));
+        let claimed_len = buf.len() as u64;
+        // 模拟截断：快照说有两帧，实际字节在第二帧帧头中间就断了
+        // （残留 < 24 字节帧头，read_exact 必然 UnexpectedEof——这正是旧
+        // 逐帧实现的报错点，缓冲实现必须原样保留）。
+        buf.truncate(WAL_HDR_SZ + (WAL_FRAME_HDR + PAGE_SZ) + 10);
+
+        let mut cursor = std::io::Cursor::new(buf);
+        let err = scan_wal_frames(&mut cursor, claimed_len, s1, s2)
+            .expect_err("快照内字节缺失必须报错，不能静默成功");
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
     /// 尾部残留半截帧（写入过程中被截断的典型形态）必须被忽略，不能 panic
