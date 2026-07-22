@@ -99,6 +99,12 @@ async fn serve_windows(
     // 竞态修复：daemon 重启（stop 后立即被新命令拉起）时，旧进程可能还差
     // 几百毫秒才死透、管道名尚未释放，首次 create 会失败。这里带退避重试
     // 最多 5 秒，而不是直接放弃退出（否则 CLI 侧只能等满 15s 启动超时）。
+    //
+    // 注意这个竞态里的错误码同样是 `拒绝访问 (os error 5)`——管道名被在世的
+    // 持有者占着，`FILE_FLAG_FIRST_PIPE_INSTANCE` 就是这么报的。所以不能一
+    // 看到 ACCESS_DENIED 就下结论「有残留实例」提前退出，只有等重试预算耗尽
+    // 才谈得上是真占用；那时才做诊断（`pipe_diag`），把「谁占着、怎么杀」写
+    // 进日志——否则用户侧只有一句「启动超时」，毫无线索。
     let listener = {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut warned = false;
@@ -113,7 +119,12 @@ async fn serve_windows(
                     }
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
-                Err(e) => return Err(e.into()),
+                Err(e) => {
+                    for line in crate::pipe_diag::bind_failure_report(&e) {
+                        eprintln!("[server] {}", line);
+                    }
+                    return Err(e.into());
+                }
             }
         }
     };

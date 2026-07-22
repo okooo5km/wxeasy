@@ -26,6 +26,15 @@ fn cmd_status() -> Result<()> {
         println!("wxeasy-daemon 运行中 (PID {})", pid);
     } else {
         println!("wxeasy-daemon 未运行");
+        // Windows：「未运行」有可能是误判——管道被一个当前令牌连不上的实例
+        // 占着时，探活失败与真的没起来完全无法区分。这是用户排查时最先敲的
+        // 命令，能定性就在这里把真相说清楚。
+        #[cfg(windows)]
+        {
+            if let Some(hint) = crate::pipe_diag::hint() {
+                println!("\n{}", hint);
+            }
+        }
     }
     Ok(())
 }

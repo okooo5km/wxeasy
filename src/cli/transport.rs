@@ -51,6 +51,13 @@ pub fn ensure_daemon() -> Result<()> {
     if is_alive() {
         return Ok(());
     }
+    // Windows：[`is_alive`] 把「连接被拒」也归成「daemon 没运行」，但这两件
+    // 事的处置完全相反——管道被一个当前令牌够不着的实例占着时，再 spawn 一个
+    // daemon 只会重演「抢不到管道 → 5s 后自杀 → CLI 等满 15s 超时」。这里先
+    // 探一次管道，确认是这种情况就直接告诉用户谁占着、怎么杀，不白等。
+    #[cfg(windows)]
+    crate::pipe_diag::preflight_before_spawn()?;
+
     eprintln!("启动 wxeasy-daemon...");
     start_daemon()?;
     Ok(())
@@ -208,11 +215,22 @@ fn start_daemon() -> Result<()> {
         }
     }
 
-    bail!(
-        "wxeasy-daemon 启动超时（>{}s）\n请查看日志: {}",
-        STARTUP_TIMEOUT_SECS,
+    // 光一句「启动超时」是最没用的报错——用户既不知道是慢盘、权限还是管道被
+    // 占，只能去翻日志。Windows 上顺手探一次管道，能定性就把结论直接写进
+    // 报错里（见 `pipe_diag`）。
+    let mut msg = format!("wxeasy-daemon 启动超时（>{}s）", STARTUP_TIMEOUT_SECS);
+    #[cfg(windows)]
+    {
+        if let Some(hint) = crate::pipe_diag::hint() {
+            msg.push_str("\n\n");
+            msg.push_str(&hint);
+        }
+    }
+    msg.push_str(&format!(
+        "\n\n请查看日志: {}",
         config::log_path().display()
-    )
+    ));
+    bail!("{}", msg)
 }
 
 fn write_pid_file(pid: u32, exe: &Path) -> Result<()> {
