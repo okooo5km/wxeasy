@@ -188,6 +188,11 @@ const WAL_SCAN_BUF_SZ: usize = 4 * 1024 * 1024;
 /// `start_pos = WAL_HDR_SZ`、`seed` 为默认空状态。返回索引与本次扫描终点
 /// （最后一个已解析完整帧之后的字节偏移——**必须**以它作为下次续扫起点，
 /// 不能用 `file_len` 推算：`file_len` 可能落在半截尾帧中间）。
+/// 大 WAL 扫描的进度心跳步长（每扫过这么多字节打一条速率日志）。
+const WAL_SCAN_PROGRESS_STEP: u64 = 1024 * 1024 * 1024; // 1 GiB
+/// 只有待扫区间超过这个阈值才打进度日志，避免小 WAL 刷屏。
+const WAL_SCAN_PROGRESS_MIN: u64 = 512 * 1024 * 1024; // 512 MiB
+
 fn scan_wal_frames<R: io::Read + io::Seek>(
     reader: &mut R,
     start_pos: u64,
@@ -195,6 +200,7 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
     salt1: u32,
     salt2: u32,
     seed: WalFrameIndex,
+    progress_tag: Option<&str>,
 ) -> io::Result<(WalFrameIndex, u64)> {
     let frame_size = (WAL_FRAME_HDR + PAGE_SZ) as u64;
     let mut frame_offsets = seed.frame_offsets;
@@ -205,6 +211,20 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
     let mut pos = start_pos;
     let mut fh_buf = [0u8; WAL_FRAME_HDR];
     reader.seek(SeekFrom::Start(pos))?;
+
+    // 进度心跳：仅当待扫区间够大且调用方要求时才启用（诊断用）。
+    let to_scan = file_len.saturating_sub(start_pos);
+    let progress = progress_tag.filter(|_| to_scan >= WAL_SCAN_PROGRESS_MIN);
+    let started = std::time::Instant::now();
+    let mut next_report = start_pos + WAL_SCAN_PROGRESS_STEP;
+    if let Some(tag) = progress {
+        eprintln!(
+            "[wal-scan] {}: 开始扫描 {:.2} GB（起点 {:.2} GB）",
+            tag,
+            to_scan as f64 / 1e9,
+            start_pos as f64 / 1e9
+        );
+    }
 
     let mut buffered = io::BufReader::with_capacity(WAL_SCAN_BUF_SZ, reader);
     while pos + frame_size <= file_len {
@@ -229,6 +249,33 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
         // 命中时纯指针移动、零 syscall——底层 IO 因此聚合成 4MiB 级顺序读。
         buffered.seek_relative(PAGE_SZ as i64)?;
         pos += frame_size;
+
+        if let Some(tag) = progress {
+            if pos >= next_report {
+                let done = pos - start_pos;
+                let secs = started.elapsed().as_secs_f64().max(0.001);
+                eprintln!(
+                    "[wal-scan] {}: {:.1}/{:.1} GB, {:.0} MB/s, {} 帧 {} 覆盖页",
+                    tag,
+                    done as f64 / 1e9,
+                    to_scan as f64 / 1e9,
+                    (done as f64 / 1e6) / secs,
+                    frames_total,
+                    frame_offsets.len()
+                );
+                next_report += WAL_SCAN_PROGRESS_STEP;
+            }
+        }
+    }
+
+    if let Some(tag) = progress {
+        eprintln!(
+            "[wal-scan] {} 完成: {} 帧, {} 覆盖页, 耗时 {:.1}s",
+            tag,
+            frames_total,
+            frame_offsets.len(),
+            started.elapsed().as_secs_f64()
+        );
     }
 
     Ok((
@@ -269,6 +316,9 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
 #[derive(Default)]
 pub struct WalIndexCache {
     entry: Option<CachedWalScan>,
+    /// 已落盘持久化文件所反映的扫描终点（见 [`build_wal_index_cached`] 的
+    /// 持久化决策）。用来避免稳态轮询里每个小增量都重写整份磁盘文件。
+    persisted_scan_end: u64,
 }
 
 struct CachedWalScan {
@@ -279,15 +329,154 @@ struct CachedWalScan {
     index: Arc<WalFrameIndex>,
 }
 
+// ---------------------------------------------------------------------------
+// WAL 帧索引的跨 daemon-重启持久化
+// ---------------------------------------------------------------------------
+//
+// 病态大 WAL 场景（真实用户：message_1.db 主库 ~0、其 -wal 达 16GB，微信从
+// 未 checkpoint）：每次 daemon 重启后首个碰到该分片的查询都要全量重扫 16GB
+// （SSD ~17s，机械盘分钟级）。[`WalIndexCache`] 的内存增量缓存只在 daemon
+// 存活期有效，重启即丢。
+//
+// 持久化把「salt + 扫描终点 + pgno→偏移映射」落盘：重启后若磁盘记录的 salt
+// 与当前 -wal header 一致、且文件未缩短，就把它当作 [`scan_wal_frames`] 的
+// 种子，只续扫「持久化终点 → 当前 EOF」这一小段增量，跳过整段 16GB 重扫。
+//
+// # 正确性
+// 与内存增量缓存**同一套论证**（WAL 同 salt 世代内严格 append-only）：磁盘
+// 记录的帧偏移在同一物理文件里恒定有效，唯一概率性假设仍是 salt1+salt2 共
+// 64bit 跨世代碰撞（~2⁻⁶⁴）。salt 不匹配（checkpoint/reset 发生过）或文件
+// 变短 ⇒ 忽略磁盘记录、全量重扫。任何解析失败一律忽略走全量路径——文件只是
+// 影子，绝不影响正确性。映射存的是 pgno→**加密 -wal 内字节偏移**，不含任何
+// 明文页内容，无隐私回退。
+//
+// # 文件格式（`{cache_dir}/wal-index/{md5(wal_path)}.wix`，小端）
+// magic"WIX1"(4) | salt1(4) | salt2(4) | scan_end(8) | has_commit(1) |
+// commit_pgcnt(4) | count(8) | count×( pgno(4) | offset(8) )
+// message_1 的 27 万覆盖页 ⇒ 约 3MB，映射规模只随「逻辑库页数」增长、不随
+// WAL 字节大小增长（同页多次改写只占一个条目）。
+
+const WAL_PERSIST_MAGIC: &[u8; 4] = b"WIX1";
+/// 增量重写磁盘文件的最小新增量：稳态轮询里小增量不重写（重启时重扫这点
+/// 尾巴很便宜），只有累计新增超过这个阈值才落盘。同时也是全量扫描后必然
+/// 落盘的兜底之外的节流阀。
+const WAL_PERSIST_MIN_DELTA: u64 = 512 * 1024 * 1024;
+
+fn wal_persist_path(dir: &Path, wal_path: &Path) -> PathBuf {
+    let h = format!("{:x}", md5::compute(wal_path.to_string_lossy().as_bytes()));
+    dir.join(format!("{}.wix", h))
+}
+
+/// 读取并校验持久化的 WAL 帧索引。任何不匹配 / 损坏返回 `None` 走全量路径。
+fn load_persisted_index(
+    dir: &Path,
+    wal_path: &Path,
+    cur_salt1: u32,
+    cur_salt2: u32,
+    file_len: u64,
+) -> Option<(WalFrameIndex, u64)> {
+    let data = std::fs::read(wal_persist_path(dir, wal_path)).ok()?;
+    const HEAD: usize = 4 + 4 + 4 + 8 + 1 + 4 + 8;
+    if data.len() < HEAD || &data[0..4] != WAL_PERSIST_MAGIC {
+        return None;
+    }
+    let rd_u32 = |o: usize| u32::from_le_bytes(data[o..o + 4].try_into().unwrap());
+    let rd_u64 = |o: usize| u64::from_le_bytes(data[o..o + 8].try_into().unwrap());
+    let salt1 = rd_u32(4);
+    let salt2 = rd_u32(8);
+    // salt 不一致（发生过 checkpoint/reset）或文件变短 ⇒ 磁盘记录作废。
+    if salt1 != cur_salt1 || salt2 != cur_salt2 {
+        return None;
+    }
+    let scan_end = rd_u64(12);
+    if file_len < scan_end {
+        return None;
+    }
+    let has_commit = data[20] != 0;
+    let commit = rd_u32(21);
+    let count = rd_u64(25) as usize;
+    let body = &data[HEAD..];
+    if body.len() != count.checked_mul(12)? {
+        return None;
+    }
+    let mut frame_offsets: HashMap<u32, u64> = HashMap::with_capacity(count);
+    for i in 0..count {
+        let o = i * 12;
+        let pgno = u32::from_le_bytes(body[o..o + 4].try_into().unwrap());
+        let off = u64::from_le_bytes(body[o + 4..o + 12].try_into().unwrap());
+        // 偏移必须落在 scan_end 之内（防篡改/损坏引入越界读）。
+        if off.checked_add(PAGE_SZ as u64)? > scan_end {
+            return None;
+        }
+        frame_offsets.insert(pgno, off);
+    }
+    let index = WalFrameIndex {
+        frame_offsets,
+        last_commit_pgcnt: has_commit.then_some(commit),
+        header_salt1: salt1,
+        header_salt2: salt2,
+        // frames_total/valid 仅诊断用途，加载后无精确值，用覆盖页数近似。
+        frames_total: count,
+        frames_valid: count,
+    };
+    Some((index, scan_end))
+}
+
+/// 原子写持久化文件（临时文件 + rename）。失败静默忽略——影子文件而已。
+fn save_persisted_index(
+    dir: &Path,
+    wal_path: &Path,
+    salt1: u32,
+    salt2: u32,
+    scan_end: u64,
+    index: &WalFrameIndex,
+) {
+    if std::fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let count = index.frame_offsets.len();
+    let mut buf = Vec::with_capacity(4 + 4 + 4 + 8 + 1 + 4 + 8 + count * 12);
+    buf.extend_from_slice(WAL_PERSIST_MAGIC);
+    buf.extend_from_slice(&salt1.to_le_bytes());
+    buf.extend_from_slice(&salt2.to_le_bytes());
+    buf.extend_from_slice(&scan_end.to_le_bytes());
+    match index.last_commit_pgcnt {
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+        None => {
+            buf.push(0);
+            buf.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
+    buf.extend_from_slice(&(count as u64).to_le_bytes());
+    for (pgno, off) in &index.frame_offsets {
+        buf.extend_from_slice(&pgno.to_le_bytes());
+        buf.extend_from_slice(&off.to_le_bytes());
+    }
+    let path = wal_persist_path(dir, wal_path);
+    let tmp = path.with_extension("wix.tmp");
+    if std::fs::write(&tmp, &buf).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
 /// 带增量缓存的 [`build_wal_index`]。
 ///
 /// 复用条件（全部满足才续扫，否则全量重扫）：header salt 与缓存一致、
 /// `file_len >= 缓存终点`。无新帧（`file_len` 不足再放一个完整帧）时直接
 /// 零拷贝复用缓存的 `Arc` 快照——稳态轮询里「分片被强制作废重建、但 WAL
 /// 本身没长」的场景整段 WAL 重扫直接消失。
+///
+/// `persist_dir` 为 `Some` 时启用跨 daemon-重启持久化（见本模块「WAL 帧
+/// 索引的跨 daemon-重启持久化」一节）：内存缓存 miss 时先尝试从磁盘加载，
+/// 只续扫增量；扫描后按节流规则落盘。传 `None` 关闭持久化（测试 / 无缓存
+/// 目录场景）。
 pub fn build_wal_index_cached(
     wal_path: &Path,
     cache: &std::sync::Mutex<WalIndexCache>,
+    persist_dir: Option<&Path>,
 ) -> io::Result<Option<WalSource>> {
     let mut file = match File::open(wal_path) {
         Ok(f) => f,
@@ -314,20 +503,40 @@ pub fn build_wal_index_cached(
         })
     };
 
+    // 内存缓存 miss（典型是 daemon 重启后首次打开该分片）时，尝试从磁盘
+    // 加载持久化索引作为增量种子——这一步就是跳过 16GB 冷扫的关键。加载
+    // 成功即把 `persisted_scan_end` 同步为磁盘记录的终点，避免续扫后立刻
+    // 又重写整份文件。
+    let mut loaded_from_disk_end: Option<u64> = None;
+    let seed = cached.or_else(|| {
+        let dir = persist_dir?;
+        let (idx, end) = load_persisted_index(dir, wal_path, salt1, salt2, file_len)?;
+        loaded_from_disk_end = Some(end);
+        Some((end, Arc::new(idx)))
+    });
+
+    // 诊断标签：用 -wal 文件名，进度日志里能看出是哪个分片在扫。
+    let tag = wal_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("wal");
     let frame_size = (WAL_FRAME_HDR + PAGE_SZ) as u64;
-    let (index, scan_end) = match cached {
+    let mut did_full_scan = false;
+    let (index, scan_end) = match seed {
         Some((start, snapshot)) if start + frame_size > file_len => {
-            // 无新完整帧：零拷贝复用缓存快照，整段 WAL 重扫消失。
+            // 无新完整帧：零拷贝复用快照，整段 WAL 重扫消失。
             (snapshot, start)
         }
         Some((start, snapshot)) => {
             // 有新帧：深拷贝一次旧快照做种子、只扫增量区间。旧 Arc 不动
             // ——已存在连接的视图保持冻结。
-            let seed = (*snapshot).clone();
-            let (merged, end) = scan_wal_frames(&mut file, start, file_len, salt1, salt2, seed)?;
+            let seed_idx = (*snapshot).clone();
+            let (merged, end) =
+                scan_wal_frames(&mut file, start, file_len, salt1, salt2, seed_idx, Some(tag))?;
             (Arc::new(merged), end)
         }
         None => {
+            did_full_scan = true;
             let (full, end) = scan_wal_frames(
                 &mut file,
                 WAL_HDR_SZ as u64,
@@ -335,10 +544,27 @@ pub fn build_wal_index_cached(
                 salt1,
                 salt2,
                 WalFrameIndex::default(),
+                Some(tag),
             )?;
             (Arc::new(full), end)
         }
     };
+
+    // 决定是否落盘（节流）：全量扫描后必落（这是要保住的 16GB 成果）；
+    // 增量场景仅当自上次落盘以来新增超过阈值才重写。磁盘 IO 在锁外。
+    let persist_decision = persist_dir.map(|dir| {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(end) = loaded_from_disk_end {
+            // 本次种子来自磁盘：磁盘已有到 `end` 的记录。
+            guard.persisted_scan_end = guard.persisted_scan_end.max(end);
+        }
+        let should = did_full_scan
+            || scan_end.saturating_sub(guard.persisted_scan_end) >= WAL_PERSIST_MIN_DELTA;
+        if should {
+            guard.persisted_scan_end = scan_end;
+        }
+        (dir.to_path_buf(), should)
+    });
 
     {
         let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
@@ -348,6 +574,10 @@ pub fn build_wal_index_cached(
             scan_end,
             index: index.clone(),
         });
+    }
+
+    if let Some((dir, true)) = persist_decision {
+        save_persisted_index(&dir, wal_path, salt1, salt2, scan_end, &index);
     }
 
     Ok(Some(WalSource { file, index }))
@@ -393,6 +623,7 @@ pub fn build_wal_index(wal_path: &Path) -> io::Result<Option<WalSource>> {
         salt1,
         salt2,
         WalFrameIndex::default(),
+        None,
     )?;
 
     Ok(Some(WalSource {
@@ -563,6 +794,7 @@ mod tests {
             s1,
             s2,
             WalFrameIndex::default(),
+            None,
         )
         .unwrap();
         assert_eq!(index.frames_total, 1, "快照之外的帧不得被解析");
@@ -599,6 +831,7 @@ mod tests {
             s1,
             s2,
             WalFrameIndex::default(),
+            None,
         )
         .expect_err("快照内字节缺失必须报错，不能静默成功");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
@@ -618,13 +851,13 @@ mod tests {
         buf.extend(write_frame(8, 2, s1, s2, 0x02));
         std::fs::write(&path, &buf).unwrap();
 
-        let first = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        let first = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
         assert_eq!(first.index.frames_total, 2);
         assert_eq!(first.index.covered_page_count(), 2);
         let first_arc = first.index.clone();
 
         // 无变化的重建：必须零拷贝复用同一份快照。
-        let reused = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        let reused = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
         assert!(
             Arc::ptr_eq(&first_arc, &reused.index),
             "无新帧时必须复用缓存的同一份 Arc 快照"
@@ -636,7 +869,7 @@ mod tests {
         appended.extend(write_frame(9, 3, s1, s2, 0x04));
         std::fs::write(&path, &appended).unwrap();
 
-        let mut second = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        let mut second = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
         assert_eq!(second.index.frames_total, 4, "增量帧数应累积到旧快照之上");
         assert_eq!(second.index.covered_page_count(), 3);
         assert_eq!(second.index.last_commit_pgcnt(), Some(3));
@@ -677,7 +910,7 @@ mod tests {
         let mut buf = write_wal_header(old_s1, old_s2);
         buf.extend(write_frame(5, 1, old_s1, old_s2, 0x01));
         std::fs::write(&path, &buf).unwrap();
-        let first = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        let first = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
         assert_eq!(first.index.frames_valid, 1);
 
         // reset：新 header + 旧世代残留帧 + 新世代帧（restart 的典型形态）。
@@ -686,7 +919,7 @@ mod tests {
         reset.extend(write_frame(6, 2, new_s1, new_s2, 0x0B));
         std::fs::write(&path, &reset).unwrap();
 
-        let second = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        let second = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
         assert_eq!(second.index.frames_total, 2, "salt 变化必须触发全量重扫");
         assert_eq!(second.index.frames_valid, 1, "旧世代残留帧必须被过滤");
         assert!(second.index.offset_for(5).is_none());
@@ -707,16 +940,108 @@ mod tests {
         buf.extend(write_frame(1, 1, s1, s2, 0x01));
         buf.extend(write_frame(2, 2, s1, s2, 0x02));
         std::fs::write(&path, &buf).unwrap();
-        build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
 
         // 同 salt、但只剩一帧。
         buf.truncate(WAL_HDR_SZ + (WAL_FRAME_HDR + PAGE_SZ));
         std::fs::write(&path, &buf).unwrap();
-        let after = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        let after = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
         assert_eq!(after.index.frames_total, 1, "缩短的文件必须全量重扫");
         assert!(after.index.offset_for(2).is_none());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// 跨「daemon 重启」（新建一个空 WalIndexCache 模拟进程重启）的持久化：
+    /// 第一个进程全量扫描后落盘；第二个进程内存缓存为空，从磁盘加载种子、
+    /// 只续扫增量，绝不重扫已持久化的部分——这正是跳过 16GB 冷扫的核心。
+    #[test]
+    fn persisted_index_survives_restart_and_only_scans_delta() {
+        let dir = tmp_path("persist-restart-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("message_1.db-wal");
+        let (s1, s2) = (0xC0DE_u32, 0xF00D_u32);
+
+        // 进程 A：写两帧，全量扫描 + 落盘。
+        let mut buf = write_wal_header(s1, s2);
+        buf.extend(write_frame(7, 2, s1, s2, 0x01));
+        buf.extend(write_frame(8, 2, s1, s2, 0x02));
+        std::fs::write(&path, &buf).unwrap();
+        let cache_a = std::sync::Mutex::new(WalIndexCache::default());
+        let a = build_wal_index_cached(&path, &cache_a, Some(&dir)).unwrap().unwrap();
+        assert_eq!(a.index.covered_page_count(), 2);
+        assert!(wal_persist_path(&dir, &path).exists(), "全量扫描后必须落盘");
+
+        // 微信追加一帧（同 salt），然后「重启」：全新空缓存。
+        buf.extend(write_frame(9, 3, s1, s2, 0x03));
+        std::fs::write(&path, &buf).unwrap();
+        let cache_b = std::sync::Mutex::new(WalIndexCache::default());
+        let b = build_wal_index_cached(&path, &cache_b, Some(&dir)).unwrap().unwrap();
+
+        // 关键断言：frames_total 只反映「本进程实际扫过的帧」。从磁盘种子
+        // （2 帧的覆盖页，frames_total 近似记为 2）+ 只续扫 1 个新帧 ⇒ 3，
+        // 而不是重扫全部 3 帧后从 0 累积——证明没有全量重扫。
+        assert_eq!(b.index.covered_page_count(), 3);
+        assert_eq!(b.index.offset_for(9).is_some(), true);
+        assert_eq!(b.index.last_commit_pgcnt(), Some(3));
+        // 与无缓存全量扫描对拍：内容级一致。
+        let oracle = build_wal_index(&path).unwrap().unwrap();
+        for pg in [7u32, 8, 9] {
+            assert_eq!(b.index.offset_for(pg), oracle.index.offset_for(pg));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// checkpoint/reset（salt 变化）后，磁盘上的旧持久化记录必须被拒绝、
+    /// 全量重扫；不得用旧世代偏移拼出错误视图。
+    #[test]
+    fn persisted_index_rejected_on_salt_change() {
+        let dir = tmp_path("persist-salt-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("message_1.db-wal");
+        let (old1, old2) = (0x1111_u32, 0x2222_u32);
+        let (new1, new2) = (0x3333_u32, 0x4444_u32);
+
+        let mut buf = write_wal_header(old1, old2);
+        buf.extend(write_frame(5, 1, old1, old2, 0x01));
+        std::fs::write(&path, &buf).unwrap();
+        let cache_a = std::sync::Mutex::new(WalIndexCache::default());
+        build_wal_index_cached(&path, &cache_a, Some(&dir)).unwrap().unwrap();
+
+        // reset：新 header + 新世代帧（旧持久化记录的 salt 已对不上）。
+        let mut reset = write_wal_header(new1, new2);
+        reset.extend(write_frame(6, 2, new1, new2, 0x0B));
+        std::fs::write(&path, &reset).unwrap();
+        let cache_b = std::sync::Mutex::new(WalIndexCache::default());
+        let b = build_wal_index_cached(&path, &cache_b, Some(&dir)).unwrap().unwrap();
+        assert!(b.index.offset_for(5).is_none(), "旧世代 pgno 不得复活");
+        assert!(b.index.offset_for(6).is_some());
+        assert_eq!(b.index.frames_total, 1, "salt 变化必须全量重扫新世代");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 损坏的持久化文件必须被忽略、退化为全量扫描，且不 panic、不误读。
+    #[test]
+    fn corrupt_persisted_file_falls_back_to_full_scan() {
+        let dir = tmp_path("persist-corrupt-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("message_1.db-wal");
+        let (s1, s2) = (0xAB_u32, 0xCD_u32);
+        let mut buf = write_wal_header(s1, s2);
+        buf.extend(write_frame(3, 1, s1, s2, 0x01));
+        std::fs::write(&path, &buf).unwrap();
+
+        // 写一份垃圾持久化文件。
+        std::fs::write(wal_persist_path(&dir, &path), b"garbage not a wix file").unwrap();
+
+        let cache = std::sync::Mutex::new(WalIndexCache::default());
+        let src = build_wal_index_cached(&path, &cache, Some(&dir)).unwrap().unwrap();
+        assert_eq!(src.index.covered_page_count(), 1);
+        assert!(src.index.offset_for(3).is_some());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 尾部残留半截帧（写入过程中被截断的典型形态）必须被忽略，不能 panic

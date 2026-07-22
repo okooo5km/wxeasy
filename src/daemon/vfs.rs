@@ -109,18 +109,24 @@ pub struct WxVfs {
     /// 因此天然按物理路径分域、与 daemon 同寿命）。见 [`WalIndexCache`] 的
     /// 正确性论证。
     wal_cache: Arc<Mutex<WalIndexCache>>,
+    /// WAL 帧索引跨 daemon-重启持久化的落盘目录（`{cache_dir}/wal-index`）。
+    /// 由 `tmp_dir`（`{cache_dir}/vfs-tmp`）的父目录推导；父目录取不到时为
+    /// `None`，退化为纯内存增量缓存。
+    wal_persist_dir: Option<PathBuf>,
     tmp_counter: AtomicU64,
 }
 
 impl WxVfs {
     pub fn new(enc_path: PathBuf, key: [u8; 32], tmp_dir: PathBuf) -> (Self, Arc<Mutex<ReadStats>>) {
         let stats = Arc::new(Mutex::new(ReadStats::default()));
+        let wal_persist_dir = tmp_dir.parent().map(|c| c.join("wal-index"));
         let vfs = WxVfs {
             enc_path,
             key,
             tmp_dir,
             stats: stats.clone(),
             wal_cache: Arc::new(Mutex::new(WalIndexCache::default())),
+            wal_persist_dir,
             tmp_counter: AtomicU64::new(0),
         };
         (vfs, stats)
@@ -150,7 +156,11 @@ impl Vfs for WxVfs {
             // 未变 + 文件未缩」时把已扫过的同世代帧免于重扫（append-only
             // 协议保证等价，见 WalIndexCache 文档），新帧照常现场解析。
             let wal_path = wal_path_for(&self.enc_path);
-            let wal = build_wal_index_cached(&wal_path, &self.wal_cache)?;
+            let wal = build_wal_index_cached(
+                &wal_path,
+                &self.wal_cache,
+                self.wal_persist_dir.as_deref(),
+            )?;
 
             return Ok(WxFile::Merged(MergedFile {
                 main: file,
