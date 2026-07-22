@@ -862,6 +862,254 @@ pub async fn q_contacts(names: &Names, query: Option<&str>, limit: usize) -> Res
     Ok(json!({ "contacts": contacts, "total": total }))
 }
 
+/// 查询群聊列表
+///
+/// 与 [`q_contacts`] 对称：那边只留真人（private），群聊在这里独立出口。
+/// 基础列表来自 `names.map`（contact 表全量加载，天然含所有 `@chatroom`），
+/// 纯内存过滤、零磁盘 IO；类型判定统一走 [`chat_type_of`] 这条同样的真相判定。
+///
+/// `member_count` 是可选增强：contact.db 的 `chat_room` / `chatroom_member`
+/// 可查时用一次聚合查询带出（热连接池，成本一次表扫描）；老版本微信没有
+/// `chatroom_member` 表、或查询失败时，优雅降级为不带该字段——绝不因增强
+/// 信息拿不到而让基础列表报错。
+pub async fn q_groups(
+    db: &DbCache,
+    names: &Names,
+    query: Option<&str>,
+    limit: usize,
+) -> Result<Value> {
+    let (mut groups, total) = filter_groups(names, query, limit);
+
+    if !groups.is_empty() {
+        if let Ok(hot) = db.hot_conn_handle("contact/contact.db") {
+            let counts: HashMap<String, i64> = match tokio::task::spawn_blocking(move || {
+                hot.with(|conn| Ok(load_group_member_counts_from_conn(conn)))
+            })
+            .await
+            {
+                Ok(Ok(c)) => c,
+                // JoinError / 连接层错误都按"没有成员数"降级，不影响基础列表
+                _ => HashMap::new(),
+            };
+            for g in groups.iter_mut() {
+                let count = g["username"].as_str().and_then(|u| counts.get(u));
+                if let Some(c) = count {
+                    g["member_count"] = json!(c);
+                }
+            }
+        }
+    }
+
+    Ok(json!({ "groups": groups, "total": total }))
+}
+
+/// [`q_groups`] 的纯内存部分：过滤 + 排序 + 截断。单独拆出来是为了单测——
+/// 不需要 `DbCache` / tokio runtime 就能覆盖过滤和 limit 逻辑。
+/// 返回（截断后的列表，过滤后未截断的总数）。
+fn filter_groups(names: &Names, query: Option<&str>, limit: usize) -> (Vec<Value>, usize) {
+    let mut groups: Vec<Value> = names
+        .map
+        .iter()
+        .filter(|(u, _)| chat_type_of(u, names) == "group")
+        .map(|(u, d)| json!({ "username": u, "display": d }))
+        .collect();
+
+    if let Some(q) = query {
+        let low = q.to_lowercase();
+        groups.retain(|g| {
+            g["display"]
+                .as_str()
+                .map(|s| s.to_lowercase().contains(&low))
+                .unwrap_or(false)
+                || g["username"]
+                    .as_str()
+                    .map(|s| s.to_lowercase().contains(&low))
+                    .unwrap_or(false)
+        });
+    }
+
+    groups.sort_by(|a, b| {
+        a["display"]
+            .as_str()
+            .unwrap_or("")
+            .cmp(b["display"].as_str().unwrap_or(""))
+    });
+
+    let total = groups.len();
+    groups.truncate(limit);
+    (groups, total)
+}
+
+/// 一次聚合查询取全部群的成员数：`chatroom_member` 按 room_id 计数，经
+/// `chat_room` 的 id → username 映射回 `@chatroom` username。
+///
+/// WeChat 不同版本 `chat_room` 的 username 列名不同（username /
+/// chat_room_name / name，同 [`load_group_ext_buffer`] 的判据），逐个尝试，
+/// prepare 失败（列不存在）就换下一个。`chatroom_member` 表缺失（老版本微信）
+/// 或全部尝试失败时返回空 map，由调用方降级为不带 `member_count`。
+fn load_group_member_counts_from_conn(conn: &Connection) -> HashMap<String, i64> {
+    let has_table: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chatroom_member'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !has_table {
+        return HashMap::new();
+    }
+
+    for uname_col in ["username", "chat_room_name", "name"] {
+        let sql = format!(
+            "SELECT cr.{}, COUNT(*) FROM chat_room cr \
+             JOIN chatroom_member cm ON cm.room_id = cr.id \
+             GROUP BY cr.id",
+            uname_col
+        );
+        let Ok(mut stmt) = conn.prepare(&sql) else {
+            continue;
+        };
+        let rows: Option<HashMap<String, i64>> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0).unwrap_or_default(),
+                    row.get::<_, i64>(1).unwrap_or(0),
+                ))
+            })
+            .ok()
+            .map(|it| {
+                it.filter_map(|r| r.ok())
+                    .filter(|(u, _)| !u.is_empty())
+                    .collect()
+            });
+        if let Some(m) = rows {
+            return m;
+        }
+    }
+    HashMap::new()
+}
+
+#[cfg(test)]
+mod groups_tests {
+    use super::*;
+
+    fn names_with(entries: &[(&str, &str)]) -> Names {
+        Names {
+            map: entries
+                .iter()
+                .map(|(u, d)| (u.to_string(), d.to_string()))
+                .collect(),
+            md5_to_uname: HashMap::new(),
+            msg_db_keys: Vec::new(),
+            verify_flags: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn filter_groups_only_returns_chatrooms() {
+        let names = names_with(&[
+            ("111@chatroom", "AI 交流群"),
+            ("wxid_abc", "张三"),
+            ("gh_123", "某公众号"),
+            ("brandsessionholder", "折叠入口"),
+        ]);
+        let (groups, total) = filter_groups(&names, None, 50);
+        assert_eq!(total, 1);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["username"], "111@chatroom");
+        assert_eq!(groups[0]["display"], "AI 交流群");
+    }
+
+    #[test]
+    fn filter_groups_query_matches_display_and_username_case_insensitive() {
+        let names = names_with(&[
+            ("111@chatroom", "AI 交流群"),
+            ("222@chatroom", "家庭群"),
+            ("333ABC@chatroom", "读书会"),
+        ]);
+        // display 匹配（大小写不敏感）
+        let (groups, total) = filter_groups(&names, Some("ai"), 50);
+        assert_eq!(total, 1);
+        assert_eq!(groups[0]["username"], "111@chatroom");
+        // username 匹配（大小写不敏感）
+        let (groups, total) = filter_groups(&names, Some("333abc"), 50);
+        assert_eq!(total, 1);
+        assert_eq!(groups[0]["display"], "读书会");
+        // 不匹配任何
+        let (groups, total) = filter_groups(&names, Some("不存在"), 50);
+        assert_eq!(total, 0);
+        assert!(groups.is_empty());
+    }
+
+    #[test]
+    fn filter_groups_limit_truncates_but_total_keeps_full_count() {
+        let names = names_with(&[
+            ("111@chatroom", "b群"),
+            ("222@chatroom", "a群"),
+            ("333@chatroom", "c群"),
+        ]);
+        let (groups, total) = filter_groups(&names, None, 2);
+        assert_eq!(total, 3);
+        assert_eq!(groups.len(), 2);
+        // 按 display 字典序排序后再截断，保证分页确定性
+        assert_eq!(groups[0]["display"], "a群");
+        assert_eq!(groups[1]["display"], "b群");
+    }
+
+    /// 与 `cache.rs` 的 contact.db 回归测试同款真实 schema：
+    /// chat_room + chatroom_member 齐全时，聚合出正确的成员数。
+    #[test]
+    fn member_counts_full_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chat_room (id INTEGER PRIMARY KEY, username TEXT, owner TEXT);
+             CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);
+             INSERT INTO chat_room (id, username, owner) VALUES (1, '111@chatroom', 'wxid_o');
+             INSERT INTO chat_room (id, username, owner) VALUES (2, '222@chatroom', 'wxid_p');
+             INSERT INTO chatroom_member (room_id, member_id) VALUES (1, 1);
+             INSERT INTO chatroom_member (room_id, member_id) VALUES (1, 2);
+             INSERT INTO chatroom_member (room_id, member_id) VALUES (1, 3);
+             INSERT INTO chatroom_member (room_id, member_id) VALUES (2, 1);",
+        )
+        .unwrap();
+        let counts = load_group_member_counts_from_conn(&conn);
+        assert_eq!(counts.get("111@chatroom"), Some(&3));
+        assert_eq!(counts.get("222@chatroom"), Some(&1));
+        assert_eq!(counts.len(), 2);
+    }
+
+    /// 老版本微信 contact.db 没有 chatroom_member 表：必须降级为空 map，
+    /// 不能报错（q_groups 据此省略 member_count 字段）。
+    #[test]
+    fn member_counts_missing_chatroom_member_table_degrades_to_empty() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chat_room (id INTEGER PRIMARY KEY, username TEXT, owner TEXT);",
+        )
+        .unwrap();
+        assert!(load_group_member_counts_from_conn(&conn).is_empty());
+        // 连 chat_room 都没有的极端情况同样降级
+        let bare = Connection::open_in_memory().unwrap();
+        assert!(load_group_member_counts_from_conn(&bare).is_empty());
+    }
+
+    /// chat_room 的 username 列在部分版本叫 chat_room_name：逐列尝试要能命中。
+    #[test]
+    fn member_counts_alternate_column_name() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE chat_room (id INTEGER PRIMARY KEY, chat_room_name TEXT);
+             CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);
+             INSERT INTO chat_room (id, chat_room_name) VALUES (7, '777@chatroom');
+             INSERT INTO chatroom_member (room_id, member_id) VALUES (7, 1);
+             INSERT INTO chatroom_member (room_id, member_id) VALUES (7, 2);",
+        )
+        .unwrap();
+        let counts = load_group_member_counts_from_conn(&conn);
+        assert_eq!(counts.get("777@chatroom"), Some(&2));
+    }
+}
+
 // ─── 内部辅助函数 ────────────────────────────────────────────────────────────
 
 fn resolve_username(chat_name: &str, names: &Names) -> Option<String> {

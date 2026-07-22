@@ -256,10 +256,14 @@ V2 image key 提取：
 ### 联系人 & 群组
 
 ```bash
-wxeasy contacts                  # 联系人列表
+wxeasy contacts                  # 联系人列表（仅真人）
 wxeasy contacts --query "李"     # 按名字搜索
+wxeasy groups                    # 群聊列表
+wxeasy groups --query "AI"       # 按群名搜索
 wxeasy members "AI交流群"        # 群成员列表
 ```
+
+`wxeasy groups --json` 每个群包含 `username`、`display` 与 `member_count`（成员数来自本地 contact.db 的成员表；老版本微信没有 `chatroom_member` 表时省略该字段）。
 
 `wxeasy members --json` 返回的成员字段包括：
 

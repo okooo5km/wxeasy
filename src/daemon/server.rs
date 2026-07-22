@@ -277,6 +277,12 @@ async fn dispatch(
                 Err(e) => Response::err(e.to_string()),
             }
         }
+        Groups { query, limit } => {
+            match query::q_groups(db, &names_arc, query.as_deref(), limit).await {
+                Ok(v) => Response::ok(v),
+                Err(e) => Response::err(e.to_string()),
+            }
+        }
         Unread {
             limit,
             filter,

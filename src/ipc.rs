@@ -55,6 +55,14 @@ pub enum Request {
         #[serde(default = "default_limit_50")]
         limit: usize,
     },
+    /// 查看群聊列表。与 `Contacts` 对称：`Contacts` 只返回真人（private），
+    /// 群聊在这里独立出口，不用再从 `Sessions` 间接翻。
+    Groups {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        query: Option<String>,
+        #[serde(default = "default_limit_50")]
+        limit: usize,
+    },
     Unread {
         #[serde(default = "default_limit_20")]
         limit: usize,

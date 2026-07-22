@@ -114,6 +114,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// 查看群聊列表
+    Groups {
+        /// 按名字过滤
+        #[arg(short = 'q', long)]
+        query: Option<String>,
+        /// 显示数量
+        #[arg(short = 'n', long, default_value = "50")]
+        limit: usize,
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
+    },
     /// 导出聊天记录到文件
     Export {
         /// 聊天对象名称
@@ -397,6 +409,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             },
         ),
         Commands::Contacts { query, limit, json } => contacts::cmd_contacts(query, limit, json),
+        Commands::Groups { query, limit, json } => contacts::cmd_groups(query, limit, json),
         Commands::Export {
             chat,
             since,

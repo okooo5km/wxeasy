@@ -205,13 +205,19 @@ wxeasy search "会议" --in "工作群" --since 2026-01-01
 ### 联系人与群组
 
 ```bash
-# 联系人列表 / 搜索
+# 联系人列表 / 搜索（仅真人，不含群和公众号）
 wxeasy contacts
 wxeasy contacts --query "李"
+
+# 群聊列表 / 搜索
+wxeasy groups
+wxeasy groups --query "AI"
 
 # 群成员列表
 wxeasy members "AI交流群"
 ```
+
+`wxeasy groups --json` 每个群包含 `username`、`display` 与 `member_count`；`member_count` 依赖本地 contact.db 的 `chatroom_member` 表，老版本微信缺该表时字段省略（列表本身不受影响）。
 
 `wxeasy members --json` 每个成员包含：
 
