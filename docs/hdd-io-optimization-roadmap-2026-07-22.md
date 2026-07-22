@@ -442,6 +442,14 @@ daemon 自有 SQLite 只存最近 N 天解密消息，摄入复用轮询管线�
 16.1ms/次 → 1.6ms/次（约 10×），冷 HDD 上免随机 seek 差距更大。回归
 测试 `contact_db_rel_key_reuses_connection_across_calls` 锁定复用行为。
 
+真机 A/B（2026-07-23，开发机暖 SSD、真实数据、contact.db 安静 >600s、
+新旧二进制同机对跑，端到端含 CLI 进程拉起 + IPC）：纯内存查询的调用
+地板 ≈43ms/次；`sessions --limit 30`（内含 9 个群）57ms → 41ms/次，
+落到地板——daemon 侧 9 次 contact.db 物理重开的 ~15ms 全部消失；
+`members`（308 人群）新旧都在地板（暖 SSD 单次重开仅几 ms，被调用
+开销遮蔽，机制收益见上面的进程内基准）。新旧输出逐条对拍一致
+（sessions 30/30；members 308 人、群主首位）。
+
 ---
 
 ## 附：分析产物位置
