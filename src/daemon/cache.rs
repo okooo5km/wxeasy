@@ -2877,7 +2877,8 @@ mod shard_route_tests {
 #[cfg(test)]
 mod hot_conn_tests {
     use super::test_support::{
-        backdate_beyond_slack, build_encrypted_fixture, key_fixture, key_to_hex, unique_tmpdir,
+        backdate_beyond_slack, build_encrypted_fixture, build_encrypted_fixture_with, key_fixture,
+        key_to_hex, unique_tmpdir,
     };
     use super::*;
 
@@ -3404,6 +3405,100 @@ mod hot_conn_tests {
             cache.hot_conns.cache_size_kb(),
             -4096,
             "容量调整后,新建连接的 cache_size 应该跟着重新换算"
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // contact.db 接入热连接池（群相关读取不再每次物理重开）
+    // -------------------------------------------------------------------
+
+    /// 回归测试：`query.rs` 的 `load_group_nicknames` / `q_members` 优先路径
+    /// 现在都改走 `hot_conn_handle("contact/contact.db")`，这里用真实的
+    /// `chat_room` / `chatroom_member` / `contact` 三表 schema（与生产查询
+    /// 结构一致）直接验证同一个 rel_key：
+    /// (a) rel_key 里的 `/` 能被 `resolve_conn_params` 正确解析成嵌套子
+    ///     目录（真实的 `contact/contact.db` 就是这个形状，不同于其它测试
+    ///     一直用的扁平 `message_0.db`）；
+    /// (b) 通过热连接确实能查到夹具写入的正确数据；
+    /// (c) mtime 未变时第二次访问复用同一个连接，不触发第二次 `open()`。
+    #[tokio::test]
+    async fn contact_db_rel_key_reuses_connection_across_calls() {
+        let root = unique_tmpdir("contact-db-hot-conn");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        let contact_dir = db_dir.join("contact");
+        std::fs::create_dir_all(&contact_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let rel_key = "contact/contact.db".to_string();
+        let db_path = contact_dir.join("contact.db");
+        let key = key_fixture();
+        build_encrypted_fixture_with(&db_path, &key, |conn| {
+            conn.execute_batch(
+                "CREATE TABLE chat_room (id INTEGER PRIMARY KEY, username TEXT, owner TEXT);
+                 CREATE TABLE chatroom_member (room_id INTEGER, member_id INTEGER);
+                 CREATE TABLE contact (id INTEGER PRIMARY KEY, username TEXT, nick_name TEXT, remark TEXT);",
+            )
+            .expect("建表失败");
+            conn.execute(
+                "INSERT INTO chat_room (id, username, owner) VALUES (1, '12345@chatroom', 'wxid_owner')",
+                [],
+            )
+            .expect("插入 chat_room 失败");
+            conn.execute(
+                "INSERT INTO contact (id, username, nick_name, remark) VALUES (1, 'wxid_owner', 'Owner Nick', '')",
+                [],
+            )
+            .expect("插入 contact 失败");
+            conn.execute(
+                "INSERT INTO chatroom_member (room_id, member_id) VALUES (1, 1)",
+                [],
+            )
+            .expect("插入 chatroom_member 失败");
+        });
+        let wal_path = wal_path_for(&db_path);
+        std::fs::write(&wal_path, [0u8; 31]).unwrap();
+        backdate_beyond_slack(&db_path);
+        backdate_beyond_slack(&wal_path);
+
+        let mut all_keys = HashMap::new();
+        all_keys.insert(rel_key.clone(), key_to_hex(&key));
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let cache = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+
+        async fn read_owner(cache: &DbCache, rel_key: &str) -> String {
+            let hot = cache.hot_conn_handle(rel_key).unwrap();
+            tokio::task::spawn_blocking(move || {
+                hot.with(|conn| {
+                    conn.query_row(
+                        "SELECT owner FROM chat_room WHERE username = ?",
+                        ["12345@chatroom"],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .map_err(anyhow::Error::from)
+                })
+            })
+            .await
+            .unwrap()
+            .unwrap()
+        }
+
+        let owner1 = read_owner(&cache, &rel_key).await;
+        assert_eq!(owner1, "wxid_owner", "应该读到夹具写入的群主");
+        assert_eq!(
+            rebuild_count(&cache, &rel_key),
+            1,
+            "首次访问 contact.db 必然触发一次重建"
+        );
+
+        let owner2 = read_owner(&cache, &rel_key).await;
+        assert_eq!(owner2, "wxid_owner");
+        assert_eq!(
+            rebuild_count(&cache, &rel_key),
+            1,
+            "mtime 未变时 contact.db 的第二次访问应复用同一个热连接，不触发重建"
         );
     }
 }

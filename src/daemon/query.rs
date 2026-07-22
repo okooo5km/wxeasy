@@ -384,8 +384,21 @@ pub async fn q_sessions(
         })
         .await??;
 
+    // 批量化：先算出本批需要群昵称的会话集合，一次性从 contact.db 热连接
+    // 取出全部 map，避免循环内逐会话各开一次连接（`load_group_nickname_maps`
+    // 内部走同一个热连接，天然去重）。
+    let group_chats: HashSet<String> = rows
+        .iter()
+        .filter(|(username, _, _, _, _, sender, _)| {
+            chat_type_of(username, names) == "group" && !sender.is_empty()
+        })
+        .map(|(username, ..)| username.clone())
+        .collect();
+    let group_nickname_maps = load_group_nickname_maps(db, group_chats)
+        .await
+        .unwrap_or_default();
+
     let mut results = Vec::new();
-    let mut group_nickname_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
     for (username, unread, summary_bytes, ts, msg_type, sender, sender_name) in rows {
         let display = names.display(&username);
         let chat_type = chat_type_of(&username, names);
@@ -396,14 +409,8 @@ pub async fn q_sessions(
         let summary = strip_group_prefix(&summary);
 
         let sender_display = if is_group && !sender.is_empty() {
-            if !group_nickname_cache.contains_key(&username) {
-                let nicknames = load_group_nicknames(db, &username)
-                    .await
-                    .unwrap_or_default();
-                group_nickname_cache.insert(username.clone(), nicknames);
-            }
             let empty = HashMap::new();
-            let group_nicknames = group_nickname_cache.get(&username).unwrap_or(&empty);
+            let group_nicknames = group_nickname_maps.get(&username).unwrap_or(&empty);
             sender_display(&sender, &sender_name, &names.map, group_nicknames)
         } else {
             String::new()
@@ -2804,13 +2811,15 @@ async fn load_group_nicknames(
     if !chat_username.contains("@chatroom") {
         return Ok(HashMap::new());
     }
-    let Ok(conn_params) = db.conn_params("contact/contact.db") else {
+    // contact.db 现走热连接池（同 message 分片一致的 mtime 门控复用），
+    // 不再每次调用都物理重开——见 mod.rs `hot_pool_capacity_for_shard_count`
+    // 旁的 +1 常驻槽位注释。
+    let Ok(hot) = db.hot_conn_handle("contact/contact.db") else {
         return Ok(HashMap::new());
     };
     let chat = chat_username.to_string();
     tokio::task::spawn_blocking(move || {
-        let conn = conn_params.open()?;
-        Ok::<_, anyhow::Error>(load_group_nickname_map_from_conn(&conn, &chat, None))
+        hot.with(|conn| Ok(load_group_nickname_map_from_conn(conn, &chat, None)))
     })
     .await?
 }
@@ -2822,19 +2831,20 @@ async fn load_group_nickname_maps(
     if chat_usernames.is_empty() {
         return Ok(HashMap::new());
     }
-    let Ok(conn_params) = db.conn_params("contact/contact.db") else {
+    let Ok(hot) = db.hot_conn_handle("contact/contact.db") else {
         return Ok(HashMap::new());
     };
     tokio::task::spawn_blocking(move || {
-        let conn = conn_params.open()?;
-        let mut out = HashMap::new();
-        for chat in chat_usernames {
-            let nicknames = load_group_nickname_map_from_conn(&conn, &chat, None);
-            if !nicknames.is_empty() {
-                out.insert(chat, nicknames);
+        hot.with(|conn| {
+            let mut out = HashMap::new();
+            for chat in chat_usernames {
+                let nicknames = load_group_nickname_map_from_conn(conn, &chat, None);
+                if !nicknames.is_empty() {
+                    out.insert(chat, nicknames);
+                }
             }
-        }
-        Ok::<_, anyhow::Error>(out)
+            Ok(out)
+        })
     })
     .await?
 }
@@ -4023,8 +4033,11 @@ pub async fn q_unread(
         })
         .await??;
 
-    let mut results = Vec::new();
-    let mut group_nickname_cache: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // 先按原有的 filter_set + limit 语义选出"哪些行进入结果"（选择顺序、
+    // 提前 break 都不变），再对选中的行批量取群昵称——批量化不改变选择
+    // 集合本身，只把"逐行取昵称"挪到选择完成之后一次性做。
+    let mut selected: Vec<(String, i64, Vec<u8>, i64, i64, String, String, bool, &'static str)> =
+        Vec::new();
     for (username, unread, summary_bytes, ts, msg_type, sender, sender_name) in rows {
         let chat_type = chat_type_of(&username, names);
         if let Some(ref set) = filter_set {
@@ -4032,23 +4045,42 @@ pub async fn q_unread(
                 continue;
             }
         }
-        if results.len() >= limit {
+        if selected.len() >= limit {
             break;
         }
-
-        let display = names.display(&username);
         let is_group = chat_type == "group";
+        selected.push((
+            username,
+            unread,
+            summary_bytes,
+            ts,
+            msg_type,
+            sender,
+            sender_name,
+            is_group,
+            chat_type,
+        ));
+    }
+
+    let group_chats: HashSet<String> = selected
+        .iter()
+        .filter(|(_, _, _, _, _, sender, _, is_group, _)| *is_group && !sender.is_empty())
+        .map(|(username, ..)| username.clone())
+        .collect();
+    let group_nickname_maps = load_group_nickname_maps(db, group_chats)
+        .await
+        .unwrap_or_default();
+
+    let mut results = Vec::new();
+    for (username, unread, summary_bytes, ts, msg_type, sender, sender_name, is_group, chat_type) in
+        selected
+    {
+        let display = names.display(&username);
         let summary = decompress_or_str(&summary_bytes);
         let summary = strip_group_prefix(&summary);
         let sender_display = if is_group && !sender.is_empty() {
-            if !group_nickname_cache.contains_key(&username) {
-                let nicknames = load_group_nicknames(db, &username)
-                    .await
-                    .unwrap_or_default();
-                group_nickname_cache.insert(username.clone(), nicknames);
-            }
             let empty = HashMap::new();
-            let group_nicknames = group_nickname_cache.get(&username).unwrap_or(&empty);
+            let group_nicknames = group_nickname_maps.get(&username).unwrap_or(&empty);
             sender_display(&sender, &sender_name, &names.map, group_nicknames)
         } else {
             String::new()
@@ -4105,110 +4137,112 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
     let names_map = names.map.clone();
 
     // 优先路径：contact.db → chatroom_member + chat_room（完整成员列表）
-    if let Ok(conn_params) = db.conn_params("contact/contact.db") {
+    // 走热连接池，同 message 分片一致的 mtime 门控复用，不再每次物理重开。
+    if let Ok(hot) = db.hot_conn_handle("contact/contact.db") {
         let uname2 = username.clone();
         let names_map2 = names_map.clone();
 
         let members_opt: Option<Vec<Value>> = tokio::task::spawn_blocking(move || {
-            let conn = conn_params.open()?;
+            hot.with(|conn| {
+                let has_table: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chatroom_member'",
+                        [],
+                        |_| Ok(true),
+                    )
+                    .unwrap_or(false);
 
-            let has_table: bool = conn
-                .query_row(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='chatroom_member'",
-                    [],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
+                if !has_table {
+                    return Ok::<_, anyhow::Error>(None);
+                }
 
-            if !has_table {
-                return Ok::<_, anyhow::Error>(None);
-            }
-
-            // 从 chat_room 表获取整数 room_id 和群主
-            // WeChat 不同版本列名可能不同：username / chat_room_name / name
-            let (room_id, owner): (i64, String) = [
-                "SELECT id, owner FROM chat_room WHERE username = ?",
-                "SELECT id, owner FROM chat_room WHERE chat_room_name = ?",
-                "SELECT id, owner FROM chat_room WHERE name = ?",
-            ]
-            .iter()
-            .find_map(|sql| {
-                conn.query_row(sql, [&uname2], |row| {
-                    Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1).unwrap_or_default(),
-                    ))
+                // 从 chat_room 表获取整数 room_id 和群主
+                // WeChat 不同版本列名可能不同：username / chat_room_name / name
+                let (room_id, owner): (i64, String) = [
+                    "SELECT id, owner FROM chat_room WHERE username = ?",
+                    "SELECT id, owner FROM chat_room WHERE chat_room_name = ?",
+                    "SELECT id, owner FROM chat_room WHERE name = ?",
+                ]
+                .iter()
+                .find_map(|sql| {
+                    conn.query_row(sql, [&uname2], |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1).unwrap_or_default(),
+                        ))
+                    })
+                    .ok()
                 })
-                .ok()
-            })
-            .unwrap_or((0, String::new()));
+                .unwrap_or((0, String::new()));
 
-            if room_id == 0 {
-                return Ok::<_, anyhow::Error>(None);
-            }
+                if room_id == 0 {
+                    return Ok::<_, anyhow::Error>(None);
+                }
 
-            let mut stmt = conn.prepare(
-                "SELECT c.username, c.nick_name, c.remark
+                let mut stmt = conn.prepare(
+                    "SELECT c.username, c.nick_name, c.remark
                  FROM chatroom_member cm
                  LEFT JOIN contact c ON c.id = cm.member_id
                  WHERE cm.room_id = ?",
-            )?;
-            let raw: Vec<(String, String, String)> = stmt
-                .query_map([room_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0).unwrap_or_default(),
-                        row.get::<_, String>(1).unwrap_or_default(),
-                        row.get::<_, String>(2).unwrap_or_default(),
-                    ))
-                })?
-                .filter_map(|r| r.ok())
-                .filter(|(uid, _, _)| !uid.is_empty())
-                .collect();
+                )?;
+                let raw: Vec<(String, String, String)> = stmt
+                    .query_map([room_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0).unwrap_or_default(),
+                            row.get::<_, String>(1).unwrap_or_default(),
+                            row.get::<_, String>(2).unwrap_or_default(),
+                        ))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .filter(|(uid, _, _)| !uid.is_empty())
+                    .collect();
 
-            if raw.is_empty() {
-                return Ok(None);
-            }
-
-            let target_usernames: HashSet<String> =
-                raw.iter().map(|(uid, _, _)| uid.clone()).collect();
-            let group_nicknames =
-                load_group_nickname_map_from_conn(&conn, &uname2, Some(&target_usernames));
-
-            let mut members: Vec<Value> = raw
-                .iter()
-                .map(|(uid, nick, remark)| {
-                    let contact_display = contact_display(uid, nick, remark, &names_map2);
-                    let group_nickname = group_nicknames.get(uid).cloned().unwrap_or_default();
-                    let disp = if group_nickname.is_empty() {
-                        contact_display.clone()
-                    } else {
-                        group_nickname.clone()
-                    };
-                    let is_owner = uid == &owner && !owner.is_empty();
-                    json!({
-                        "username": uid,
-                        "display": disp,
-                        "contact_display": contact_display,
-                        "group_nickname": group_nickname,
-                        "is_owner": is_owner,
-                    })
-                })
-                .collect();
-
-            // 群主排首位，其余按 display 字典序
-            members.sort_by(|a, b| {
-                let ao = a["is_owner"].as_bool().unwrap_or(false);
-                let bo = b["is_owner"].as_bool().unwrap_or(false);
-                if ao != bo {
-                    return bo.cmp(&ao);
+                if raw.is_empty() {
+                    return Ok(None);
                 }
-                a["display"]
-                    .as_str()
-                    .unwrap_or("")
-                    .cmp(b["display"].as_str().unwrap_or(""))
-            });
 
-            Ok(Some(members))
+                let target_usernames: HashSet<String> =
+                    raw.iter().map(|(uid, _, _)| uid.clone()).collect();
+                let group_nicknames =
+                    load_group_nickname_map_from_conn(conn, &uname2, Some(&target_usernames));
+
+                let mut members: Vec<Value> = raw
+                    .iter()
+                    .map(|(uid, nick, remark)| {
+                        let contact_display = contact_display(uid, nick, remark, &names_map2);
+                        let group_nickname =
+                            group_nicknames.get(uid).cloned().unwrap_or_default();
+                        let disp = if group_nickname.is_empty() {
+                            contact_display.clone()
+                        } else {
+                            group_nickname.clone()
+                        };
+                        let is_owner = uid == &owner && !owner.is_empty();
+                        json!({
+                            "username": uid,
+                            "display": disp,
+                            "contact_display": contact_display,
+                            "group_nickname": group_nickname,
+                            "is_owner": is_owner,
+                        })
+                    })
+                    .collect();
+
+                // 群主排首位，其余按 display 字典序
+                members.sort_by(|a, b| {
+                    let ao = a["is_owner"].as_bool().unwrap_or(false);
+                    let bo = b["is_owner"].as_bool().unwrap_or(false);
+                    if ao != bo {
+                        return bo.cmp(&ao);
+                    }
+                    a["display"]
+                        .as_str()
+                        .unwrap_or("")
+                        .cmp(b["display"].as_str().unwrap_or(""))
+                });
+
+                Ok(Some(members))
+            })
         })
         .await??;
 
@@ -5332,6 +5366,18 @@ pub async fn q_new_messages(
 
     // 只给本轮真正 changed 的会话预算展示名 / 会话类型 / 群昵称 / 增量
     // 下界，供下面按分片聚合查询时直接复用。
+    // 批量化：先收集本轮 changed 里的全部群 uname，一次 `load_group_nickname_maps`
+    // 拿到所有群的昵称 map（内部走同一个 contact.db 热连接），不再对每个群
+    // 各自触发一次独立查询。
+    let changed_groups: HashSet<String> = changed
+        .iter()
+        .filter(|(uname, _)| chat_type_of(uname, names) == "group")
+        .map(|(uname, _)| uname.clone())
+        .collect();
+    let mut group_nickname_maps = load_group_nickname_maps(db, changed_groups)
+        .await
+        .unwrap_or_default();
+
     let mut session_ctx: HashMap<String, SessionCtx> = HashMap::new();
     for (uname, _) in &changed {
         let since_ts = state
@@ -5341,11 +5387,7 @@ pub async fn q_new_messages(
             .unwrap_or(fallback_ts);
         let chat_type = chat_type_of(uname, names);
         let is_group = chat_type == "group";
-        let group_nicknames = if is_group {
-            load_group_nicknames(db, uname).await.unwrap_or_default()
-        } else {
-            HashMap::new()
-        };
+        let group_nicknames = group_nickname_maps.remove(uname).unwrap_or_default();
         session_ctx.insert(
             uname.clone(),
             SessionCtx {

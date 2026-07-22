@@ -424,6 +424,26 @@ daemon 自有 SQLite 只存最近 N 天解密消息，摄入复用轮询管线�
 
 ---
 
+## 10. 追记（2026-07-23）：contact.db 群读取接入热连接池
+
+§1 的 IO 账本只建模了 Msg 分片，漏了一类稳态成本：**contact.db 的群相关
+读取（群昵称 / 群成员）每次调用都物理重开**（`conn_params.open()` = VFS
+注册 + WAL 扫描 + sqlite_master 解析 + 空页缓存重新逐页解密，用完即弃），
+且 `q_new_messages` 按 changed 群逐个重开、`q_sessions`/`q_unread` 按列表
+里每个群重开——轮询热路径上一轮可达几十次。
+
+修复：全部路由进既有 `HotConnPool`（快照逐字段相等 + 安静满 slack 才复用，
+与消息分片同一套门控；contact.db 不在消息正确性链路上，陈旧最坏是展示名
+过期，且 600s 门控内每次照旧重建、无回归窗口）；三处按群循环合并为单次
+批量加载；池容量 +1 给 contact.db 留常驻槽位。session.db 每次重开语义
+一字未动（§4.3 护栏）。
+
+实测（合成夹具：8000 联系人、60 群 × 120 成员，暖 SSD）：群成员查询
+16.1ms/次 → 1.6ms/次（约 10×），冷 HDD 上免随机 seek 差距更大。回归
+测试 `contact_db_rel_key_reuses_connection_across_calls` 锁定复用行为。
+
+---
+
 ## 附：分析产物位置
 
 15 个 agent 的完整提案与逐条验证记录（含被否决方案的完整论证）在本机

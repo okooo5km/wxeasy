@@ -74,7 +74,13 @@ async fn async_run() -> Result<()> {
     // 65~80 个消息分片）下形同虚设、LRU 反复抖动驱逐。必须晚于
     // `msg_db_keys` 确定、早于任何查询开始服务（此刻池子还是空的，见
     // `cache::HotConnPool::set_capacity` 文档）。
-    let hot_pool_capacity = cache::hot_pool_capacity_for_shard_count(msg_db_keys.len());
+    //
+    // +1：给 `contact/contact.db` 的热连接留一个常驻槽位——群相关读取
+    // （群成员、群昵称）现在也走这个池子，不该跟消息分片抢同一批 LRU
+    // 名额，否则大账号下 contact.db 的槽位可能被消息分片轮流挤占，反而
+    // 抵消掉热连接带来的收益。
+    let hot_pool_capacity =
+        cache::hot_pool_capacity_for_shard_count(msg_db_keys.len().saturating_add(1));
     db.set_hot_pool_capacity(hot_pool_capacity);
     eprintln!(
         "[daemon] 热连接池容量: {} (消息分片数: {})",
