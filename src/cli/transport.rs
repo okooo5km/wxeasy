@@ -11,6 +11,19 @@ const STARTUP_TIMEOUT_SECS: u64 = 15;
 #[cfg(unix)]
 const STOP_TIMEOUT_MS: u64 = 2_000;
 
+/// FIX 4：daemon 后台加载联系人期间（socket 已经可连接，`Request::Ping`
+/// 正常应答，但依赖 names 的请求会先收到 `Response::warming_up`），
+/// `send_unix`/`send_windows` 在这个预算内做有限次数、有进度提示的重试，
+/// 而不是把"预热中"当成"真失败"立刻报错给用户。
+///
+/// 与 [`STARTUP_TIMEOUT_SECS`] 是两个独立的等待阶段：前者等的是"daemon
+/// 进程 + socket 是否已经能连上"，这里等的是"socket 已经能连上，但
+/// `contact.db` 还没扫完"——两个阶段可能都发生在同一次冷启动里，各自的
+/// 超时预算不应该合并成一个，否则慢机上会把本该分别观测的两类耗时糊在
+/// 一起，日志/报错都更难定位根因。
+const WARMUP_WAIT_TIMEOUT_SECS: u64 = 30;
+const WARMUP_POLL_INTERVAL_MS: u64 = 500;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PidFile {
     pid: u32,
@@ -442,26 +455,50 @@ pub fn send(req: Request) -> Result<Response> {
 fn send_unix(req: Request) -> Result<Response> {
     use std::os::unix::net::UnixStream;
     let sock_path = config::sock_path();
-    let mut stream = UnixStream::connect(&sock_path).context("连接 daemon socket 失败")?;
-    stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
-    stream
-        .set_write_timeout(Some(Duration::from_secs(120)))
-        .ok();
 
-    let req_str = serde_json::to_string(&req)? + "\n";
-    stream.write_all(req_str.as_bytes())?;
+    // FIX 4：每次重试都需要一条新连接——daemon 每条连接只处理一个请求就
+    // 关闭（见 `daemon::server::handle_connection_unix`），"预热中"响应
+    // 之后不能复用同一条已经半关闭的连接再发一次。
+    let deadline = std::time::Instant::now() + Duration::from_secs(WARMUP_WAIT_TIMEOUT_SECS);
+    let mut warned = false;
+    loop {
+        let mut stream = UnixStream::connect(&sock_path).context("连接 daemon socket 失败")?;
+        stream.set_read_timeout(Some(Duration::from_secs(120))).ok();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(120)))
+            .ok();
 
-    let mut line = String::new();
-    let mut reader = BufReader::new(&stream);
-    reader.read_line(&mut line)?;
+        let req_str = serde_json::to_string(&req)? + "\n";
+        stream.write_all(req_str.as_bytes())?;
 
-    let resp: Response = serde_json::from_str(&line).context("解析 daemon 响应失败")?;
+        let mut line = String::new();
+        let mut reader = BufReader::new(&stream);
+        reader.read_line(&mut line)?;
 
-    if !resp.ok {
-        bail!("{}", resp.error.as_deref().unwrap_or("未知错误"));
+        let resp: Response = serde_json::from_str(&line).context("解析 daemon 响应失败")?;
+
+        if resp.warming_up {
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "daemon 预热超时（>{}s）：{}",
+                    WARMUP_WAIT_TIMEOUT_SECS,
+                    resp.error.as_deref().unwrap_or("联系人仍未加载完成")
+                );
+            }
+            if !warned {
+                eprintln!("daemon 正在预热（加载联系人），等待中...");
+                warned = true;
+            }
+            std::thread::sleep(Duration::from_millis(WARMUP_POLL_INTERVAL_MS));
+            continue;
+        }
+
+        if !resp.ok {
+            bail!("{}", resp.error.as_deref().unwrap_or("未知错误"));
+        }
+
+        return Ok(resp);
     }
-
-    Ok(resp)
 }
 
 #[cfg(windows)]
@@ -471,22 +508,46 @@ fn send_windows(req: Request) -> Result<Response> {
     let name = "wxeasy-daemon"
         .to_ns_name::<GenericNamespaced>()
         .context("构造 pipe name 失败")?;
-    let stream = Stream::connect(name).context("连接 daemon named pipe 失败")?;
 
-    // interprocess::Stream 同时实现 Read + Write，但需要拆分读写端
-    let mut reader = BufReader::new(stream);
+    // FIX 4：每次重试都需要一条新连接——daemon 每条连接只处理一个请求就
+    // 关闭（见 `daemon::server::handle_connection_windows`），"预热中"响应
+    // 之后不能复用同一条已经半关闭的连接再发一次。
+    let deadline = std::time::Instant::now() + Duration::from_secs(WARMUP_WAIT_TIMEOUT_SECS);
+    let mut warned = false;
+    loop {
+        let stream = Stream::connect(name.clone()).context("连接 daemon named pipe 失败")?;
 
-    let req_str = serde_json::to_string(&req)? + "\n";
-    reader.get_mut().write_all(req_str.as_bytes())?;
+        // interprocess::Stream 同时实现 Read + Write，但需要拆分读写端
+        let mut reader = BufReader::new(stream);
 
-    let mut line = String::new();
-    reader.read_line(&mut line)?;
+        let req_str = serde_json::to_string(&req)? + "\n";
+        reader.get_mut().write_all(req_str.as_bytes())?;
 
-    let resp: Response = serde_json::from_str(&line).context("解析 daemon 响应失败")?;
+        let mut line = String::new();
+        reader.read_line(&mut line)?;
 
-    if !resp.ok {
-        bail!("{}", resp.error.as_deref().unwrap_or("未知错误"));
+        let resp: Response = serde_json::from_str(&line).context("解析 daemon 响应失败")?;
+
+        if resp.warming_up {
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "daemon 预热超时（>{}s）：{}",
+                    WARMUP_WAIT_TIMEOUT_SECS,
+                    resp.error.as_deref().unwrap_or("联系人仍未加载完成")
+                );
+            }
+            if !warned {
+                eprintln!("daemon 正在预热（加载联系人），等待中...");
+                warned = true;
+            }
+            std::thread::sleep(Duration::from_millis(WARMUP_POLL_INTERVAL_MS));
+            continue;
+        }
+
+        if !resp.ok {
+            bail!("{}", resp.error.as_deref().unwrap_or("未知错误"));
+        }
+
+        return Ok(resp);
     }
-
-    Ok(resp)
 }

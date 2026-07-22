@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
-use super::cache::{DbCache, ShardRouteLookup};
+use super::cache::{DbCache, ShardRouteLookup, SourceSnapshot};
 use super::meta::{derive_status, discover_unknown_shards, Meta};
 
 /// `cache_mode_per_shard` / debug 输出里统一填的占位值：VFS 按需解页下不再有
@@ -237,20 +237,32 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
     // 密钥缺失 / contact.db 不存在时，与旧版 `db.get(..)` 返回 `None` 语义一致：
     // 静默产出空联系人表，不当作错误往上抛。
     if let Ok(conn_params) = db.conn_params("contact/contact.db") {
+        // FIX 4：daemon 启动阶段的 stderr 输出到这里之后会有一段静默——
+        // `contact.db` 在机械盘上可能是几十万行的全表扫描，没有任何输出会
+        // 让人误以为卡死（今日已实测撞到一次慢机场景）。改成手动逐行迭代
+        // （而不是 `query_map(..).collect()` 一次性拿全部结果），每
+        // `PROGRESS_LOG_EVERY_ROWS` 行打一条阶段性进度日志——纯诊断用途，
+        // 不影响解析出的联系人数据本身。
+        const PROGRESS_LOG_EVERY_ROWS: u64 = 20_000;
         let rows: Vec<(String, String, String, i64)> = tokio::task::spawn_blocking(move || {
             let conn = conn_params.open().context("打开 contact.db 失败")?;
             let mut stmt =
                 conn.prepare("SELECT username, nick_name, remark, verify_flag FROM contact")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1).unwrap_or_default(),
-                        row.get::<_, String>(2).unwrap_or_default(),
-                        row.get::<_, i64>(3).unwrap_or(0),
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut rows = Vec::new();
+            let mut scanned = 0u64;
+            let mut rows_iter = stmt.query([])?;
+            while let Some(row) = rows_iter.next()? {
+                rows.push((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1).unwrap_or_default(),
+                    row.get::<_, String>(2).unwrap_or_default(),
+                    row.get::<_, i64>(3).unwrap_or(0),
+                ));
+                scanned += 1;
+                if scanned % PROGRESS_LOG_EVERY_ROWS == 0 {
+                    eprintln!("[names] 联系人加载中... 已扫描 {} 行", scanned);
+                }
+            }
             Ok::<_, anyhow::Error>(rows)
         })
         .await??;
@@ -636,6 +648,11 @@ pub async fn q_search(
     let kw = keyword.to_string();
     let mut join_set: tokio::task::JoinSet<Result<(String, Vec<Value>)>> =
         tokio::task::JoinSet::new();
+    // 并发上限见 `MAX_CONCURRENT_SHARD_SCANS` 文档：全局搜索（不带 `chats`
+    // 过滤）会对 `names.msg_db_keys` 里的每个分片各 dispatch 一次，与
+    // `find_msg_shards` 冷启动同属"对分片无差别并发派发"的形状，同样的机械
+    // 盘寻道风暴风险，复用同一个常量、同一套限流 helper。
+    let scan_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHARD_SCANS));
     for (rel_key, table_list) in by_rel_key {
         // FIX 4：具名 chat 分支的 `rel_key` 来自 `find_msg_shards`，已经用
         // `hot_conn_handle_with_snapshot` 开过（或复用过）一次热连接；全局
@@ -659,7 +676,7 @@ pub async fn q_search(
         let group_nicknames_by_chat2 = Arc::clone(&group_nicknames_by_chat);
         let rel_key_for_log = rel_key.clone();
 
-        join_set.spawn_blocking(move || {
+        spawn_shard_scan(&mut join_set, &scan_semaphore, move || {
             hot.with(|conn| {
             let mut all = Vec::new();
             let empty_group_nicknames = HashMap::new();
@@ -854,6 +871,88 @@ fn shard_skippable(freshness: Option<i64>, since: Option<i64>) -> bool {
     }
 }
 
+/// 分片级并发扫描（[`find_msg_shards`] / [`q_search`] 全局分支的 `JoinSet`）
+/// 允许同时真正发起磁盘 I/O 的分片数上限。
+///
+/// # 为什么不能无限并发
+/// 目标部署环境是机械硬盘（HDD），只有一个物理磁头/一条寻道臂。`JoinSet`
+/// 把"对哪些分片发起扫描"和"这些扫描真正跑多快"两件事分开了：不加上限时，
+/// `since=None` 冷启动会对全部 `need_rebuild` 分片（活跃大账号可达 60~80
+/// 个）一次性 `spawn_blocking`，每个任务几乎同时对不同分片文件发起
+/// `open()` + 逐页解密，等价于让 HDD 同时响应几十个随机位置的读请求——
+/// 机械寻道时间（通常几毫秒到十几毫秒）与理论上"完全并行"节省的时间相比
+/// 会占主导，磁头在几十个目标扇区之间来回抖动，总耗时可能比老的串行实现
+/// 更差（负优化）。这与 SSD 相反：SSD 没有机械寻道开销，高并发随机读能
+/// 直接换来更高的聚合吞吐，越并发越快。
+///
+/// # 为什么选 4 而不是 1 或者更大
+/// - 选 1（退化回串行）放弃了并发化本来要解决的问题：单个分片的解密+查询
+///   仍然有纯 CPU 开销（AES 逐页解密、HMAC 校验、SQLite 解析），值太小时
+///   没法用"发起下一个分片的 I/O"去重叠"当前分片的 CPU 解密"这部分延迟，
+///   丧失并发化的收益。
+/// - 选一个双位数的值（例如 16、32）本质上和不设上限没有区别——目标机器
+///   上的机械盘队列深度撑不住那么多并发随机 I/O，寻道抖动的负面效应会
+///   重新主导总耗时，等于没修。
+/// - 4 是一个"既能靠适度重叠隐藏部分寻道 / 解密延迟，又远低于机械盘寻道
+///   风暴阈值"的保守折中：现代 HDD 的原生指令队列（NCQ）在浅深度（个位数）
+///   时仍能有效做电梯调度合并，深度一旦上到几十就会开始退化。选一个偏
+///   保守的小值，代价只是"极端场景下没有榨干理论并行上限"，换来的是
+///   任何硬件（尤其是这个项目明确要支持的慢速机械盘）上都不会比串行更差。
+///
+/// 不做成运行时可配置项：这是一个纯粹的硬件特性折中，不是业务参数，写死
+/// 常量比暴露一个用户很难正确设置的配置项更安全。
+const MAX_CONCURRENT_SHARD_SCANS: usize = 4;
+
+/// 把"先拿信号量许可、许可到手后才真正 `spawn_blocking` 执行分片 I/O"这个
+/// 模式封装成一个共享 helper，供 [`find_msg_shards`] 和 [`q_search`] 全局
+/// 扫描分支的 `JoinSet` 复用（消除重复代码，见 [`MAX_CONCURRENT_SHARD_SCANS`]
+/// 的取值论证）。
+///
+/// # 为什么信号量的 `.await` 必须放在 `spawn` 出去的任务内部，而不是调用方
+/// 调用方（`find_msg_shards` 的判定循环）对"逐分片同步完成判定、循环体内
+/// 无任何 `.await`"这个不变量有严格要求（避免与其它并发调用者交错出新的
+/// 判定期竞态，见 `find_msg_shards` 文档"FIX 3：判定同步、I/O 并发"一节）。
+/// 这里用 `join_set.spawn(async move { .. })` 包一层普通异步任务、把
+/// `semaphore.acquire_owned().await` 放进这个新任务自己的执行体内部——从
+/// 调用方（判定循环）的视角看，`spawn` 本身仍然是同步注册、立即返回、不
+/// 产生任何让出点，只是把"等待许可"这件事推迟到任务自己被调度执行的时候，
+/// 不会让判定循环出现新的交错窗口。真正的限流发生在"已经 spawn 出去的
+/// 任务里最多只有 `MAX_CONCURRENT_SHARD_SCANS` 个能拿到许可、跑进
+/// `spawn_blocking` 做真实 I/O"，其余任务在 `acquire_owned().await` 上
+/// 排队，不占用阻塞线程池。
+///
+/// # 错误语义：与"直接 `join_set.spawn_blocking(work)`"完全等价
+/// `work` 内部返回的 `Err`（真实 I/O/解密错误）原样透传；`work` 所在的
+/// `spawn_blocking` 任务本身 panic/被 abort 时，`.unwrap_or_else` 把这种
+/// 情况也转换成一个 `Err`，与"work 自己返回 Err"合并成同一个出口——调用方
+/// 不需要再额外区分"内层阻塞任务 panic"和"内层阻塞任务正常返回 Err"这两
+/// 种情况（原来直接用 `spawn_blocking` 时，前者是外层 `JoinSet` 的
+/// `JoinError`，后者是 `Ok(Err(e))`；现在统一成后一种形态）。两种情况下
+/// `find_msg_shards` / `q_search` 最终都会让整个调用返回 `Err`，"任一分片
+/// 失败、整体失败、不返回部分结果"这条既有语义不变，只是内部错误分类的
+/// 归并方式变了。
+fn spawn_shard_scan<F, T>(
+    join_set: &mut tokio::task::JoinSet<Result<T>>,
+    semaphore: &Arc<tokio::sync::Semaphore>,
+    work: F,
+) where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    let semaphore = Arc::clone(semaphore);
+    join_set.spawn(async move {
+        // 信号量只在 `close()` 后才会返回 Err，这里从不主动 close，`expect`
+        // 只是让"不会失败"这个不变量在类型上显式可见。
+        let _permit = semaphore
+            .acquire_owned()
+            .await
+            .expect("MAX_CONCURRENT_SHARD_SCANS 信号量不会被 close()");
+        tokio::task::spawn_blocking(work)
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!("分片扫描阻塞任务异常退出: {}", e)))
+    });
+}
+
 /// 定位某个 chat 对应 `Msg_<md5>` 表所在的消息分片。
 ///
 /// `since`：调用方已知的时间下界（unix 秒）。传 `Some(s)` 时，会在解密前先用
@@ -863,6 +962,52 @@ fn shard_skippable(freshness: Option<i64>, since: Option<i64>) -> bool {
 ///
 /// 返回 `(命中分片, scanned, skipped)`：`scanned` 是实际解密并查询过的分片数
 /// （语义不变，跳过的分片不计入）；`skipped` 是因 mtime 判定被跳过的分片数。
+/// [`find_msg_shards`] 并发扫描（FIX 3）单个分片任务的完整结果：把
+/// `put_shard_schema` 回写、结果拼装所需的一切拥有型数据都装进来，避免
+/// `JoinSet` 完成顺序不确定时还要额外维护"结果 -> 判定期上下文"的外部
+/// 关联表。
+struct ShardScanOutcome {
+    rel_key: String,
+    tables_opt: Option<HashSet<String>>,
+    max_ts: Option<i64>,
+    enc_path: std::path::PathBuf,
+    snap_at_judgement: Option<SourceSnapshot>,
+    expected_generation: u64,
+}
+
+/// 定位某个 chat 对应 `Msg_<md5>` 表所在的消息分片。
+///
+/// `since`：调用方已知的时间下界（unix 秒）。传 `Some(s)` 时，会在解密前先用
+/// `DbCache::source_freshness_secs` 读取每个分片加密源文件的 mtime；mtime 早于
+/// `s - SHARD_FRESHNESS_SLACK_SECS` 的分片被判定为"不可能含有新消息"而跳过解密
+/// （见 `shard_skippable`）。传 `None` 时行为与跳过逻辑加入前完全一致。
+///
+/// 返回 `(命中分片, scanned, skipped)`：`scanned` 是实际解密并查询过的分片数
+/// （语义不变，跳过的分片不计入）；`skipped` 是因 mtime 判定被跳过的分片数。
+///
+/// # FIX 3：判定同步、I/O 并发
+/// `since=None`（`find_msg_tables` / `q_search` 全局-命名分支 / `q_stats` /
+/// `q_attachments` 等"全量发现"场景）下 `shard_skippable` 恒为 false，
+/// daemon 刚重启、路由缓存为空时会对**全部** `S` 个消息分片逐一真正
+/// `open()` + 扫 `sqlite_master`——旧实现串行 `await`，总耗时是"各分片之和"
+/// （几十秒到数分钟）。这里把逻辑拆成两段：
+/// 1. **判定段**（skip / 路由缓存 Fresh-Stale / `expected_generation`
+///    读取）保持逐分片同步完成，与旧实现的时序完全一致，不引入新的判定间
+///    竞态——这段本身没有任何 `.await`，多个分片之间天然串行、不重叠。
+/// 2. **I/O 段**（真正需要重建或已确认命中目标表的分片）用 `JoinSet` 一次性
+///    `spawn_blocking` 派发（参照 [`q_search`] 全局分支 ~634-638 的现成
+///    范式），总耗时从"各分片之和"降到"最大值"。
+///
+/// 并发化后 `expected_generation`/`put_shard_schema` 的 TOCTOU 保护为什么
+/// 仍然正确：见 `DbCache::put_shard_schema` 文档——世代号是**全局**原子
+/// 计数器，校验（`route_generation.load() != expected_generation`）与写入
+/// 都在 `shard_routes` 那把 `std::sync::Mutex` 的同一个临界区内完成，这个
+/// 机制从设计上就是为了"任意数量的并发调用者互相竞争"而存在的（它已经在
+/// 服务"不同并发 RPC 连接各自调用 find_msg_shards"这个更早就存在的并发
+/// 场景）；这里在**同一次** `find_msg_shards` 调用内部把多个分片的 I/O
+/// 并发化，不过是让这套已经为任意并发设计的机制多服务几个同时在飞的
+/// 调用者，不改变、不放宽任何单次校验本身的正确性。并发测试见
+/// `cache::concurrency_tests`。
 async fn find_msg_shards(
     db: &DbCache,
     names: &Names,
@@ -877,7 +1022,16 @@ async fn find_msg_shards(
     let total = names.msg_db_keys.len();
     let mut scanned = 0usize;
     let mut skipped = 0usize;
-    let mut results: Vec<MessageShard> = Vec::new();
+
+    // 判定段：逐分片同步完成（无 `.await`），与旧实现的时序语义完全一致；
+    // 只是把"真正需要 open() 的分片"收集起来，延后到下面并发派发，而不是
+    // 判定完一个就立刻同步等它的 I/O 完成。
+    let mut join_set: tokio::task::JoinSet<Result<ShardScanOutcome>> = tokio::task::JoinSet::new();
+    // 并发上限见 `MAX_CONCURRENT_SHARD_SCANS` 文档：这次调用自己的分片扫描
+    // 批次最多同时 `MAX_CONCURRENT_SHARD_SCANS` 个在真正做磁盘 I/O，不影响
+    // 判定段本身（下面循环体内依旧没有任何 `.await`）。
+    let scan_semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHARD_SCANS));
+
     for rel_key in &names.msg_db_keys {
         // FIX 2：每分片只读一次 SourceSnapshot（至多 1 次主库 metadata + 1 次
         // WAL exists()/metadata），透传给下面 skip 判定 / 路由 lookup / 热
@@ -916,75 +1070,113 @@ async fn find_msg_shards(
         let enc_path = hot.enc_db_path().to_path_buf();
         scanned += 1;
         let tname = table_name.clone();
+        let rel_key_owned = rel_key.clone();
 
-        // FIX-MEDIUM（invalidate 与 put_shard_schema 回写竞态）：在真正发起
-        // `spawn_blocking` 扫描之前读一次当前作废世代号。`DbCache` 经 `Arc`
-        // 被 `server.rs` 每连接 `tokio::spawn` 共享，下面这次扫描（排队 +
-        // sqlite_master I/O）期间完全可能有另一个并发请求对同一分片（或
-        // 任意分片，见 `DbCache::invalidate_shard` 的全局粒度说明）调用
-        // `invalidate_shard`；如果扫描完成后仍然无条件回写，会用一份可能
-        // 已经过期的 schema 把刚被作废的路由悄悄复活。下面 `put_shard_schema`
-        // 调用会拿这份 `expected_generation` 与《回写那一刻》的当前世代号
-        // 比较，不等就放弃写入。
+        // FIX-MEDIUM（invalidate 与 put_shard_schema 回写竞态，保持不变）：
+        // 在真正发起 `spawn_blocking` 扫描之前读一次当前作废世代号。
+        // `DbCache` 经 `Arc` 被 `server.rs` 每连接 `tokio::spawn` 共享，
+        // 下面这次扫描（排队 + sqlite_master I/O）期间完全可能有另一个并发
+        // 请求对同一分片（或任意分片，见 `DbCache::invalidate_shard` 的
+        // 全局粒度说明）调用 `invalidate_shard`；如果扫描完成后仍然无条件
+        // 回写，会用一份可能已经过期的 schema 把刚被作废的路由悄悄复活。
+        // 下面 `put_shard_schema` 调用会拿这份 `expected_generation` 与
+        // 《回写那一刻》的当前世代号比较，不等就放弃写入——并发化只是把
+        // "发起 spawn_blocking 之后的等待"改成并发，这一步读取的时序位置
+        // 与旧实现完全相同。
         let expected_generation = db.route_generation();
 
-        let (tables_opt, max_ts): (Option<HashSet<String>>, Option<i64>) =
-            tokio::task::spawn_blocking(move || {
-                hot.with(|conn| {
-                    if need_rebuild {
-                        let mut stmt = conn.prepare(
-                            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
-                        )?;
-                        let tables: HashSet<String> = stmt
-                            .query_map([], |row| row.get::<_, String>(0))?
-                            .filter_map(|r| r.ok())
-                            .collect();
-                        let ts = if tables.contains(&tname) {
-                            conn.query_row(
-                                &format!("SELECT MAX(create_time) FROM [{}]", tname),
-                                [],
-                                |row| row.get(0),
-                            )
-                            .ok()
-                            .flatten()
-                        } else {
-                            None
-                        };
-                        Ok::<_, anyhow::Error>((Some(tables), ts))
+        spawn_shard_scan(&mut join_set, &scan_semaphore, move || -> Result<ShardScanOutcome> {
+            let (tables_opt, max_ts) = hot.with(|conn| {
+                if need_rebuild {
+                    let mut stmt = conn.prepare(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
+                    )?;
+                    let tables: HashSet<String> = stmt
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    let ts = if tables.contains(&tname) {
+                        conn.query_row(
+                            &format!("SELECT MAX(create_time) FROM [{}]", tname),
+                            [],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                        .flatten()
                     } else {
-                        // 缓存已确认该分片含目标表（否则上面已经 continue）；
-                        // 万一实际不一致（理论上不该发生——任何写入都会 bump
-                        // mtime 使缓存失效），查询失败时 `.ok()` 安全退化为
-                        // None，不 panic、不误报数据。
-                        let ts = conn
-                            .query_row(
-                                &format!("SELECT MAX(create_time) FROM [{}]", tname),
-                                [],
-                                |row| row.get(0),
-                            )
-                            .ok()
-                            .flatten();
-                        Ok((None, ts))
-                    }
-                })
+                        None
+                    };
+                    Ok::<_, anyhow::Error>((Some(tables), ts))
+                } else {
+                    // 缓存已确认该分片含目标表（否则上面已经 continue）；
+                    // 万一实际不一致（理论上不该发生——任何写入都会 bump
+                    // mtime 使缓存失效），查询失败时 `.ok()` 安全退化为
+                    // None，不 panic、不误报数据。
+                    let ts = conn
+                        .query_row(
+                            &format!("SELECT MAX(create_time) FROM [{}]", tname),
+                            [],
+                            |row| row.get(0),
+                        )
+                        .ok()
+                        .flatten();
+                    Ok((None, ts))
+                }
+            })?;
+            Ok(ShardScanOutcome {
+                rel_key: rel_key_owned,
+                tables_opt,
+                max_ts,
+                enc_path,
+                snap_at_judgement,
+                expected_generation,
             })
-            .await??;
+        });
+    }
 
-        if let Some(tables) = tables_opt {
+    // I/O 段：并发收割。任意一个分片扫描失败（真实 I/O/decrypt 错误，不是
+    // "确认不含目标表"这种正常空结果）都立刻中止并把错误原样传播给调用方
+    // ——与旧实现的 `.await??` 语义完全一致：旧实现里任何一次 `?` 失败都会
+    // 让整个 `find_msg_shards` 立刻返回 `Err`，不会把"部分分片失败"降级
+    // 处理成"跳过失败的分片、返回其余分片的部分结果"。仍在 `JoinSet` 里
+    // 排队/执行的其它分片任务会在 `join_set` 被 drop 时收到 abort 信号；
+    // 由于它们是 `spawn_blocking`（协作式取消对阻塞线程无效），可能会把
+    // 当前这次 I/O 跑完，但其结果不会被读取、不会被回写，不产生任何副作用
+    // 之外的正确性影响。
+    let mut results: Vec<MessageShard> = Vec::new();
+    while let Some(joined) = join_set.join_next().await {
+        let outcome = match joined {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(e)) => {
+                return Err(e.context(format!("扫描 {} 的消息分片失败", username)));
+            }
+            Err(e) => {
+                anyhow::bail!("扫描 {} 的消息分片任务异常: {}", username, e);
+            }
+        };
+
+        if let Some(tables) = outcome.tables_opt {
             // 必须用《判定时刻》的 snap_at_judgement（`shard_route_lookup`
             // 返回 Stale 时携带的快照），不能用重建完成后重新读的快照——
             // 否则会把"重建期间发生的新写入"误判为"缓存仍新鲜"，见
             // `DbCache::put_shard_schema` 的 TOCTOU 说明。`need_rebuild` 为
             // true 时这份快照必然是 `Some`（上面 `Stale` 分支赋的值），
             // `expect` 只是让这个不变量在类型上显式可见。
-            let snapshot = snap_at_judgement.expect("need_rebuild 时快照必然存在");
-            db.put_shard_schema(rel_key.clone(), snapshot, tables, expected_generation);
+            let snapshot = outcome
+                .snap_at_judgement
+                .expect("need_rebuild 时快照必然存在");
+            db.put_shard_schema(
+                outcome.rel_key.clone(),
+                snapshot,
+                tables,
+                outcome.expected_generation,
+            );
         }
 
-        if let Some(ts) = max_ts {
+        if let Some(ts) = outcome.max_ts {
             results.push(MessageShard {
-                rel_key: rel_key.clone(),
-                path: enc_path,
+                rel_key: outcome.rel_key,
+                path: outcome.enc_path,
                 table: table_name.clone(),
                 max_ts: ts,
             });
@@ -1001,7 +1193,8 @@ async fn find_msg_shards(
         );
     }
 
-    // 按最大时间戳降序排列（最新的优先）
+    // 按最大时间戳降序排列（最新的优先）——并发完成顺序不确定，排序保证
+    // 输出顺序与旧实现完全一致。
     results.sort_by_key(|s| std::cmp::Reverse(s.max_ts));
     Ok((results, scanned, skipped))
 }
@@ -1052,6 +1245,443 @@ mod shard_skip_tests {
     fn fresher_than_since_is_not_skipped() {
         let since = 1_000_000i64;
         assert!(!shard_skippable(Some(since + 10), Some(since)));
+    }
+}
+
+/// FIX 3（并发扫描）的集成测试：用真实 VFS 可打开的加密夹具（复用
+/// `cache::test_support`）搭多个消息分片，端到端验证 `find_msg_shards`
+/// 并发化后：(a) 功能结果与旧的逐分片串行实现完全等价（命中哪些分片、
+/// 每个分片的 max_ts、按 max_ts 降序排序），(b) 冷启动（路由缓存为空，
+/// `since=None`）下确实会对全部分片并发发起真正的 open()，(c) 任意一个
+/// 分片打开失败都会让整个调用立刻返回 `Err`，不会静默降级成"跳过失败
+/// 分片、返回其余分片的部分结果"——这是刻意保留的旧行为，不是并发化的
+/// 副作用。
+#[cfg(test)]
+mod find_msg_shards_concurrency_tests {
+    use super::super::cache::test_support::{
+        backdate_beyond_slack, build_encrypted_fixture, key_fixture, key_to_hex, unique_tmpdir,
+    };
+    use super::*;
+
+    fn names_for(msg_db_keys: Vec<String>) -> Names {
+        Names {
+            map: HashMap::new(),
+            md5_to_uname: HashMap::new(),
+            msg_db_keys,
+            verify_flags: HashMap::new(),
+        }
+    }
+
+    fn wal_sidecar_path(db_path: &std::path::Path) -> std::path::PathBuf {
+        let mut name = db_path.file_name().unwrap().to_os_string();
+        name.push("-wal");
+        db_path.with_file_name(name)
+    }
+
+    /// 冷启动场景：daemon 刚重启，路由缓存为空，`since=None`（`shard_skippable`
+    /// 恒 false）——`names.msg_db_keys` 里的全部分片都会走 need_rebuild 真正
+    /// open()，这正是 FIX 3 要并发化的场景。三个分片：一个承载目标表（较新
+    /// 消息）、一个承载目标表的"旧半"（模拟分片滚动，同一个 uname 的表分布
+    /// 在两个分片里）、一个完全不相关。
+    #[tokio::test]
+    async fn concurrently_scans_all_dirty_shards_and_returns_results_sorted_by_max_ts_desc() {
+        let root = unique_tmpdir("find-shards-concurrent");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let username = "alice";
+        let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
+        let key = key_fixture();
+        let mut all_keys = HashMap::new();
+
+        // shard_new：承载目标表，较新的消息（max create_time = 5000）。
+        let shard_new = db_dir.join("message_0.db");
+        build_encrypted_fixture(&shard_new, &key, &table_name, &[(1, 1000), (2, 5000)]);
+        backdate_beyond_slack(&shard_new);
+        all_keys.insert("message_0.db".to_string(), key_to_hex(&key));
+
+        // shard_unrelated：不承载目标表，只有一张无关的表。
+        let shard_unrelated = db_dir.join("message_1.db");
+        build_encrypted_fixture(&shard_unrelated, &key, "Msg_someone_else", &[(1, 9999)]);
+        backdate_beyond_slack(&shard_unrelated);
+        all_keys.insert("message_1.db".to_string(), key_to_hex(&key));
+
+        // shard_old：模拟分片滚动——同一个 table_name 出现在另一个分片里，
+        // 承载更早的消息（max create_time = 3000）。
+        let shard_old = db_dir.join("message_2.db");
+        build_encrypted_fixture(&shard_old, &key, &table_name, &[(1, 500), (2, 3000)]);
+        backdate_beyond_slack(&shard_old);
+        all_keys.insert("message_2.db".to_string(), key_to_hex(&key));
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let db = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+        let names = names_for(vec![
+            "message_0.db".to_string(),
+            "message_1.db".to_string(),
+            "message_2.db".to_string(),
+        ]);
+
+        let (shards, scanned, skipped) = find_msg_shards(&db, &names, username, None)
+            .await
+            .expect("冷启动下应该成功并发扫描全部分片");
+
+        assert_eq!(skipped, 0, "since=None 时不应该跳过任何分片");
+        assert_eq!(scanned, 3, "路由缓存为空，全部 3 个分片都应该真正被 open 扫描");
+
+        assert_eq!(shards.len(), 2, "只有承载目标表的两个分片应该出现在结果里");
+        assert_eq!(
+            shards[0].rel_key, "message_0.db",
+            "按 max_ts 降序，更新的分片应该排在前面"
+        );
+        assert_eq!(shards[0].max_ts, 5000);
+        assert_eq!(shards[1].rel_key, "message_2.db");
+        assert_eq!(shards[1].max_ts, 3000);
+
+        // 并发扫描附带效果：路由缓存应该已经记下这三个分片各自的 schema，
+        // 后续同一批分片的查询可以直接命中 Fresh，不需要重新 open。
+        assert!(matches!(
+            db.shard_route_lookup("message_0.db"),
+            ShardRouteLookup::Fresh(_)
+        ));
+        assert!(matches!(
+            db.shard_route_lookup("message_1.db"),
+            ShardRouteLookup::Fresh(_)
+        ));
+        assert!(matches!(
+            db.shard_route_lookup("message_2.db"),
+            ShardRouteLookup::Fresh(_)
+        ));
+    }
+
+    /// 两个分片：一个承载目标表，一个不承载。第二次调用（路由缓存已经
+    /// Fresh）时：
+    /// - 承载目标表的分片仍然需要 touch 一次去拿 `MAX(create_time)`——
+    ///   `scanned` 统计的是"发起了真正的连接层查询"，不是"发起了
+    ///   `sqlite_master` 全表扫描"，路由缓存 Fresh 在这种情况下省下的是
+    ///   "重新扫描 schema"，不是"完全不碰这个分片"，这与优化 A 的既有
+    ///   文档语义一致（"命中且快照未变、**确认不含目标表**时零阻塞 I/O
+    ///   直接跳过"——反过来，确认**含**目标表时不属于这条零 I/O 路径）。
+    /// - 不承载目标表的分片应该完全零 I/O 跳过（这条才是"路由缓存命中时
+    ///   跳过"真正生效的场景），证明并发化没有破坏这条既有优化。
+    #[tokio::test]
+    async fn second_call_reuses_route_cache_to_skip_only_the_non_matching_shard() {
+        let root = unique_tmpdir("find-shards-warm");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let username = "bob";
+        let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
+        let key = key_fixture();
+        let mut all_keys = HashMap::new();
+
+        let shard_match = db_dir.join("message_0.db");
+        build_encrypted_fixture(&shard_match, &key, &table_name, &[(1, 1000)]);
+        // 路由缓存的 Fresh 判定同时要求"snapshot 相等"与
+        // `SourceSnapshot::trusted_as_of`（安静满一个 600s 新鲜度 slack），
+        // 回拨 mtime 让第二次调用不用真的等待 600 秒就能进入"可信"状态。
+        backdate_beyond_slack(&shard_match);
+        all_keys.insert("message_0.db".to_string(), key_to_hex(&key));
+
+        let shard_other = db_dir.join("message_1.db");
+        build_encrypted_fixture(&shard_other, &key, "Msg_unrelated", &[(1, 1)]);
+        backdate_beyond_slack(&shard_other);
+        all_keys.insert("message_1.db".to_string(), key_to_hex(&key));
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let db = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+        let names = names_for(vec!["message_0.db".to_string(), "message_1.db".to_string()]);
+
+        let (first, first_scanned, _) = find_msg_shards(&db, &names, username, None)
+            .await
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first_scanned, 2, "第一次调用路由缓存为空，两个分片都必须真正 open");
+
+        let (second, second_scanned, _) = find_msg_shards(&db, &names, username, None)
+            .await
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].rel_key, "message_0.db");
+        assert_eq!(second[0].max_ts, 1000, "复用路由缓存 schema 后查到的 max_ts 应该仍然正确");
+        assert_eq!(
+            second_scanned, 1,
+            "只有承载目标表的分片需要 touch 一次拿 MAX(create_time)；\
+             不承载目标表的分片路由缓存 Fresh 后应该零 I/O 跳过"
+        );
+    }
+
+    /// 错误传播不降级：并发化之前，串行实现里任何一个分片 open 失败都会
+    /// 通过 `.await??` 立刻让整个 `find_msg_shards` 返回 `Err`；并发化后
+    /// 必须保持这个"任一失败、整体失败"的语义，不能悄悄把失败的分片当作
+    /// "跳过"处理、只返回其余分片的部分结果——那样会把一次真实的 I/O/解密
+    /// 异常伪装成"这个会话没有更多消息"，对监控工具是不可接受的静默降级。
+    #[tokio::test]
+    async fn any_shard_open_failure_aborts_whole_call_not_partial_results() {
+        let root = unique_tmpdir("find-shards-error");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let username = "carol";
+        let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
+        let key = key_fixture();
+        let mut all_keys = HashMap::new();
+
+        // shard_good：真正命中目标表，本该被正常返回。
+        let shard_good = db_dir.join("message_0.db");
+        build_encrypted_fixture(&shard_good, &key, &table_name, &[(1, 1000)]);
+        all_keys.insert("message_0.db".to_string(), key_to_hex(&key));
+
+        // shard_bad：密钥已登记（能通过 resolve_conn_params），但磁盘内容是
+        // 垃圾字节——`ConnParams::open()` 内部用 `immutable=1` 打开时会在
+        // 校验页 1 魔数那一步直接报 SQLITE_NOTADB，模拟真实的解密/损坏错误。
+        let shard_bad = db_dir.join("message_1.db");
+        std::fs::write(&shard_bad, vec![0x13u8; 4096]).unwrap();
+        all_keys.insert("message_1.db".to_string(), key_to_hex(&key));
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let db = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+        let names = names_for(vec!["message_0.db".to_string(), "message_1.db".to_string()]);
+
+        let result = find_msg_shards(&db, &names, username, None).await;
+        assert!(
+            result.is_err(),
+            "任意一个分片 open 失败都必须让整个调用返回 Err，不能静默降级成部分结果"
+        );
+    }
+
+    /// 分片滚动 + 并发场景下，wal-only 变化也必须让 join_set 里对应的分片
+    /// 走 need_rebuild 真正重扫——防止并发化引入"某个分片在批次里被漏判为
+    /// Fresh"这类回归（wal 存在性是 SourceSnapshot 相等性判断的一部分，
+    /// 见 cache.rs `wal_appearing_makes_snapshot_unequal_even_with_zeroed_mtime_len`）。
+    #[tokio::test]
+    async fn wal_only_change_forces_rebuild_for_the_affected_shard_in_a_concurrent_batch() {
+        let root = unique_tmpdir("find-shards-wal-change");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let username = "dave";
+        let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
+        let key = key_fixture();
+        let mut all_keys = HashMap::new();
+
+        let shard_a = db_dir.join("message_0.db");
+        build_encrypted_fixture(&shard_a, &key, &table_name, &[(1, 1000)]);
+        backdate_beyond_slack(&shard_a);
+        all_keys.insert("message_0.db".to_string(), key_to_hex(&key));
+
+        let shard_b = db_dir.join("message_1.db");
+        build_encrypted_fixture(&shard_b, &key, "Msg_unrelated", &[(1, 1)]);
+        backdate_beyond_slack(&shard_b);
+        all_keys.insert("message_1.db".to_string(), key_to_hex(&key));
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let db = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+        let names = names_for(vec!["message_0.db".to_string(), "message_1.db".to_string()]);
+
+        let (_first, first_scanned, _) = find_msg_shards(&db, &names, username, None)
+            .await
+            .unwrap();
+        assert_eq!(first_scanned, 2, "首次调用两个分片都应该真正 open");
+
+        // 只给 shard_a 追加一个 WAL 文件（模拟微信刚开始往这个分片写新消息），
+        // 不动 shard_b。
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::fs::write(wal_sidecar_path(&shard_a), [0u8; 31]).unwrap();
+
+        let (second, second_scanned, _) = find_msg_shards(&db, &names, username, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            second_scanned, 1,
+            "只有 WAL 变化的 shard_a 应该重新 open，shard_b 应该继续走路由缓存零 I/O"
+        );
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].rel_key, "message_0.db");
+    }
+}
+
+/// [`MAX_CONCURRENT_SHARD_SCANS`] / [`spawn_shard_scan`] 专项测试：
+/// - 并发度确实被限制在上限内，且不是被误伤退化成纯串行（峰值应该真的
+///   触达上限）；
+/// - 限流只改变"谁先谁后拿到许可"这个调度节奏，不改变最终结果集——不丢、
+///   不重、不篡改任何一个任务的产出；
+/// - 接到真实 `find_msg_shards` 上、分片数明显超过并发上限时，功能结果
+///   （命中哪些分片、每个分片的 max_ts、排序）与不限流时的既有测试
+///   （`find_msg_shards_concurrency_tests`）完全一致。
+#[cfg(test)]
+mod shard_scan_concurrency_cap_tests {
+    use super::super::cache::test_support::{
+        backdate_beyond_slack, build_encrypted_fixture, key_fixture, key_to_hex, unique_tmpdir,
+    };
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// 直接对 [`spawn_shard_scan`] + [`MAX_CONCURRENT_SHARD_SCANS`] 施压，不
+    /// 经过任何真实分片/磁盘 I/O：用一个共享计数器记录"同一时刻有多少个
+    /// work 闭包正在执行"，配一个足够宽（60ms）的睡眠窗口让调度器有充分
+    /// 机会把其它已经拿到许可的任务也调度上来同时跑，验证峰值恰好等于
+    /// 上限——既不超过（安全性），也确实触达上限（不是被误伤退化成串行）。
+    #[tokio::test]
+    async fn spawn_shard_scan_bounds_concurrency_to_the_configured_cap() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHARD_SCANS));
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let total_tasks = MAX_CONCURRENT_SHARD_SCANS * 4;
+        let mut join_set: tokio::task::JoinSet<Result<usize>> = tokio::task::JoinSet::new();
+        for i in 0..total_tasks {
+            let active2 = Arc::clone(&active);
+            let peak2 = Arc::clone(&peak);
+            spawn_shard_scan(&mut join_set, &semaphore, move || {
+                let cur = active2.fetch_add(1, Ordering::SeqCst) + 1;
+                peak2.fetch_max(cur, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                active2.fetch_sub(1, Ordering::SeqCst);
+                Ok(i)
+            });
+        }
+
+        let mut results = Vec::new();
+        while let Some(joined) = join_set.join_next().await {
+            results.push(joined.expect("任务不应 panic").expect("任务不应返回 Err"));
+        }
+        results.sort_unstable();
+
+        assert!(
+            peak.load(Ordering::SeqCst) <= MAX_CONCURRENT_SHARD_SCANS,
+            "并发峰值 {} 不能超过上限 {}",
+            peak.load(Ordering::SeqCst),
+            MAX_CONCURRENT_SHARD_SCANS
+        );
+        assert_eq!(
+            peak.load(Ordering::SeqCst),
+            MAX_CONCURRENT_SHARD_SCANS,
+            "任务数远多于上限、睡眠窗口足够宽时，峰值应该恰好触达上限，\
+             证明确实在并发跑、不是被误伤退化成串行"
+        );
+        assert_eq!(
+            results,
+            (0..total_tasks).collect::<Vec<_>>(),
+            "限流不应该丢失或重复任何一个任务的结果"
+        );
+    }
+
+    /// 结果集一致性：同一批任务分别跑"不限流（直接 `spawn_blocking`）"和
+    /// "限流（经 `spawn_shard_scan`）"两条路径，产出必须完全相同——限流
+    /// 只是调度节奏的改变，不是又一次"部分结果"降级。
+    #[tokio::test]
+    async fn capped_concurrency_yields_identical_result_set_to_uncapped() {
+        let total_tasks = MAX_CONCURRENT_SHARD_SCANS * 3;
+
+        let mut baseline_set: tokio::task::JoinSet<Result<usize>> = tokio::task::JoinSet::new();
+        for i in 0..total_tasks {
+            baseline_set.spawn_blocking(move || Ok(i));
+        }
+        let mut baseline: Vec<usize> = Vec::new();
+        while let Some(joined) = baseline_set.join_next().await {
+            baseline.push(joined.expect("baseline 任务不应 panic").expect("baseline 任务不应返回 Err"));
+        }
+        baseline.sort_unstable();
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SHARD_SCANS));
+        let mut capped_set: tokio::task::JoinSet<Result<usize>> = tokio::task::JoinSet::new();
+        for i in 0..total_tasks {
+            spawn_shard_scan(&mut capped_set, &semaphore, move || Ok(i));
+        }
+        let mut capped: Vec<usize> = Vec::new();
+        while let Some(joined) = capped_set.join_next().await {
+            capped.push(joined.expect("capped 任务不应 panic").expect("capped 任务不应返回 Err"));
+        }
+        capped.sort_unstable();
+
+        assert_eq!(
+            capped, baseline,
+            "限流只应该改变调度节奏，不应该丢失/重复/篡改任何一个任务的结果"
+        );
+    }
+
+    /// 接到真实 `find_msg_shards` 上：分片数明显超过并发上限（cap + 3）时，
+    /// 功能结果仍然正确——命中目标表的分片一个不漏、`max_ts` 与排序都与
+    /// `find_msg_shards_concurrency_tests`（不受并发上限约束，因为分片数
+    /// 没超过它）里验证过的语义完全一致。
+    #[tokio::test]
+    async fn find_msg_shards_stays_correct_when_shard_count_exceeds_the_concurrency_cap() {
+        let root = unique_tmpdir("find-shards-over-cap");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let username = "erin";
+        let table_name = format!("Msg_{:x}", md5::compute(username.as_bytes()));
+        let key = key_fixture();
+        let mut all_keys = HashMap::new();
+        let shard_count = MAX_CONCURRENT_SHARD_SCANS + 3;
+        let mut msg_db_keys = Vec::new();
+
+        for i in 0..shard_count {
+            let rel_key = format!("message_{}.db", i);
+            let path = db_dir.join(&rel_key);
+            if i == 0 {
+                // 承载目标表的较新一段。
+                build_encrypted_fixture(&path, &key, &table_name, &[(1, 1000), (2, 4000)]);
+            } else if i == shard_count - 1 {
+                // 分片滚动：目标表也出现在最后一个分片，承载更旧的一段。
+                build_encrypted_fixture(&path, &key, &table_name, &[(1, 200), (2, 2000)]);
+            } else {
+                build_encrypted_fixture(
+                    &path,
+                    &key,
+                    &format!("Msg_unrelated_{}", i),
+                    &[(1, 1)],
+                );
+            }
+            backdate_beyond_slack(&path);
+            all_keys.insert(rel_key.clone(), key_to_hex(&key));
+            msg_db_keys.push(rel_key);
+        }
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let db = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+        let names = Names {
+            map: HashMap::new(),
+            md5_to_uname: HashMap::new(),
+            msg_db_keys,
+            verify_flags: HashMap::new(),
+        };
+
+        let (shards, scanned, skipped) = find_msg_shards(&db, &names, username, None)
+            .await
+            .expect("分片数超过并发上限时仍应成功扫描全部分片");
+
+        assert_eq!(skipped, 0, "since=None 时不应该跳过任何分片");
+        assert_eq!(
+            scanned, shard_count,
+            "并发上限只限制同时在飞的任务数，不应该漏扫任何分片"
+        );
+        assert_eq!(shards.len(), 2, "承载目标表的两个分片都应该被找到");
+        assert_eq!(shards[0].rel_key, "message_0.db");
+        assert_eq!(shards[0].max_ts, 4000);
+        assert_eq!(shards[1].rel_key, format!("message_{}.db", shard_count - 1));
+        assert_eq!(shards[1].max_ts, 2000);
     }
 }
 
@@ -3010,6 +3640,732 @@ mod force_invalidate_tests {
     }
 }
 
+/// [`q_new_messages`] 聚合执行专用的会话上下文：展示名 / 会话类型 / 群昵称 /
+/// 本轮增量下界，按会话预先算好一次，供按分片聚合查询时复用——群昵称需要
+/// 独立一次 `contact.db` async 查询（[`load_group_nicknames`]），在这里统一
+/// 按会话预取一次，避免在按分片的循环里对同一会话重复触发。
+struct SessionCtx {
+    display: String,
+    chat_type: &'static str,
+    is_group: bool,
+    group_nicknames: HashMap<String, String>,
+    since_ts: i64,
+}
+
+/// [`aggregate_new_messages_by_shard`] 里，单个分片单个命中会话的一次消息
+/// 查询任务：把 [`SessionCtx`] 里"整个 changed 批次共享一次"的字段与
+/// "这次任务专属"的 `table` 打包成拥有型数据，供 move 进 `spawn_blocking`
+/// 闭包（同一个分片承载的全部任务在**同一次**闭包调用里依次跑完，见函数
+/// 文档"为什么必须在同一个 hot.with() 闭包内做完发现 + 查询"一节）。
+struct ShardMessageJob {
+    uname: String,
+    table: String,
+    since_ts: i64,
+    display: String,
+    chat_type: &'static str,
+    is_group: bool,
+    group_nicknames: HashMap<String, String>,
+}
+
+/// [`aggregate_new_messages_by_shard`] 的返回值：聚合后的消息，与按分片的
+/// 诊断 bookkeeping（对齐 [`q_new_messages`] 原本从逐会话 `find_msg_shards`
+/// 返回值里手工攒出来的同名字段，语义差异见函数文档最后一节）。
+#[derive(Default)]
+struct NewMessagesShardAggregate {
+    messages: Vec<Value>,
+    scanned_rel_keys: HashSet<String>,
+    hit_rel_keys: HashSet<String>,
+    cache_modes: HashMap<String, String>,
+    shard_paths: HashMap<String, String>,
+    /// 仅用于日志：本轮真正触发过 I/O（进入 `hot_conn_handle_with_snapshot`
+    /// 及之后）的分片数。
+    scanned_shards: usize,
+    /// 仅用于日志：按 mtime 判定安全跳过、未触发任何 I/O 的分片数。
+    skipped_shards: usize,
+}
+
+/// FIX 1（聚合执行，替代原来"逐会话调用 [`find_msg_shards`] + 逐会话再次
+/// `hot_conn_handle` 查消息"这两步分离的执行路径）：把本轮 `changed` 全部
+/// 会话按承载分片聚合，每个分片只 open（或复用）一次热连接，在**同一次**
+/// `hot.with()` 闭包内依次查完它承载的全部 changed 会话的消息——每个 dirty
+/// 分片本轮的 open 次数从 `2×C`（C 为 changed 会话数）降到 1。
+///
+/// # 为什么必须在同一个 `hot.with()` 闭包内做完"发现 + 查询"
+/// [`SourceSnapshot::trusted_as_of`]（600 秒 slack）意味着：一个分片只要
+/// 最近（< 600s）被 WeChat 写过——这正是它承载的会话出现在 `changed` 里的
+/// 原因——它的热连接就"永远不被信任"，任何两次独立的
+/// [`super::cache::HotConnHandle::with`] 调用之间都会强制重建一次，哪怕两次
+/// 调用之间数据完全没变、间隔只有几毫秒；门控看的是《快照年龄》而不是
+/// 《两次调用之间是否真的有变化》。所以哪怕把"schema 发现"和"消息查询"
+/// 分成两次挨着的 `.with()` 调用，同一个 dirty 分片依然会被 open 两次——
+/// 唯一能把单个分片的开销压到 1 次的办法，是让 schema 发现（`need_rebuild`
+/// 时的 `sqlite_master` 扫描）与这个分片承载的全部匹配会话的消息查询共享
+/// 同一次 `hot.with()` 闭包、同一个已经建立好的 `&Connection` 引用。
+///
+/// # 与 [`find_msg_shards`] 共享、且严格不放宽的判据
+/// 新鲜度 skip（[`shard_skippable`]）、路由缓存 Fresh/Stale
+/// （`DbCache::shard_route_lookup_with_snapshot`）、`expected_generation`
+/// TOCTOU 保护（`DbCache::put_shard_schema`）、热连接门控
+/// （`DbCache::hot_conn_handle_with_snapshot` + `HotConnHandle::with`）逐条
+/// 保持不变——这里只是把"对哪个分片做判定"的粒度从"每个会话各自遍历全部
+/// 分片"改成"遍历一次全部分片，每个分片内部一次性匹配、一次性查询本轮
+/// 全部相关会话"。唯一的差异：`shard_skippable` 的 `since` 参数改用本轮
+/// 全部会话 `since_ts` 的**最小值**（最保守下界）——只要某分片按这个最
+/// 保守下界都判定不可能有新消息，对"since 更晚"的会话（下界更高、要求更
+/// 严格）自然也不可能有，不会漏判；代价仅仅是个别分片本可以对部分会话更早
+/// 跳过、现在没跳过，不产生正确性问题。
+///
+/// # 与旧执行路径的输出差异（仅限诊断字段，非功能字段）
+/// `scanned_rel_keys` / `cache_modes` / `shard_paths` 判定"一个分片是否算
+/// 命中"时，旧路径经 `find_msg_shards` 内部一次额外的
+/// `SELECT MAX(create_time)` 确认"目标表存在且至少有一行"；这里为了不做
+/// 那次纯诊断用途的额外查询，改用"目标表存在于该分片的 `sqlite_master`
+/// （或缓存的 `msg_tables`）"作为判定条件——唯一的差异场景是"表存在但恰好
+/// 零行"（旧路径的 `MAX` 会返回 NULL、不计入命中），这种表在实践中不会
+/// 出现（微信消息表都是首次写入消息时才建表，建表和写入同一事务）。
+/// `hit_rel_keys`（实际查到消息）与 `messages` / `new_state` 依赖的时间戳
+/// 等**功能字段**不受这个差异影响，判定条件与旧路径逐字段相同（都是"这次
+/// `WHERE create_time > since_ts` 查询是否非空"）。
+async fn aggregate_new_messages_by_shard(
+    db: &DbCache,
+    names: &Names,
+    changed: &[(String, i64)],
+    session_ctx: &HashMap<String, SessionCtx>,
+    per_table_limit: usize,
+) -> Result<NewMessagesShardAggregate> {
+    // uname 去重后按 table_name 分组：一个 table_name 理论上只对应一个
+    // uname（md5 碰撞概率为零），用 Vec 只是防御性地保留"万一"的语义。
+    let mut unames_by_table: HashMap<String, Vec<String>> = HashMap::new();
+    for (uname, _) in changed {
+        if !session_ctx.contains_key(uname) {
+            continue;
+        }
+        let table_name = format!("Msg_{:x}", md5::compute(uname.as_bytes()));
+        if !msg_table_re().is_match(&table_name) {
+            continue;
+        }
+        unames_by_table
+            .entry(table_name)
+            .or_default()
+            .push(uname.clone());
+    }
+
+    let mut agg = NewMessagesShardAggregate::default();
+    if unames_by_table.is_empty() {
+        return Ok(agg);
+    }
+
+    // 最保守的 since 下界：见函数文档"与 find_msg_shards 共享、且严格不
+    // 放宽的判据"一节。
+    let min_since = changed
+        .iter()
+        .filter_map(|(uname, _)| session_ctx.get(uname).map(|c| c.since_ts))
+        .min();
+
+    let names_map = names.map.clone();
+
+    for rel_key in &names.msg_db_keys {
+        let snapshot = db.source_snapshot(rel_key);
+
+        if shard_skippable(snapshot.freshness_secs(), min_since) {
+            agg.skipped_shards += 1;
+            continue;
+        }
+
+        let (cached_tables, need_rebuild, snap_at_judgement) =
+            match db.shard_route_lookup_with_snapshot(rel_key, snapshot) {
+                ShardRouteLookup::Fresh(tables) => (tables, false, None),
+                ShardRouteLookup::Stale(s) => (HashSet::new(), true, Some(s)),
+            };
+
+        let mut candidate_tables: Vec<String> = Vec::new();
+        if need_rebuild {
+            candidate_tables.extend(unames_by_table.keys().cloned());
+        } else {
+            for table in unames_by_table.keys() {
+                if cached_tables.contains(table) {
+                    candidate_tables.push(table.clone());
+                }
+            }
+            if candidate_tables.is_empty() {
+                // Fresh 且该分片缓存的表集合与本轮全部目标表都不相交：零 I/O 跳过。
+                continue;
+            }
+        }
+
+        let hot = match db.hot_conn_handle_with_snapshot(rel_key, snapshot) {
+            Ok(h) => h,
+            Err(_) => continue,
+        };
+        agg.scanned_shards += 1;
+        let enc_path = hot.enc_db_path().to_path_buf();
+        // FIX-MEDIUM（保持不变）：必须紧跟着这次判定同步读取，不能等到
+        // spawn_blocking 完成之后再读——道理与 find_msg_shards 完全相同
+        // （见 DbCache::put_shard_schema 文档）。
+        let expected_generation = db.route_generation();
+
+        // 把候选任务打包成拥有型数据，一次性 move 进闭包；need_rebuild 时
+        // 候选是"本轮全部目标表"（还不知道这个分片实际承载哪些，闭包内
+        // 扫完 sqlite_master 后再精确过滤），非 need_rebuild 时已经是精确
+        // 命中集合。
+        let mut jobs_ctx: Vec<ShardMessageJob> = Vec::new();
+        for table in &candidate_tables {
+            if let Some(unames) = unames_by_table.get(table) {
+                for uname in unames {
+                    let Some(ctx) = session_ctx.get(uname) else {
+                        continue;
+                    };
+                    jobs_ctx.push(ShardMessageJob {
+                        uname: uname.clone(),
+                        table: table.clone(),
+                        since_ts: ctx.since_ts,
+                        display: ctx.display.clone(),
+                        chat_type: ctx.chat_type,
+                        is_group: ctx.is_group,
+                        group_nicknames: ctx.group_nicknames.clone(),
+                    });
+                }
+            }
+        }
+
+        let names_map2 = names_map.clone();
+        let rel_key_for_log = rel_key.clone();
+
+        let (tables_opt, matched_any, msgs): (Option<HashSet<String>>, bool, Vec<Value>) =
+            match tokio::task::spawn_blocking(move || {
+                hot.with(|conn| {
+                    let scanned_tables = if need_rebuild {
+                        let mut stmt = conn.prepare(
+                            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
+                        )?;
+                        let tables: HashSet<String> = stmt
+                            .query_map([], |row| row.get::<_, String>(0))?
+                            .filter_map(|r| r.ok())
+                            .collect();
+                        Some(tables)
+                    } else {
+                        None
+                    };
+
+                    let jobs: Vec<ShardMessageJob> = match &scanned_tables {
+                        Some(t) => jobs_ctx
+                            .into_iter()
+                            .filter(|job| t.contains(&job.table))
+                            .collect(),
+                        None => jobs_ctx,
+                    };
+                    let matched_any = !jobs.is_empty();
+
+                    let mut result = Vec::new();
+                    if matched_any {
+                        let id2u = load_id2u(conn);
+                        for job in jobs {
+                            let sql = format!(
+                                "SELECT local_id, local_type, create_time, real_sender_id,
+                                        message_content, WCDB_CT_message_content
+                                 FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT ?",
+                                job.table
+                            );
+                            let rows: Vec<_> = conn
+                                .prepare(&sql)
+                                .and_then(|mut stmt| {
+                                    stmt.query_map(
+                                        rusqlite::params![job.since_ts, per_table_limit as i64],
+                                        |row| {
+                                            Ok((
+                                                row.get::<_, i64>(0)?,
+                                                row.get::<_, i64>(1)?,
+                                                row.get::<_, i64>(2)?,
+                                                row.get::<_, i64>(3)?,
+                                                get_content_bytes(row, 4),
+                                                row.get::<_, i64>(5).unwrap_or(0),
+                                            ))
+                                        },
+                                    )
+                                    .map(|it| it.filter_map(|r| r.ok()).collect())
+                                })
+                                .unwrap_or_default();
+
+                            for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in
+                                rows
+                            {
+                                let content = decompress_message(&content_bytes, ct);
+                                let sender = sender_label(
+                                    real_sender_id,
+                                    &content,
+                                    job.is_group,
+                                    &job.uname,
+                                    &id2u,
+                                    &names_map2,
+                                    &job.group_nicknames,
+                                );
+                                let text =
+                                    fmt_content(local_id, local_type, &content, job.is_group);
+                                let url = appmsg_url_for_message(local_type, &content);
+                                let mut msg = json!({
+                                    "chat": job.display,
+                                    "username": job.uname,
+                                    "is_group": job.is_group,
+                                    "chat_type": job.chat_type,
+                                    "timestamp": ts,
+                                    "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
+                                    "sender": sender,
+                                    "content": text,
+                                    "type": fmt_type(local_type),
+                                });
+                                if let Some(u) = url {
+                                    msg["url"] = serde_json::Value::String(u);
+                                }
+                                result.push(msg);
+                            }
+                        }
+                    }
+
+                    Ok::<_, anyhow::Error>((scanned_tables, matched_any, result))
+                })
+            })
+            .await
+            {
+                Ok(Ok(v)) => v,
+                Ok(Err(e)) => {
+                    eprintln!("[new-messages] skip {}: {}", rel_key_for_log, e);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[new-messages] task error: {}", e);
+                    continue;
+                }
+            };
+
+        if let Some(tables) = tables_opt {
+            let snapshot = snap_at_judgement.expect("need_rebuild 时快照必然存在");
+            db.put_shard_schema(rel_key.clone(), snapshot, tables, expected_generation);
+        }
+
+        if matched_any {
+            agg.scanned_rel_keys.insert(rel_key.clone());
+            agg.cache_modes
+                .insert(rel_key.clone(), VFS_CACHE_MODE_LABEL.to_string());
+            agg.shard_paths
+                .insert(rel_key.clone(), enc_path.to_string_lossy().into_owned());
+        }
+        if !msgs.is_empty() {
+            agg.hit_rel_keys.insert(rel_key.clone());
+        }
+        agg.messages.extend(msgs);
+    }
+
+    Ok(agg)
+}
+
+/// [`aggregate_new_messages_by_shard`] 端到端测试：这是四项规模修复里唯一
+/// 改动了核心消息拉取语义的一处（把"逐会话调用 `find_msg_shards` + 逐会话
+/// 再次 `hot_conn_handle` 查消息"改成"按分片聚合、一次 `hot.with()` 闭包内
+/// 查完该分片承载的全部 changed 会话"），但改造前的人工审查没有任何测试
+/// 直接跑过这条聚合路径。这里用真实的加密 VFS 夹具（同一个分片文件里塞
+/// 两张不同会话的 `Msg_<md5>` 表，模拟"一个分片承载多个会话"的真实场景）
+/// 直接验证：
+/// - 两个会话各自 `since_ts` 不同时，各自只拿到自己下界之后的消息；
+/// - 两个会话的消息互不串号（`chat` / `username` / `is_group` / `chat_type`
+///   / 内容归属都精确对应各自会话，不会被同一个分片内的另一张表污染）；
+/// - 群会话的 `group_nicknames` → `sender` 归属正确；
+/// - 通过公开入口 [`q_new_messages`] 走一遍完整流程时，`new_state` 对每个
+///   会话分别正确推进（含"未变化会话原样保留"这个第三种情况，与"变化且
+///   有消息返回"两个会话的推进值分别核对，不是笼统断言"整体被 advance"）；
+/// - 边界：`changed` 为空（或全部不在 `session_ctx` 里）时返回正常空结果，
+///   不触碰任何分片、不报错。
+#[cfg(test)]
+mod aggregate_new_messages_by_shard_tests {
+    use super::super::cache::test_support::{
+        build_encrypted_fixture_with, key_fixture, key_to_hex, unique_tmpdir,
+    };
+    use super::*;
+
+    fn names_for(map: HashMap<String, String>, msg_db_keys: Vec<String>) -> Names {
+        Names {
+            map,
+            md5_to_uname: HashMap::new(),
+            msg_db_keys,
+            verify_flags: HashMap::new(),
+        }
+    }
+
+    /// 构造一个加密分片文件，可以在**同一个分片**里塞多张 `Msg_<md5>`
+    /// 表——每张表用生产查询真正要读的完整列（`local_type` 固定为 1，
+    /// 纯文本消息；`WCDB_CT_message_content` 固定为 0，未压缩），`rows`
+    /// 每条是 `(local_id, create_time, real_sender_id, message_content)`。
+    fn build_shard_with_message_tables(
+        enc_path: &std::path::Path,
+        key: &[u8; 32],
+        tables: &[(&str, &[(i64, i64, i64, &str)])],
+    ) {
+        // 先转成拥有型数据，一次性 move 进 `build_encrypted_fixture_with`
+        // 的 `FnOnce(&Connection)` 回调（回调不能借用外部传入的 `&[...]`
+        // 引用，闭包本身要求 `'static`-free 但仍需在回调内部拥有自己的
+        // 数据副本，避免生命周期纠缠)。
+        let tables_owned: Vec<(String, Vec<(i64, i64, i64, String)>)> = tables
+            .iter()
+            .map(|(name, rows)| {
+                (
+                    name.to_string(),
+                    rows.iter()
+                        .map(|(id, ts, sender, content)| (*id, *ts, *sender, content.to_string()))
+                        .collect(),
+                )
+            })
+            .collect();
+        build_encrypted_fixture_with(enc_path, key, move |conn| {
+            for (table_name, rows) in &tables_owned {
+                conn.execute_batch(&format!(
+                    "CREATE TABLE [{}] (
+                        local_id INTEGER PRIMARY KEY,
+                        local_type INTEGER,
+                        create_time INTEGER,
+                        real_sender_id INTEGER,
+                        message_content TEXT,
+                        WCDB_CT_message_content INTEGER
+                    );",
+                    table_name
+                ))
+                .expect("建消息表失败");
+                for (id, ts, sender, content) in rows {
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO [{}] (local_id, local_type, create_time, \
+                             real_sender_id, message_content, WCDB_CT_message_content) \
+                             VALUES (?1, 1, ?2, ?3, ?4, 0)",
+                            table_name
+                        ),
+                        rusqlite::params![id, ts, sender, content],
+                    )
+                    .expect("插入消息夹具失败");
+                }
+            }
+        });
+    }
+
+    /// 同一个分片里两个会话（一私聊一群聊），各自 `since_ts` 不同、各自
+    /// 消息不互相污染，群聊 `sender` 按 `group_nicknames` 正确归属。核心
+    /// 单元测试：直接调用 [`aggregate_new_messages_by_shard`]，不经过
+    /// `q_new_messages` 那层 session.db 读取，聚焦聚合函数本身的正确性。
+    #[tokio::test]
+    async fn two_sessions_sharing_one_shard_do_not_cross_contaminate() {
+        let root = unique_tmpdir("aggregate-two-sessions");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let uname_a = "wxid_alice".to_string();
+        let uname_b = "9999group@chatroom".to_string();
+        let table_a = format!("Msg_{:x}", md5::compute(uname_a.as_bytes()));
+        let table_b = format!("Msg_{:x}", md5::compute(uname_b.as_bytes()));
+
+        let key = key_fixture();
+        let shard_path = db_dir.join("message_0.db");
+        build_shard_with_message_tables(
+            &shard_path,
+            &key,
+            &[
+                (
+                    table_a.as_str(),
+                    &[
+                        (1, 1000, 0, "hello 1 from alice chat"),
+                        (2, 2000, 0, "hello 2 from alice chat"),
+                        (3, 3000, 0, "hello 3 from alice chat"),
+                    ],
+                ),
+                (
+                    table_b.as_str(),
+                    &[
+                        (1, 500, 0, "wxid_member1:\nhi from member1 (too old, must not leak)"),
+                        (2, 1500, 0, "wxid_member2:\nhi from member2"),
+                        (3, 2500, 0, "wxid_member1:\nsecond msg from member1"),
+                    ],
+                ),
+            ],
+        );
+        let mut all_keys = HashMap::new();
+        all_keys.insert("message_0.db".to_string(), key_to_hex(&key));
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let db = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+
+        let mut names_map = HashMap::new();
+        names_map.insert(uname_a.clone(), "Alice 私聊".to_string());
+        names_map.insert(uname_b.clone(), "群聊 A".to_string());
+        let names = names_for(names_map, vec!["message_0.db".to_string()]);
+
+        let mut group_nicknames = HashMap::new();
+        group_nicknames.insert("wxid_member1".to_string(), "群昵称1".to_string());
+        group_nicknames.insert("wxid_member2".to_string(), "群昵称2".to_string());
+
+        let mut session_ctx = HashMap::new();
+        session_ctx.insert(
+            uname_a.clone(),
+            SessionCtx {
+                display: names.display(&uname_a),
+                chat_type: chat_type_of(&uname_a, &names),
+                is_group: false,
+                group_nicknames: HashMap::new(),
+                since_ts: 1500, // 会话 A 自己的下界
+            },
+        );
+        session_ctx.insert(
+            uname_b.clone(),
+            SessionCtx {
+                display: names.display(&uname_b),
+                chat_type: chat_type_of(&uname_b, &names),
+                is_group: true,
+                group_nicknames: group_nicknames.clone(),
+                since_ts: 800, // 会话 B 自己的下界，与 A 不同
+            },
+        );
+
+        let changed = vec![(uname_a.clone(), 0i64), (uname_b.clone(), 0i64)];
+
+        let agg = aggregate_new_messages_by_shard(&db, &names, &changed, &session_ctx, 200)
+            .await
+            .expect("聚合查询不应失败");
+
+        assert_eq!(agg.scanned_shards, 1, "只有一个分片，且它命中目标表，应该被真正 open 一次");
+        assert_eq!(agg.skipped_shards, 0);
+        assert!(agg.scanned_rel_keys.contains("message_0.db"));
+        assert!(agg.hit_rel_keys.contains("message_0.db"));
+
+        assert_eq!(agg.messages.len(), 4, "会话 A 2 条 + 会话 B 2 条，不多不少");
+
+        let msgs_a: Vec<&Value> = agg
+            .messages
+            .iter()
+            .filter(|m| m["username"].as_str() == Some(uname_a.as_str()))
+            .collect();
+        let msgs_b: Vec<&Value> = agg
+            .messages
+            .iter()
+            .filter(|m| m["username"].as_str() == Some(uname_b.as_str()))
+            .collect();
+        assert_eq!(msgs_a.len(), 2, "会话 A：since_ts=1500，只应命中 ts=2000/3000");
+        assert_eq!(msgs_b.len(), 2, "会话 B：since_ts=800，只应命中 ts=1500/2500");
+
+        // ---- 各自 since_ts 下界都不多不少 ----
+        let mut ts_a: Vec<i64> = msgs_a.iter().map(|m| m["timestamp"].as_i64().unwrap()).collect();
+        ts_a.sort_unstable();
+        assert_eq!(ts_a, vec![2000, 3000], "会话 A 不应包含 ts=1000（<= since_ts=1500）");
+
+        let mut ts_b: Vec<i64> = msgs_b.iter().map(|m| m["timestamp"].as_i64().unwrap()).collect();
+        ts_b.sort_unstable();
+        assert_eq!(ts_b, vec![1500, 2500], "会话 B 不应包含 ts=500（<= since_ts=800）");
+
+        // ---- 互不串号：会话归属字段精确对应各自会话，没有被对方污染 ----
+        for m in &msgs_a {
+            assert_eq!(m["chat"].as_str(), Some("Alice 私聊"));
+            assert_eq!(m["is_group"].as_bool(), Some(false));
+            assert_eq!(m["chat_type"].as_str(), Some("private"));
+            // 私聊消息不经过群消息的 "sender:\n" 前缀剥离，内容原样保留。
+            assert!(m["content"].as_str().unwrap().starts_with("hello"));
+        }
+        for m in &msgs_b {
+            assert_eq!(m["chat"].as_str(), Some("群聊 A"));
+            assert_eq!(m["is_group"].as_bool(), Some(true));
+            assert_eq!(m["chat_type"].as_str(), Some("group"));
+            // 群消息内容不应残留会话 A 的文本。
+            assert!(!m["content"].as_str().unwrap().contains("alice"));
+        }
+
+        // ---- 群昵称 / sender_label 归属正确（按各自 real_sender 精确对应，
+        //      不能被同一个分片内批处理的另一条消息覆盖）----
+        let msg_1500 = msgs_b
+            .iter()
+            .find(|m| m["timestamp"].as_i64() == Some(1500))
+            .expect("ts=1500 的消息应该存在");
+        assert_eq!(msg_1500["sender"].as_str(), Some("群昵称2"), "ts=1500 来自 wxid_member2");
+        assert_eq!(
+            msg_1500["content"].as_str(),
+            Some("hi from member2"),
+            "群消息内容应该剥离 \"sender:\\n\" 前缀"
+        );
+
+        let msg_2500 = msgs_b
+            .iter()
+            .find(|m| m["timestamp"].as_i64() == Some(2500))
+            .expect("ts=2500 的消息应该存在");
+        assert_eq!(
+            msg_2500["sender"].as_str(),
+            Some("群昵称1"),
+            "ts=2500 来自 wxid_member1，不能被 member2 的归属覆盖"
+        );
+    }
+
+    /// 通过公开入口 [`q_new_messages`] 走完整流程（session.db 读取 →
+    /// changed 判定 → 聚合查询 → `new_state` 重建），核对 `new_state` 对
+    /// 每个会话分别正确推进：两个变化的会话分别 advance 到"本轮返回的最大
+    /// 时间戳"（不是笼统 advance 到同一个值），一个未变化的会话原样保留
+    /// `session.db` 的 `last_timestamp`，不受聚合影响。
+    #[tokio::test]
+    async fn q_new_messages_advances_new_state_independently_per_session() {
+        let root = unique_tmpdir("aggregate-new-state");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let uname_a = "wxid_alice2".to_string();
+        let uname_b = "wxid_bob2".to_string();
+        let uname_c = "wxid_carol_unchanged".to_string();
+        let table_a = format!("Msg_{:x}", md5::compute(uname_a.as_bytes()));
+        let table_b = format!("Msg_{:x}", md5::compute(uname_b.as_bytes()));
+
+        let key = key_fixture();
+        let shard_path = db_dir.join("message_0.db");
+        build_shard_with_message_tables(
+            &shard_path,
+            &key,
+            &[
+                (
+                    table_a.as_str(),
+                    &[
+                        (1, 1000, 0, "a-1"),
+                        (2, 2000, 0, "a-2"),
+                        (3, 3000, 0, "a-3"),
+                    ],
+                ),
+                (
+                    table_b.as_str(),
+                    &[(1, 400, 0, "b-1"), (2, 1500, 0, "b-2"), (3, 2500, 0, "b-3")],
+                ),
+            ],
+        );
+
+        let session_key = key_fixture();
+        let session_dir = db_dir.join("session");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        let session_path = session_dir.join("session.db");
+        build_encrypted_fixture_with(&session_path, &session_key, |conn| {
+            conn.execute_batch(
+                "CREATE TABLE SessionTable (username TEXT, last_timestamp INTEGER);",
+            )
+            .expect("建 SessionTable 失败");
+            for (uname, ts) in [
+                ("wxid_alice2", 3000i64),
+                ("wxid_bob2", 2500i64),
+                ("wxid_carol_unchanged", 900i64),
+            ] {
+                conn.execute(
+                    "INSERT INTO SessionTable (username, last_timestamp) VALUES (?1, ?2)",
+                    rusqlite::params![uname, ts],
+                )
+                .expect("插入 session 行失败");
+            }
+        });
+
+        let mut all_keys = HashMap::new();
+        all_keys.insert("message_0.db".to_string(), key_to_hex(&key));
+        all_keys.insert("session/session.db".to_string(), key_to_hex(&session_key));
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let db = DbCache::with_dirs(db_dir, cache_dir, mtime_file, all_keys)
+            .await
+            .unwrap();
+        let names = names_for(HashMap::new(), vec!["message_0.db".to_string()]);
+
+        // 三个会话各自的“上次已知 last_timestamp”：a / b 都 < session.db
+        // 里的当前值（视为变化），c 与 session.db 当前值相等（视为未变化）。
+        let mut state = HashMap::new();
+        state.insert(uname_a.clone(), 1500i64);
+        state.insert(uname_b.clone(), 800i64);
+        state.insert(uname_c.clone(), 900i64);
+
+        let result = q_new_messages(&db, &names, Some(state), 100, false, false)
+            .await
+            .expect("q_new_messages 不应失败");
+
+        assert_eq!(result["count"].as_u64(), Some(4), "a 2 条 + b 2 条，c 未变化不产出消息");
+
+        let messages = result["messages"].as_array().expect("messages 应该是数组");
+        let ts_a: Vec<i64> = messages
+            .iter()
+            .filter(|m| m["username"].as_str() == Some(uname_a.as_str()))
+            .map(|m| m["timestamp"].as_i64().unwrap())
+            .collect();
+        let ts_b: Vec<i64> = messages
+            .iter()
+            .filter(|m| m["username"].as_str() == Some(uname_b.as_str()))
+            .map(|m| m["timestamp"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ts_a, vec![2000, 3000], "a 的消息不应包含 ts=1000（<= since_ts=1500）");
+        assert_eq!(ts_b, vec![1500, 2500], "b 的消息不应包含 ts=400（<= since_ts=800）");
+        assert!(
+            messages
+                .iter()
+                .all(|m| m["username"].as_str() == Some(uname_a.as_str())
+                    || m["username"].as_str() == Some(uname_b.as_str())),
+            "不应该出现除 a/b 之外的会话（尤其是未变化的 c）"
+        );
+
+        let new_state = result["new_state"].as_object().expect("new_state 应该是对象");
+        assert_eq!(
+            new_state[&uname_a].as_i64(),
+            Some(3000),
+            "a：有消息返回，应该 advance 到本轮返回的最大时间戳"
+        );
+        assert_eq!(
+            new_state[&uname_b].as_i64(),
+            Some(2500),
+            "b：有消息返回，应该 advance 到本轮返回的最大时间戳（与 a 的推进值不同，\
+             证明不是笼统 advance 到同一个值）"
+        );
+        assert_eq!(
+            new_state[&uname_c].as_i64(),
+            Some(900),
+            "c：session.db 里未变化，应该原样保留，不受本轮聚合影响"
+        );
+    }
+
+    /// 边界：`changed` 为空时必须返回默认空聚合结果，不报错、不触碰任何
+    /// 分片（`names.msg_db_keys` 指向一个从未在 `all_keys` 里注册过密钥、
+    /// 磁盘上也不存在的分片——如果实现意外触碰它，`hot_conn_handle` 会失败,
+    /// 但函数本身必须在到达那一步之前就已经提前返回)。
+    #[tokio::test]
+    async fn empty_changed_returns_empty_aggregate_without_touching_any_shard() {
+        let root = unique_tmpdir("aggregate-empty-changed");
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+
+        let mtime_file = cache_dir.join("_mtimes.json");
+        let db = DbCache::with_dirs(db_dir, cache_dir, mtime_file, HashMap::new())
+            .await
+            .unwrap();
+        // 故意指向一个不存在的分片：密钥未注册、文件也没建过。
+        let names = names_for(HashMap::new(), vec!["message_never_created.db".to_string()]);
+        let session_ctx: HashMap<String, SessionCtx> = HashMap::new();
+
+        let agg = aggregate_new_messages_by_shard(&db, &names, &[], &session_ctx, 200)
+            .await
+            .expect("changed 为空时不应该报错");
+
+        assert!(agg.messages.is_empty());
+        assert!(agg.scanned_rel_keys.is_empty());
+        assert!(agg.hit_rel_keys.is_empty());
+        assert_eq!(agg.scanned_shards, 0, "不应该触碰任何分片（包括那个不存在的分片）");
+        assert_eq!(agg.skipped_shards, 0);
+
+        // 边界的另一面：changed 非空，但其中的 uname 都不在 session_ctx
+        // 里（防御性保护，真实调用方目前不会出现这种情况，但函数自身的
+        // 契约不应该依赖调用方保证）——同样应该在触碰分片之前就提前返回。
+        let changed = vec![("wxid_not_in_session_ctx".to_string(), 0i64)];
+        let agg2 = aggregate_new_messages_by_shard(&db, &names, &changed, &session_ctx, 200)
+            .await
+            .expect("changed 里的 uname 都不在 session_ctx 时不应该报错");
+        assert!(agg2.messages.is_empty());
+        assert_eq!(agg2.scanned_shards, 0);
+    }
+}
+
 /// 查询新消息：以 session.db 的 last_timestamp 作为 inbox 索引，
 /// 只查询 last_timestamp > state[username] 的会话，精确且高效
 pub async fn q_new_messages(
@@ -3116,35 +4472,22 @@ pub async fn q_new_messages(
         }
     }
 
-    // 4. 只查询有新消息的会话的消息表
+    // 4. 按分片聚合查询有新消息的会话的消息表（FIX 1：把"逐会话调用
+    //    find_msg_shards + 逐会话再次 hot_conn_handle 查消息"这两步分离的
+    //    执行路径，改造成"按分片聚合、每个 dirty 分片本轮只 open 一次"，
+    //    详见 aggregate_new_messages_by_shard 文档）。
     // per_table_limit 取 limit*5 防止单表截断，最终由全局 truncate 收尾
     let per_table_limit = limit.saturating_mul(5).max(200);
-    let mut all_msgs: Vec<Value> = Vec::new();
-    let mut scanned_rel_keys: HashSet<String> = HashSet::new();
-    let mut hit_rel_keys: HashSet<String> = HashSet::new();
-    let mut cache_modes: HashMap<String, String> = HashMap::new();
-    let mut shard_paths: HashMap<String, String> = HashMap::new();
 
+    // 只给本轮真正 changed 的会话预算展示名 / 会话类型 / 群昵称 / 增量
+    // 下界，供下面按分片聚合查询时直接复用。
+    let mut session_ctx: HashMap<String, SessionCtx> = HashMap::new();
     for (uname, _) in &changed {
         let since_ts = state
             .as_ref()
             .and_then(|m| m.get(uname))
             .copied()
             .unwrap_or(fallback_ts);
-        let (shards, _, _) = find_msg_shards(db, names, uname, Some(since_ts)).await?;
-        if shards.is_empty() {
-            continue;
-        }
-        for shard in &shards {
-            scanned_rel_keys.insert(shard.rel_key.clone());
-            cache_modes.insert(shard.rel_key.clone(), VFS_CACHE_MODE_LABEL.to_string());
-            shard_paths.insert(
-                shard.rel_key.clone(),
-                shard.path.to_string_lossy().into_owned(),
-            );
-        }
-
-        let display = names.display(uname);
         let chat_type = chat_type_of(uname, names);
         let is_group = chat_type == "group";
         let group_nicknames = if is_group {
@@ -3152,102 +4495,34 @@ pub async fn q_new_messages(
         } else {
             HashMap::new()
         };
-
-        for shard in &shards {
-            let hot = match db.hot_conn_handle(&shard.rel_key) {
-                Ok(h) => h,
-                Err(e) => {
-                    eprintln!("[new-messages] skip {}: {}", shard.rel_key, e);
-                    continue;
-                }
-            };
-            let tname = shard.table.clone();
-            let uname2 = uname.clone();
-            let display2 = display.clone();
-            let names_map = names.map.clone();
-            let group_nicknames2 = group_nicknames.clone();
-            let tname_for_log = tname.clone();
-            let rel_key_for_hit = shard.rel_key.clone();
-
-            let msgs: Vec<Value> = match tokio::task::spawn_blocking(move || {
-                hot.with(|conn| {
-                    let id2u = load_id2u(conn);
-
-                    let sql = format!(
-                        "SELECT local_id, local_type, create_time, real_sender_id,
-                                message_content, WCDB_CT_message_content
-                         FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT ?",
-                        tname
-                    );
-                    let rows: Vec<_> = conn
-                        .prepare(&sql)
-                        .and_then(|mut stmt| {
-                            stmt.query_map(rusqlite::params![since_ts, per_table_limit as i64], |row| {
-                                Ok((
-                                    row.get::<_, i64>(0)?,
-                                    row.get::<_, i64>(1)?,
-                                    row.get::<_, i64>(2)?,
-                                    row.get::<_, i64>(3)?,
-                                    get_content_bytes(row, 4),
-                                    row.get::<_, i64>(5).unwrap_or(0),
-                                ))
-                            })
-                            .map(|it| it.filter_map(|r| r.ok()).collect())
-                        })
-                        .unwrap_or_default();
-
-                    let mut result = Vec::new();
-                    for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
-                        let content = decompress_message(&content_bytes, ct);
-                        let sender = sender_label(
-                            real_sender_id,
-                            &content,
-                            is_group,
-                            &uname2,
-                            &id2u,
-                            &names_map,
-                            &group_nicknames2,
-                        );
-                        let text = fmt_content(local_id, local_type, &content, is_group);
-                        let url = appmsg_url_for_message(local_type, &content);
-                        let mut msg = json!({
-                            "chat": display2,
-                            "username": uname2,
-                            "is_group": is_group,
-                            "chat_type": chat_type,
-                            "timestamp": ts,
-                            "time": fmt_time(ts, "%Y-%m-%d %H:%M"),
-                            "sender": sender,
-                            "content": text,
-                            "type": fmt_type(local_type),
-                        });
-                        if let Some(u) = url {
-                            msg["url"] = serde_json::Value::String(u);
-                        }
-                        result.push(msg);
-                    }
-                    Ok::<_, anyhow::Error>(result)
-                })
-            })
-            .await
-            {
-                Ok(Ok(v)) => v,
-                Ok(Err(e)) => {
-                    eprintln!("[new-messages] skip {}: {}", tname_for_log, e);
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("[new-messages] task error: {}", e);
-                    continue;
-                }
-            };
-
-            if !msgs.is_empty() {
-                hit_rel_keys.insert(rel_key_for_hit);
-            }
-            all_msgs.extend(msgs);
-        }
+        session_ctx.insert(
+            uname.clone(),
+            SessionCtx {
+                display: names.display(uname),
+                chat_type,
+                is_group,
+                group_nicknames,
+                since_ts,
+            },
+        );
     }
+
+    let agg =
+        aggregate_new_messages_by_shard(db, names, &changed, &session_ctx, per_table_limit)
+            .await?;
+    eprintln!(
+        "[shards] q_new_messages 聚合批次: {} 个会话变化, {} 个分片 open, {} 个分片按 mtime 跳过 (共 {} 个消息分片)",
+        changed.len(),
+        agg.scanned_shards,
+        agg.skipped_shards,
+        names.msg_db_keys.len()
+    );
+
+    let mut all_msgs: Vec<Value> = agg.messages;
+    let scanned_rel_keys = agg.scanned_rel_keys;
+    let hit_rel_keys = agg.hit_rel_keys;
+    let cache_modes = agg.cache_modes;
+    let shard_paths = agg.shard_paths;
 
     all_msgs.sort_by_key(|m| m["timestamp"].as_i64().unwrap_or(0));
     all_msgs.truncate(limit);

@@ -193,6 +193,17 @@ pub struct Response {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// FIX 4：daemon 后台加载联系人期间（socket 已经可连接，但
+    /// `contact.db` 还没扫完）对依赖 names 的请求返回的区分信号——`ok`
+    /// 仍是 `false`（保证旧客户端只看 `ok`/`error` 时的行为退化成"当作
+    /// 错误处理"这个安全默认，不会被误当作成功），但新客户端（这里指
+    /// `cli/transport.rs` 的 `send_unix`/`send_windows`）应该识别这个
+    /// 字段，走"有限次数 + 有进度提示的重试"而不是立刻报错——这正是"预热
+    /// 中"与"真失败"的区分点。默认 `false` 且 `skip_serializing_if`，旧版
+    /// JSON payload 里不会出现这个字段，字段本身的增加不改变既有响应的
+    /// 序列化结果。
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub warming_up: bool,
     #[serde(flatten)]
     pub data: Value,
 }
@@ -202,6 +213,7 @@ impl Response {
         Self {
             ok: true,
             error: None,
+            warming_up: false,
             data,
         }
     }
@@ -210,6 +222,19 @@ impl Response {
         Self {
             ok: false,
             error: Some(msg.into()),
+            warming_up: false,
+            data: Value::Null,
+        }
+    }
+
+    /// FIX 4：daemon 正在后台加载联系人、尚未就绪时的响应。`ok=false` 保证
+    /// 旧客户端安全退化为"当作错误"；`warming_up=true` 供新客户端识别并
+    /// 重试，见字段文档。
+    pub fn warming_up(msg: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(msg.into()),
+            warming_up: true,
             data: Value::Null,
         }
     }

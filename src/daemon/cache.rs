@@ -3,7 +3,7 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -657,12 +657,29 @@ impl DbCache {
     ) -> Result<HotConnHandle> {
         let conn_params = self.resolve_conn_params(rel_key)?;
         let (slot, rebuild_count) = self.hot_conns.slot(rel_key);
+        let cache_size_kb = self.hot_conns.cache_size_kb();
         Ok(HotConnHandle {
             slot,
             conn_params,
             snapshot,
             rebuild_count,
+            cache_size_kb,
         })
+    }
+
+    /// FIX ②：daemon 预热阶段拿到真实分片数（`msg_db_keys.len()`）后调整
+    /// 热连接池容量——`DbCache::new()` 构造时机早于分片数确定（见
+    /// `mod.rs::async_run`：`db` 先建好，`msg_db_keys` 才从 `all_keys` 里
+    /// 过滤出来），容量没法在构造函数参数里直接给,只能构造后由调用方补
+    /// 设置一次。调用方应传入 [`hot_pool_capacity_for_shard_count`] 算出的
+    /// 值，且应该在真正开始处理任何查询之前调用（此刻池子还是空的，不会
+    /// 有"缩容时需要批量驱逐已有连接"的问题，见 [`HotConnPool::set_capacity`]
+    /// 文档）。
+    ///
+    /// 纯原子写、微秒级，可以在 async 上下文里直接同步调用，不需要
+    /// `spawn_blocking`。
+    pub fn set_hot_pool_capacity(&self, capacity: usize) {
+        self.hot_conns.set_capacity(capacity);
     }
 
     /// FIX 1：反查"路由缓存里，哪些分片当时记录的 `msg_tables` 包含这个
@@ -1172,17 +1189,72 @@ pub enum ShardRouteLookup {
 // 优化 B：mtime 门控的热连接复用
 // ---------------------------------------------------------------------------
 
-/// 同时保留的热连接分片数上限。超过时驱逐最久未用的一个——线性扫描找最小
-/// `last_used`，复杂度 O(容量)；容量设计上很小（个位数到十几），可以忽略，
-/// 但如果后续把容量调得很大（上百级别），需要换成更高效的数据结构（如
-/// `IndexMap` 或双向链表 + 索引），当前实现不适合直接调大这个常量。
+/// 同时保留的热连接分片数上限的**默认值**（daemon 启动、真正拿到分片数
+/// 之前的初始值，见 [`HotConnPool::new`]）。超过时驱逐最久未用的一个——
+/// 线性扫描找最小 `last_used`，复杂度 O(容量)。
+///
+/// FIX ②（容量随规模伸缩）之前，这是一个写死的硬上限；固定 12 在大账号
+/// （120GB+ 账号实测可能有 65~80 个消息分片）下形同虚设——热连接池天天
+/// 被塞满、LRU 反复驱逐刚建好的连接，完全吃不到"同一分片多轮复用"的
+/// 收益。FIX ② 后，`mod.rs::async_run` 在预热阶段拿到真实 `msg_db_keys`
+/// 数量后，会调用 [`DbCache::set_hot_pool_capacity`]（内部即
+/// [`hot_pool_capacity_for_shard_count`] 的换算结果）把容量调整到
+/// `[12, 64]` 区间——12 作为下限延续这个常量原来的取值（小账号没有调大的
+/// 必要），64 是"当前 O(容量) 线性驱逐扫描 + 下面 [`compute_hot_conn_cache_size_kb`]
+/// 内存预算换算仍然安全"的上界；继续往上调，线性驱逐扫描（个位数到十几
+/// 量级下可忽略）需要先换成更高效的数据结构（如 `IndexMap` 或双向链表 +
+/// 索引）。
 const MAX_HOT_SHARDS: usize = 12;
 
-/// 每条热连接的 `PRAGMA cache_size`（负数=KB）：16MB/连接，让 SQLite 自身
-/// pager 的页缓存在多次查询之间保持热（配合"同一 Connection 存活"），使
-/// 第 2..N 次轮询大概率直接内存命中，不再触发 `decrypt_page` 重新做 AES
-/// 解密。
-const HOT_CONN_CACHE_SIZE_KB: i64 = -16384;
+/// FIX ②：热连接池整体内存预算上限（KB）——`容量 × 单连接 cache_size` 必须
+/// `≲` 这个值。256MiB 是"多个热连接同时保留页缓存"这件事本身愿意付出的
+/// 内存代价上限，不是某个精确测得的数字，选一个足够宽松、又不至于在大账号
+/// 上失控增长的量级。
+const HOT_CONN_MEMORY_BUDGET_KB: i64 = 256 * 1024;
+
+/// FIX ②：单连接 `PRAGMA cache_size`（负数=KB）的封顶值——对应"容量仍是
+/// [`MAX_HOT_SHARDS`] 原值 12"时的历史行为（`262144 / 12 ≈ 21845`，被这个
+/// 封顶值夹到 16384），保证容量在小账号上维持这个常量引入前逐字节相同的
+/// 单连接缓存大小，`hot_conn_tests` 里全部既有的复用/重建断言不受影响。
+const HOT_CONN_CACHE_SIZE_KB_CEILING: i64 = 16_384;
+
+/// FIX ②：单连接 `PRAGMA cache_size`（负数=KB）的下限值——容量被调到
+/// 上限附近时，避免单连接缓存小到失去意义（1MiB 仍然能让一次典型查询的
+/// 热页留在内存里）。当前 clamp 上限 64 配合 256MiB 预算算出的每连接
+/// 4096KB 远高于这个下限，这里只是防御性兜底，不影响 `[12, 64]` 区间内的
+/// 实际取值。
+const HOT_CONN_CACHE_SIZE_KB_FLOOR: i64 = 1_024;
+
+/// FIX ②：给定热连接池容量，按"容量 × 单连接缓存 ≲ 256MiB"的预算换算每条
+/// 连接的 `PRAGMA cache_size`（负数=KB，SQLite 语义：负值单位是 KB）。
+///
+/// 公式：`per_conn_kb = clamp(HOT_CONN_MEMORY_BUDGET_KB / capacity, FLOOR, CEILING)`，
+/// 整数除法向下取整。
+///
+/// 取 `capacity = 12`（[`MAX_HOT_SHARDS`] 原值，FIX ② 前的固定容量）代入：
+/// `262144 / 12 ≈ 21845`，被 `CEILING = 16384` 封顶 → 结果仍是 `-16384`
+/// （16MiB/连接），与 FIX ② 之前的行为逐字节不变。
+///
+/// 取 `capacity = 64`（当前 clamp 上限，见 [`hot_pool_capacity_for_shard_count`]）
+/// 代入：`262144 / 64 = 4096` → `-4096`（4MiB/连接），总预算恰好打满
+/// 256MiB，与任务描述里给出的例子一致。
+fn compute_hot_conn_cache_size_kb(capacity: usize) -> i64 {
+    let capacity = capacity.max(1) as i64;
+    let per_conn = (HOT_CONN_MEMORY_BUDGET_KB / capacity)
+        .clamp(HOT_CONN_CACHE_SIZE_KB_FLOOR, HOT_CONN_CACHE_SIZE_KB_CEILING);
+    -per_conn
+}
+
+/// FIX ②：热连接池容量随消息分片数伸缩的换算规则，供 `mod.rs::async_run`
+/// 预热阶段（`msg_db_keys` 确定之后）调用一次。
+///
+/// 夹到 `[12, 64]`：下限维持 [`MAX_HOT_SHARDS`] 原值（小账号没有调大的
+/// 收益，也不产生任何坏处）；上限 64 是"当前实现仍然安全"的上界——见
+/// [`MAX_HOT_SHARDS`] 文档，`HotConnPool::slot` 的驱逐是 O(容量) 线性扫描，
+/// 64 这个量级仍然可以忽略不计，继续调大需要先换更高效的数据结构。
+pub fn hot_pool_capacity_for_shard_count(shard_count: usize) -> usize {
+    shard_count.clamp(12, 64)
+}
 
 /// LRU 时钟：只用于 [`HotShardSlot::last_used`] 的相对新旧排序，不是真实
 /// 时间，进程内单调递增即可。
@@ -1233,9 +1305,15 @@ struct HotShardSlot {
 /// 按分片保留常驻只读连接的池子。
 struct HotConnPool {
     shards: std::sync::Mutex<HashMap<String, HotShardSlot>>,
-    /// 容量上限，正常固定为 [`MAX_HOT_SHARDS`]；测试用较小值验证驱逐逻辑，
-    /// 不需要真的构造十几个物理分片。
-    capacity: usize,
+    /// FIX ②：容量上限，用 `AtomicUsize` 而不是普通 `usize`——`DbCache`
+    /// （及其内部的 `HotConnPool`）经 `Arc` 被 `server.rs` 每连接共享，
+    /// `set_capacity` 需要能在只有 `&self`（不是 `&mut self`）的情况下、
+    /// daemon 预热阶段一次性调整容量，不引入额外的锁。默认构造为
+    /// [`MAX_HOT_SHARDS`]；生产路径由 `mod.rs::async_run` 在
+    /// `msg_db_keys` 确定后调用 [`DbCache::set_hot_pool_capacity`] 一次性
+    /// 改成按分片数伸缩的值，测试路径可以继续用较小值验证驱逐逻辑，不需要
+    /// 真的构造十几个物理分片。
+    capacity: AtomicUsize,
 }
 
 impl HotConnPool {
@@ -1246,16 +1324,39 @@ impl HotConnPool {
     fn with_capacity(capacity: usize) -> Self {
         Self {
             shards: std::sync::Mutex::new(HashMap::new()),
-            capacity: capacity.max(1),
+            capacity: AtomicUsize::new(capacity.max(1)),
         }
+    }
+
+    /// FIX ②：把池子容量调整为 `new_capacity`（至少为 1）。生产只在 daemon
+    /// 预热阶段、真正开始服务查询之前调用一次（此刻池子还是空的，不存在
+    /// "缩容时需要批量驱逐已有条目"的问题）；即便调用时机晚于某些查询已经
+    /// 建立了热连接，缩容也不会立刻驱逐既有条目——下一次有新分片需要占位
+    /// 时，[`Self::slot`] 里既有的单个驱逐逻辑会按 LRU 顺序逐个补齐差额，
+    /// 不需要额外的批量驱逐代码路径。纯原子写，微秒级，可以在 async 上下文
+    /// 直接同步调用。
+    fn set_capacity(&self, new_capacity: usize) {
+        self.capacity.store(new_capacity.max(1), Ordering::Relaxed);
+    }
+
+    /// FIX ②：当前容量对应的单连接 `PRAGMA cache_size`（负数=KB），供新建
+    /// 热连接时设置——见 [`compute_hot_conn_cache_size_kb`]。
+    fn cache_size_kb(&self) -> i64 {
+        compute_hot_conn_cache_size_kb(self.capacity.load(Ordering::Relaxed))
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.capacity.load(Ordering::Relaxed)
     }
 
     /// 拿到（或创建）某个分片专属的槽位（连接互斥锁 + 重建计数器）。持锁
     /// 时间是纯内存操作（无阻塞 I/O），微秒级，可以直接在 async 上下文里
     /// 同步调用（与 `source_freshness_secs` 现有调用惯例一致）。
     fn slot(&self, rel_key: &str) -> (Arc<std::sync::Mutex<Option<HotConn>>>, Arc<AtomicU64>) {
+        let capacity = self.capacity.load(Ordering::Relaxed);
         let mut map = self.shards.lock().unwrap_or_else(|e| e.into_inner());
-        if !map.contains_key(rel_key) && map.len() >= self.capacity {
+        if !map.contains_key(rel_key) && map.len() >= capacity {
             if let Some(evict_key) = map
                 .iter()
                 .min_by_key(|(_, v)| v.last_used.load(Ordering::Relaxed))
@@ -1324,6 +1425,12 @@ pub struct HotConnHandle {
     /// 见 [`HotShardSlot::rebuild_count`] 文档：生产路径只写不读。
     #[cfg_attr(not(test), allow(dead_code))]
     rebuild_count: Arc<AtomicU64>,
+    /// FIX ②：新建连接时要设置的 `PRAGMA cache_size`（负数=KB）——取自
+    /// 《这次拿句柄那一刻》的池子容量（[`HotConnPool::cache_size_kb`]），
+    /// 不是写死的常量。同一个分片在池子扩容/缩容前后重建出的连接，缓存
+    /// 大小会随之变化；已经建立、还在被复用的连接不受影响（只有真正触发
+    /// 重建时才会用新值重设 `cache_size`）。
+    cache_size_kb: i64,
 }
 
 impl HotConnHandle {
@@ -1355,7 +1462,7 @@ impl HotConnHandle {
             // 这一刻最新的 WAL 视图，不需要任何增量维护逻辑。
             *guard = None;
             let conn = self.conn_params.open()?;
-            conn.pragma_update(None, "cache_size", HOT_CONN_CACHE_SIZE_KB)?;
+            conn.pragma_update(None, "cache_size", self.cache_size_kb)?;
             *guard = Some(HotConn {
                 conn,
                 snapshot: self.snapshot,
@@ -1872,6 +1979,61 @@ pub(crate) mod test_support {
             }
             // 默认 journal_mode=DELETE（回滚日志），连接 drop 时主库文件
             // 已是最终提交状态，不会残留 -wal / -journal。
+        }
+
+        let plain_bytes = std::fs::read(&plain_path).expect("读取明文夹具失败");
+        assert_eq!(
+            plain_bytes.len() % crate::crypto::PAGE_SZ,
+            0,
+            "测试夹具应恰好是整数个页（reserve bytes 生效的前提）"
+        );
+        let iv = [0x42u8; 16];
+        let mut enc_bytes = Vec::with_capacity(plain_bytes.len());
+        for (i, chunk) in plain_bytes.chunks(crate::crypto::PAGE_SZ).enumerate() {
+            enc_bytes.extend(crate::crypto::encrypt_page(key, chunk, &iv, (i + 1) as u32));
+        }
+        std::fs::write(enc_path, &enc_bytes).expect("写入加密夹具失败");
+        let _ = std::fs::remove_file(&plain_path);
+    }
+
+    /// [`build_encrypted_fixture`] 的通用版本：把"page_size / reserve bytes /
+    /// 逐页 `encrypt_page` 往返变换"这套通用装订工序抽出来，`populate` 回调
+    /// 拿到明文库的 `&Connection` 自己决定建几张表、每张表什么 schema、写
+    /// 什么数据——用于需要在**同一个分片文件**里塞入多张 `Msg_<md5>` 表
+    /// （模拟真实微信"一个分片承载多个会话"场景）、或者需要生产查询真正
+    /// 用到的完整列（`local_type` / `real_sender_id` / `message_content` /
+    /// `WCDB_CT_message_content`，而不只是 [`build_encrypted_fixture`] 那个
+    /// 只测 `MAX(create_time)` 用的最小 schema）的测试。
+    ///
+    /// 不改动、不复用 [`build_encrypted_fixture`] 自身的实现，避免为了这个
+    /// 新用途改动一个已经被十几个既有测试依赖的函数、引入无关回归面。
+    pub(crate) fn build_encrypted_fixture_with(
+        enc_path: &Path,
+        key: &[u8; 32],
+        populate: impl FnOnce(&Connection),
+    ) {
+        let plain_path = enc_path.with_extension("plain-fixture.db");
+        let _ = std::fs::remove_file(&plain_path);
+        {
+            let conn = Connection::open(&plain_path).expect("打开明文夹具库失败");
+            conn.execute_batch(&format!("PRAGMA page_size={};", crate::crypto::PAGE_SZ))
+                .expect("设置 page_size 失败");
+            unsafe {
+                let raw = conn.handle();
+                let mut reserve: std::os::raw::c_int =
+                    crate::crypto::RESERVE_SZ as std::os::raw::c_int;
+                let db_name = std::ffi::CString::new("main").unwrap();
+                let rc = rusqlite::ffi::sqlite3_file_control(
+                    raw,
+                    db_name.as_ptr(),
+                    rusqlite::ffi::SQLITE_FCNTL_RESERVE_BYTES,
+                    &mut reserve as *mut _ as *mut std::os::raw::c_void,
+                );
+                assert_eq!(rc, rusqlite::ffi::SQLITE_OK, "设置 reserve bytes 失败");
+            }
+            populate(&conn);
+            // 默认 journal_mode=DELETE，连接 drop 时主库文件已是最终提交
+            // 状态，不会残留 -wal / -journal（与 build_encrypted_fixture 相同）。
         }
 
         let plain_bytes = std::fs::read(&plain_path).expect("读取明文夹具失败");
@@ -2821,6 +2983,105 @@ mod hot_conn_tests {
             "WAL 从不存在变为存在必须让快照判定为不同，强制重建，不能继续复用旧连接"
         );
     }
+
+    // -------------------------------------------------------------------
+    // FIX ②：热连接池容量随分片数伸缩
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn hot_pool_capacity_for_shard_count_clamps_to_12_64_range() {
+        assert_eq!(hot_pool_capacity_for_shard_count(0), 12, "小于下限夹到 12");
+        assert_eq!(hot_pool_capacity_for_shard_count(5), 12);
+        assert_eq!(hot_pool_capacity_for_shard_count(12), 12, "边界值原样使用");
+        assert_eq!(hot_pool_capacity_for_shard_count(37), 37, "区间内原样使用");
+        assert_eq!(hot_pool_capacity_for_shard_count(64), 64, "边界值原样使用");
+        assert_eq!(
+            hot_pool_capacity_for_shard_count(80),
+            64,
+            "大于上限（120GB+ 账号实测 65~80 个分片）夹到 64"
+        );
+    }
+
+    #[test]
+    fn cache_size_kb_matches_pre_fix2_default_at_capacity_12() {
+        // 容量仍是这个常量引入前的固定值时，单连接缓存必须逐字节不变，
+        // 保证上面既有的 reuse/rebuild 系列测试（默认走 `DbCache::new()`
+        // 的容量 12）不受这次改动影响。
+        assert_eq!(
+            compute_hot_conn_cache_size_kb(MAX_HOT_SHARDS),
+            -16384,
+            "容量 12（旧固定值）时单连接缓存必须与 FIX ② 之前逐字节相同"
+        );
+    }
+
+    #[test]
+    fn cache_size_kb_at_capacity_64_matches_task_example() {
+        assert_eq!(
+            compute_hot_conn_cache_size_kb(64),
+            -4096,
+            "容量 64（clamp 上限）时单连接缓存应为 4MiB，匹配任务描述给出的例子"
+        );
+    }
+
+    #[test]
+    fn cache_size_kb_budget_never_exceeds_256mib_across_clamp_range() {
+        for capacity in 12..=64usize {
+            let per_conn_kb = compute_hot_conn_cache_size_kb(capacity).unsigned_abs();
+            let total_kb = per_conn_kb * capacity as u64;
+            assert!(
+                total_kb <= HOT_CONN_MEMORY_BUDGET_KB as u64,
+                "capacity={} per_conn_kb={} total_kb={} 超出 256MiB 预算",
+                capacity,
+                per_conn_kb,
+                total_kb
+            );
+        }
+    }
+
+    #[test]
+    fn hot_conn_pool_set_capacity_updates_eviction_threshold() {
+        let pool = HotConnPool::with_capacity(2);
+        assert_eq!(pool.capacity(), 2);
+
+        pool.set_capacity(3);
+        assert_eq!(pool.capacity(), 3, "set_capacity 应该立刻反映到 capacity()");
+
+        let _a = pool.slot("a");
+        let _b = pool.slot("b");
+        let _c = pool.slot("c");
+        assert_eq!(pool.len(), 3, "容量已调到 3，插入第 3 个分片不应触发驱逐");
+        assert!(pool.contains("a") && pool.contains("b") && pool.contains("c"));
+
+        // 刷新 a 的 last_used，再插入第 4 个应该驱逐最久未用的 b。
+        let _ = pool.slot("a");
+        let _d = pool.slot("d");
+        assert_eq!(pool.len(), 3, "容量仍是 3，插入第 4 个应该触发一次驱逐");
+        assert!(pool.contains("a"), "刚访问过的 a 不应被驱逐");
+        assert!(pool.contains("d"), "新插入的 d 应该在池中");
+        assert!(!pool.contains("b"), "最久未用的 b 应该被驱逐");
+        assert!(pool.contains("c"), "c 比 b 新，不应该被驱逐");
+    }
+
+    #[tokio::test]
+    async fn dbcache_set_hot_pool_capacity_updates_underlying_pool_and_cache_size() {
+        let (cache, _rel_key, _db_path) =
+            setup_fixture_cache("capacity-set", "Msg_test", &[(1, 1000)]).await;
+
+        assert_eq!(
+            cache.hot_conns.capacity(),
+            MAX_HOT_SHARDS,
+            "DbCache::new()/with_dirs() 默认容量应保持旧固定值"
+        );
+        assert_eq!(cache.hot_conns.cache_size_kb(), -16384);
+
+        cache.set_hot_pool_capacity(64);
+        assert_eq!(cache.hot_conns.capacity(), 64);
+        assert_eq!(
+            cache.hot_conns.cache_size_kb(),
+            -4096,
+            "容量调整后,新建连接的 cache_size 应该跟着重新换算"
+        );
+    }
 }
 
 /// FIX 1（核心·焊死"mtime 滞后漏消息"）的单元测试：`route_shard_for_table`
@@ -3064,5 +3325,173 @@ mod invalidate_tests {
         // 对一个从未出现过的 rel_key 调用 invalidate_shard：两个子缓存都
         // miss，必须是安全的空操作，不能 panic。
         cache.invalidate_shard("message_never_opened.db");
+    }
+}
+
+/// FIX ③ 并发场景专项测试：`find_msg_shards` 把分片循环从串行 await 改成
+/// `JoinSet` 并发扫描之后，多个分片任务可能真正同时（而不是像旧实现那样
+/// 严格逐个）读 [`DbCache::route_generation`]、真正 I/O、再回写
+/// [`DbCache::put_shard_schema`]。这里用真实的 `tokio::spawn` 并发（不是
+/// 手工摆顺序模拟）直接对 `shard_routes` 这把锁施压，验证
+/// FIX-MEDIUM/LOW-1 那套"世代号校验必须在 `shard_routes` 锁的临界区内部
+/// 完成"的保护，在真正并发、而不只是"手工排列调用顺序"的场景下依然成立：
+/// - 过期的 `expected_generation` 无论被多少个并发任务同时携带，一次都不
+///   允许写入成功（不能被并发放大成"总有一个漏网之鱼"）；
+/// - 互不相关的 rel_key 并发写入必须互不覆盖、无丢失更新。
+///
+/// 直接读取 `cache.shard_routes.lock()` 内部 map（而不是经
+/// `shard_route_lookup` 判断 Fresh/Stale）：后者还叠加了
+/// [`SourceSnapshot::trusted_as_of`] 的新鲜度 slack 判断，对不存在的测试
+/// 夹具文件永远是 `Stale`，无法单独证明"世代号校验本身"是否正确——直接查
+/// 内部 map 才能精确断言"到底有没有写入过"。
+#[cfg(test)]
+mod concurrency_tests {
+    use super::test_support::unique_tmpdir;
+    use super::*;
+
+    async fn empty_cache(tag: &str) -> DbCache {
+        let root = unique_tmpdir(tag);
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let mtime_file = cache_dir.join("_mtimes.json");
+        DbCache::with_dirs(db_dir, cache_dir, mtime_file, HashMap::new())
+            .await
+            .unwrap()
+    }
+
+    /// 核心场景：`find_msg_shards` 并发化后，多个分片扫描任务可能在
+    /// "决定重建"那一刻读到同一个（此刻仍然当前、但很快就会过期的）世代
+    /// 号——模拟"扫描进行期间，另一个并发请求（例如 `q_new_messages` 的
+    /// FIX 1 强制作废）推进了世代号"，随后 16 个并发任务全部携带这个已经
+    /// 过期的 `expected_generation` 试图回写。无论 Mutex 内部调度顺序如何
+    /// 交错，全部 16 次写入都必须被拒绝——一次都不能让过期数据溜进缓存。
+    #[tokio::test]
+    async fn stale_generation_write_is_rejected_even_under_real_concurrent_dispatch() {
+        let cache = Arc::new(empty_cache("concurrent-stale-gen").await);
+        let rel_key = "message_0.db";
+
+        let stale_generation = cache.route_generation();
+        let snapshot = cache.source_snapshot(rel_key);
+
+        // 世代号真正推进一次，让下面全部并发写入天然都是"过期"的。
+        cache.invalidate_shard(rel_key);
+        assert_ne!(
+            cache.route_generation(),
+            stale_generation,
+            "invalidate_shard 后世代号必须前进"
+        );
+
+        let mut handles = Vec::new();
+        for i in 0..16u32 {
+            let cache2 = Arc::clone(&cache);
+            let rel_key2 = rel_key.to_string();
+            handles.push(tokio::spawn(async move {
+                let mut tables = HashSet::new();
+                tables.insert(format!("Msg_stale_{}", i));
+                cache2.put_shard_schema(rel_key2, snapshot, tables, stale_generation);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        assert!(
+            !cache.shard_routes.lock().contains_key(rel_key),
+            "全部 16 次并发写入携带的 expected_generation 都已过期，\
+             不允许任何一次写入成功——哪怕是真实并发调度下的任意交错顺序"
+        );
+    }
+
+    /// 反向对照：互不相关的 rel_key 并发写入（各自读到的 `expected_generation`
+    /// 全程未被任何 invalidate 打断）必须全部成功、互不覆盖——证明
+    /// `shard_routes` 这把锁在真实多线程压力下不会丢更新，也不会把不同
+    /// rel_key 的条目相互污染。
+    #[tokio::test]
+    async fn concurrent_put_shard_schema_across_distinct_shards_all_persist_independently() {
+        let cache = Arc::new(empty_cache("concurrent-distinct").await);
+        let rel_keys: Vec<String> = (0..8).map(|i| format!("message_{}.db", i)).collect();
+
+        let mut handles = Vec::new();
+        for rel_key in rel_keys.clone() {
+            let cache2 = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                let snapshot = cache2.source_snapshot(&rel_key);
+                let generation = cache2.route_generation();
+                let mut tables = HashSet::new();
+                tables.insert(format!("Msg_{}", rel_key));
+                // 主动让出一次，放大真实交错窗口（不这样做的话，8 个任务
+                // 在单线程 runtime 上也可能凑巧串行跑完，测不出真正的竞争）。
+                tokio::task::yield_now().await;
+                cache2.put_shard_schema(rel_key, snapshot, tables, generation);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let map = cache.shard_routes.lock();
+        assert_eq!(
+            map.len(),
+            rel_keys.len(),
+            "8 个互不相关的并发写入应该全部持久化，互不覆盖、互不丢失"
+        );
+        for rel_key in &rel_keys {
+            assert!(
+                map.contains_key(rel_key),
+                "分片 {} 的并发写入应该成功持久化",
+                rel_key
+            );
+        }
+    }
+
+    /// 混合场景：一批 rel_key 正常并发写入的同时，另一个任务并发对其中
+    /// 一部分 rel_key 发起 `invalidate_shard`——验证两类操作真正并发交错时
+    /// 不 panic、不死锁，且"最终每个 rel_key 要么完全体现写入、要么完全
+    /// 体现作废"（不会出现半写入的中间态,例如 map 里存在一条
+    /// `ShardSchemaEntry` 但世代号已经不匹配这种不可能通过 `put_shard_schema`
+    /// 正常路径产生的状态）。这里不断言具体哪个 rel_key 最终是哪种状态
+    /// （真实调度顺序不确定），只断言"不 panic + 只可能是两种自洽结果之一"。
+    #[tokio::test]
+    async fn concurrent_writes_and_invalidates_interleave_without_panic_or_torn_state() {
+        let cache = Arc::new(empty_cache("concurrent-mixed").await);
+        let rel_keys: Vec<String> = (0..6).map(|i| format!("message_{}.db", i)).collect();
+
+        let mut handles = Vec::new();
+        for rel_key in rel_keys.clone() {
+            let cache2 = Arc::clone(&cache);
+            let rel_key_w = rel_key.clone();
+            handles.push(tokio::spawn(async move {
+                let snapshot = cache2.source_snapshot(&rel_key_w);
+                let generation = cache2.route_generation();
+                tokio::task::yield_now().await;
+                let mut tables = HashSet::new();
+                tables.insert(format!("Msg_{}", rel_key_w));
+                cache2.put_shard_schema(rel_key_w, snapshot, tables, generation);
+            }));
+
+            let cache3 = Arc::clone(&cache);
+            let rel_key_i = rel_key.clone();
+            handles.push(tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                cache3.invalidate_shard(&rel_key_i);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        // 只要求"不 panic 就能跑到这里"本身已经是主要断言；额外确认 map
+        // 内部状态自洽：每一条留存下来的 ShardSchemaEntry，其 rel_key 都在
+        // 我们预期的集合内（没有产生任何越界/幽灵条目）。
+        let map = cache.shard_routes.lock();
+        for rel_key in map.keys() {
+            assert!(
+                rel_keys.contains(rel_key),
+                "不应该出现预期之外的 rel_key 条目: {}",
+                rel_key
+            );
+        }
     }
 }

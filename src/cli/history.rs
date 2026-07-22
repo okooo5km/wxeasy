@@ -12,6 +12,22 @@ pub fn cmd_history(
     msg_type: Option<String>,
     opts: OutputOpts,
 ) -> Result<()> {
+    // FIX 3（CLI 兜底，只加提示、不改默认值）：daemon 侧 `since=None` 时
+    // `shard_skippable` 恒为 false，daemon 刚重启、路由缓存为空时会对
+    // *全部* 消息分片串行/并发扫描一遍——手滑漏传 `--since` 是这类全库扫描
+    // 最常见的触发源。这里只在 stderr 打一行提示，**不改变**不传 `--since`
+    // 时的实际查询语义（仍然是"无时间下界，返回全部历史里最新的 N 条"）：
+    // PriceKeeper（已知调用方，见 `src-tauri/src/lib.rs` 的
+    // `run_wx_history_json` / `WxReadyProbe::History`）依赖这个"不传
+    // `--since` 就拿真正意义上最新一条消息"的兜底语义做 wx-cli 就绪探测
+    // （`-n 1` 只要一条最近消息，用来判断 wx-cli 是否能正常读到聊天记录）；
+    // 如果把默认值悄悄改成"最近 30 天"，一个近 30 天没有新消息的会话会让
+    // 这个探测误判为"读不到历史记录"，从而把"wx-cli 工作正常、只是这个
+    // 会话最近没消息"误报成"wx-cli 故障"，属于典型的破坏已知调用方语义的
+    // 场景，因此这里退化为只加提示。
+    if since.is_none() {
+        eprintln!("未指定 --since，将查询全部历史（可能触发全库扫描），如需限定范围请传 --since YYYY-MM-DD");
+    }
     let since_ts = since.as_deref().map(parse_time).transpose()?;
     let until_ts = until.as_deref().map(parse_time_end).transpose()?;
     let type_val = msg_type.as_deref().and_then(parse_msg_type);
