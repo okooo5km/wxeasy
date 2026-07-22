@@ -1,6 +1,6 @@
 {
   "name": "wxeasy",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Query your local WeChat data from the command line. Designed for LLM agent tool calls.",
   "bin": {
     "wxeasy": "bin/wxeasy.js"
@@ -13,7 +13,7 @@
     "install.js"
   ],
   "optionalDependencies": {
-    "wxeasy-darwin-arm64": "0.3.0",
+    "wxeasy-darwin-arm64": "0.3.1",
     "wxeasy-darwin-x64":   "0.3.0",
     "wxeasy-linux-x64":    "0.3.0",
     "wxeasy-linux-arm64":  "0.3.0",
