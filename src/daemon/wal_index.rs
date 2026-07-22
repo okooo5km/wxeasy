@@ -52,6 +52,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::crypto::PAGE_SZ;
 
@@ -131,9 +132,14 @@ impl WalFrameIndex {
 
 /// 已打开的 -wal 文件 + 其帧索引。VFS 按需读页时通过这里保留的 `File` 句柄做
 /// 定点 `seek + read`，不会把整份 WAL 内容常驻内存。
+///
+/// `index` 是 `Arc` 共享的**不可变快照**：增量缓存（[`WalIndexCache`]）命中
+/// 且无新帧时直接复用同一份 `Arc`（零拷贝）；有新帧时深拷贝一次再扩展成新
+/// 快照——已存在连接持有的旧快照绝不会被原地修改（连接的 `immutable=1`
+/// 视图必须冻结在它建立那一刻）。
 pub struct WalSource {
     file: File,
-    pub index: WalFrameIndex,
+    pub index: Arc<WalFrameIndex>,
 }
 
 impl WalSource {
@@ -177,19 +183,26 @@ const WAL_SCAN_BUF_SZ: usize = 4 * 1024 * 1024;
 /// 尾部不足一整帧的残留字节（`file_len` 本身没对齐到帧边界）仍视为
 /// 「正在写入中的半截帧」直接忽略——那是写入协议的正常形态，与「快照内
 /// 的字节消失了」是两回事。
+/// `start_pos` 支持增量续扫（[`WalIndexCache`]）：从上次扫描终点（必然是
+/// 完整帧边界）继续解析，`seed` 是上次扫描的累计状态；全量扫描时
+/// `start_pos = WAL_HDR_SZ`、`seed` 为默认空状态。返回索引与本次扫描终点
+/// （最后一个已解析完整帧之后的字节偏移——**必须**以它作为下次续扫起点，
+/// 不能用 `file_len` 推算：`file_len` 可能落在半截尾帧中间）。
 fn scan_wal_frames<R: io::Read + io::Seek>(
     reader: &mut R,
+    start_pos: u64,
     file_len: u64,
     salt1: u32,
     salt2: u32,
-) -> io::Result<WalFrameIndex> {
+    seed: WalFrameIndex,
+) -> io::Result<(WalFrameIndex, u64)> {
     let frame_size = (WAL_FRAME_HDR + PAGE_SZ) as u64;
-    let mut frame_offsets: HashMap<u32, u64> = HashMap::new();
-    let mut last_commit_pgcnt: Option<u32> = None;
-    let mut frames_total = 0usize;
-    let mut frames_valid = 0usize;
+    let mut frame_offsets = seed.frame_offsets;
+    let mut last_commit_pgcnt = seed.last_commit_pgcnt;
+    let mut frames_total = seed.frames_total;
+    let mut frames_valid = seed.frames_valid;
 
-    let mut pos = WAL_HDR_SZ as u64;
+    let mut pos = start_pos;
     let mut fh_buf = [0u8; WAL_FRAME_HDR];
     reader.seek(SeekFrom::Start(pos))?;
 
@@ -218,14 +231,126 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
         pos += frame_size;
     }
 
-    Ok(WalFrameIndex {
-        frame_offsets,
-        last_commit_pgcnt,
-        header_salt1: salt1,
-        header_salt2: salt2,
-        frames_total,
-        frames_valid,
-    })
+    Ok((
+        WalFrameIndex {
+            frame_offsets,
+            last_commit_pgcnt,
+            header_salt1: salt1,
+            header_salt2: salt2,
+            frames_total,
+            frames_valid,
+        },
+        pos,
+    ))
+}
+
+/// WAL 帧索引的跨重建增量缓存（每个物理 `-wal` 路径一份，挂在 VFS 注册表
+/// 条目上、与 daemon 同寿命）。
+///
+/// # 为什么增量续扫是「读真字节」而不是 metadata 信任
+/// WAL 在同一 salt 世代内严格 append-only；checkpoint / reset 必然改写
+/// header 的 salt1/salt2（「核心坑 1」已依赖的 SQLite WAL 协议）。因此
+/// 「重新读 32 字节 header 比对 salt + 从上次边界续扫」得到的索引与全量
+/// 重扫**逐字节等价**——已扫过的帧在同世代内不可能变化，唯一的概率性
+/// 假设是 salt1+salt2 共 64 bit 在新旧世代间碰撞（~2⁻⁶⁴，本模块此前从未
+/// 依赖跨时刻 salt 比对，这是新增假设，特此注明）。这不触碰 §4.1 的
+/// mtime 门控——门控管的是「要不要重建连接」，这里管的是「重建时 WAL
+/// 区间要不要重读」，且判定依据是文件真实字节。
+///
+/// # 并发
+/// 多个 open 并发续扫同一分片时各自取快照、各自扫描（锁只保护取/存快照，
+/// 不覆盖 IO 段），写回互相覆盖——每次写回都是一份自洽的完整快照（索引
+/// 与终点成对），后写者赢即可，不存在「半新半旧」状态。
+///
+/// # mid-scan reset 的 TOCTOU
+/// 续扫期间微信 checkpoint/reset：新世代帧的 salt 与本次 header 快照不
+/// 匹配 ⇒ 被逐帧丢弃，与全量扫描的既有行为完全同构，不引入新竞态类别
+/// （对应单测 `incremental_scan_drops_frames_from_new_generation`）。
+#[derive(Default)]
+pub struct WalIndexCache {
+    entry: Option<CachedWalScan>,
+}
+
+struct CachedWalScan {
+    salt1: u32,
+    salt2: u32,
+    /// 上次扫描终点（完整帧边界，见 [`scan_wal_frames`] 返回值说明）。
+    scan_end: u64,
+    index: Arc<WalFrameIndex>,
+}
+
+/// 带增量缓存的 [`build_wal_index`]。
+///
+/// 复用条件（全部满足才续扫，否则全量重扫）：header salt 与缓存一致、
+/// `file_len >= 缓存终点`。无新帧（`file_len` 不足再放一个完整帧）时直接
+/// 零拷贝复用缓存的 `Arc` 快照——稳态轮询里「分片被强制作废重建、但 WAL
+/// 本身没长」的场景整段 WAL 重扫直接消失。
+pub fn build_wal_index_cached(
+    wal_path: &Path,
+    cache: &std::sync::Mutex<WalIndexCache>,
+) -> io::Result<Option<WalSource>> {
+    let mut file = match File::open(wal_path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let file_len = file.metadata()?.len();
+    if file_len <= WAL_HDR_SZ as u64 {
+        return Ok(None);
+    }
+
+    let mut header = [0u8; WAL_HDR_SZ];
+    file.read_exact(&mut header)?;
+    let salt1 = u32::from_be_bytes(header[16..20].try_into().unwrap());
+    let salt2 = u32::from_be_bytes(header[20..24].try_into().unwrap());
+
+    // 锁内只做快照取用，IO 全在锁外。
+    let cached: Option<(u64, Arc<WalFrameIndex>)> = {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.entry.as_ref().and_then(|e| {
+            (e.salt1 == salt1 && e.salt2 == salt2 && file_len >= e.scan_end)
+                .then(|| (e.scan_end, e.index.clone()))
+        })
+    };
+
+    let frame_size = (WAL_FRAME_HDR + PAGE_SZ) as u64;
+    let (index, scan_end) = match cached {
+        Some((start, snapshot)) if start + frame_size > file_len => {
+            // 无新完整帧：零拷贝复用缓存快照，整段 WAL 重扫消失。
+            (snapshot, start)
+        }
+        Some((start, snapshot)) => {
+            // 有新帧：深拷贝一次旧快照做种子、只扫增量区间。旧 Arc 不动
+            // ——已存在连接的视图保持冻结。
+            let seed = (*snapshot).clone();
+            let (merged, end) = scan_wal_frames(&mut file, start, file_len, salt1, salt2, seed)?;
+            (Arc::new(merged), end)
+        }
+        None => {
+            let (full, end) = scan_wal_frames(
+                &mut file,
+                WAL_HDR_SZ as u64,
+                file_len,
+                salt1,
+                salt2,
+                WalFrameIndex::default(),
+            )?;
+            (Arc::new(full), end)
+        }
+    };
+
+    {
+        let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        guard.entry = Some(CachedWalScan {
+            salt1,
+            salt2,
+            scan_end,
+            index: index.clone(),
+        });
+    }
+
+    Ok(Some(WalSource { file, index }))
 }
 
 /// 打开 `-wal` 文件并扫描全部帧头，建立索引。
@@ -240,6 +365,9 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
 ///   `FILE_FLAG_SEQUENTIAL_SCAN` 之类的访问模式提示：该句柄的主要用途是
 ///   `read_raw_page` 的随机 seek，SEQUENTIAL_SCAN 会让 cache manager 对它
 ///   激进 evict-behind，反伤后续随机读。
+/// 生产路径已改走 [`build_wal_index_cached`]；这个无缓存版本保留给单测与
+/// oracle 对拍（每次全量扫描、无跨调用状态，是增量版的对拍基准）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn build_wal_index(wal_path: &Path) -> io::Result<Option<WalSource>> {
     let mut file = match File::open(wal_path) {
         Ok(f) => f,
@@ -258,9 +386,19 @@ pub fn build_wal_index(wal_path: &Path) -> io::Result<Option<WalSource>> {
     let salt1 = u32::from_be_bytes(header[16..20].try_into().unwrap());
     let salt2 = u32::from_be_bytes(header[20..24].try_into().unwrap());
 
-    let index = scan_wal_frames(&mut file, file_len, salt1, salt2)?;
+    let (index, _scan_end) = scan_wal_frames(
+        &mut file,
+        WAL_HDR_SZ as u64,
+        file_len,
+        salt1,
+        salt2,
+        WalFrameIndex::default(),
+    )?;
 
-    Ok(Some(WalSource { file, index }))
+    Ok(Some(WalSource {
+        file,
+        index: Arc::new(index),
+    }))
 }
 
 #[cfg(test)]
@@ -418,11 +556,23 @@ mod tests {
         buf.extend(write_frame(2, 2, s1, s2, 0x2));
 
         let mut cursor = std::io::Cursor::new(buf);
-        let index = scan_wal_frames(&mut cursor, snapshot_len, s1, s2).unwrap();
+        let (index, scan_end) = scan_wal_frames(
+            &mut cursor,
+            WAL_HDR_SZ as u64,
+            snapshot_len,
+            s1,
+            s2,
+            WalFrameIndex::default(),
+        )
+        .unwrap();
         assert_eq!(index.frames_total, 1, "快照之外的帧不得被解析");
         assert!(index.offset_for(1).is_some());
         assert!(index.offset_for(2).is_none(), "快照后追加的 pgno=2 不得进索引");
         assert_eq!(index.last_commit_pgcnt(), Some(1));
+        assert_eq!(
+            scan_end, snapshot_len,
+            "扫描终点应停在快照边界（此处快照恰好是完整帧边界）"
+        );
     }
 
     /// 守护语义 2（中途截断 fail-loud）：`file_len` 快照以内的字节读不满
@@ -442,9 +592,131 @@ mod tests {
         buf.truncate(WAL_HDR_SZ + (WAL_FRAME_HDR + PAGE_SZ) + 10);
 
         let mut cursor = std::io::Cursor::new(buf);
-        let err = scan_wal_frames(&mut cursor, claimed_len, s1, s2)
-            .expect_err("快照内字节缺失必须报错，不能静默成功");
+        let err = scan_wal_frames(
+            &mut cursor,
+            WAL_HDR_SZ as u64,
+            claimed_len,
+            s1,
+            s2,
+            WalFrameIndex::default(),
+        )
+        .expect_err("快照内字节缺失必须报错，不能静默成功");
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    /// 增量缓存核心场景：同 salt 追加帧跨两次 open 累积；无新帧时零拷贝
+    /// 复用同一份 Arc 快照；同 pgno 的新帧跨增量边界覆盖旧帧。
+    #[test]
+    fn incremental_cache_extends_and_reuses_across_rebuilds() {
+        let path = tmp_path("incremental-extend");
+        let s1 = 0xAA11_u32;
+        let s2 = 0xBB22_u32;
+        let cache = std::sync::Mutex::new(WalIndexCache::default());
+
+        let mut buf = write_wal_header(s1, s2);
+        buf.extend(write_frame(7, 2, s1, s2, 0x01));
+        buf.extend(write_frame(8, 2, s1, s2, 0x02));
+        std::fs::write(&path, &buf).unwrap();
+
+        let first = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        assert_eq!(first.index.frames_total, 2);
+        assert_eq!(first.index.covered_page_count(), 2);
+        let first_arc = first.index.clone();
+
+        // 无变化的重建：必须零拷贝复用同一份快照。
+        let reused = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        assert!(
+            Arc::ptr_eq(&first_arc, &reused.index),
+            "无新帧时必须复用缓存的同一份 Arc 快照"
+        );
+
+        // 同 salt 追加两帧：pgno=7 被新帧覆盖，pgno=9 新增。
+        let mut appended = buf.clone();
+        appended.extend(write_frame(7, 3, s1, s2, 0x03));
+        appended.extend(write_frame(9, 3, s1, s2, 0x04));
+        std::fs::write(&path, &appended).unwrap();
+
+        let mut second = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        assert_eq!(second.index.frames_total, 4, "增量帧数应累积到旧快照之上");
+        assert_eq!(second.index.covered_page_count(), 3);
+        assert_eq!(second.index.last_commit_pgcnt(), Some(3));
+        let off7 = second.index.offset_for(7).unwrap();
+        let raw7 = second.read_raw_page(off7).unwrap();
+        assert!(
+            raw7.iter().all(|&b| b == 0x03),
+            "pgno=7 必须指向增量边界之后的新帧"
+        );
+        // 旧连接持有的快照必须保持冻结，不受后续扩展影响。
+        assert_eq!(first_arc.covered_page_count(), 2);
+        assert!(first_arc.offset_for(9).is_none());
+
+        // 与无缓存全量扫描对拍：内容级一致。
+        let oracle = build_wal_index(&path).unwrap().unwrap();
+        assert_eq!(oracle.index.covered_page_count(), 3);
+        assert_eq!(oracle.index.offset_for(7), second.index.offset_for(7));
+        assert_eq!(oracle.index.offset_for(8), second.index.offset_for(8));
+        assert_eq!(oracle.index.offset_for(9), second.index.offset_for(9));
+        assert_eq!(
+            oracle.index.last_commit_pgcnt(),
+            second.index.last_commit_pgcnt()
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// checkpoint/reset 换 salt 后：header 不匹配 ⇒ 缓存失效、全量重扫，
+    /// 新索引只含新世代帧；增量续扫期间混进的新世代帧也会被 salt 过滤掉
+    /// （与全量扫描的既有行为同构）。
+    #[test]
+    fn incremental_cache_invalidated_by_salt_change() {
+        let path = tmp_path("incremental-salt-change");
+        let cache = std::sync::Mutex::new(WalIndexCache::default());
+        let (old_s1, old_s2) = (0x1111_u32, 0x2222_u32);
+        let (new_s1, new_s2) = (0x3333_u32, 0x4444_u32);
+
+        let mut buf = write_wal_header(old_s1, old_s2);
+        buf.extend(write_frame(5, 1, old_s1, old_s2, 0x01));
+        std::fs::write(&path, &buf).unwrap();
+        let first = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        assert_eq!(first.index.frames_valid, 1);
+
+        // reset：新 header + 旧世代残留帧 + 新世代帧（restart 的典型形态）。
+        let mut reset = write_wal_header(new_s1, new_s2);
+        reset.extend(write_frame(5, 0, old_s1, old_s2, 0x0A)); // 旧世代残留
+        reset.extend(write_frame(6, 2, new_s1, new_s2, 0x0B));
+        std::fs::write(&path, &reset).unwrap();
+
+        let second = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        assert_eq!(second.index.frames_total, 2, "salt 变化必须触发全量重扫");
+        assert_eq!(second.index.frames_valid, 1, "旧世代残留帧必须被过滤");
+        assert!(second.index.offset_for(5).is_none());
+        assert!(second.index.offset_for(6).is_some());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 同 salt 但文件比缓存终点还短（理论上只可能是 salt 碰撞或文件被外部
+    /// 篡改）：不许增量、必须全量重扫，且不得报错。
+    #[test]
+    fn incremental_cache_rejects_shrunk_file() {
+        let path = tmp_path("incremental-shrunk");
+        let cache = std::sync::Mutex::new(WalIndexCache::default());
+        let (s1, s2) = (0x5A5A_u32, 0x6B6B_u32);
+
+        let mut buf = write_wal_header(s1, s2);
+        buf.extend(write_frame(1, 1, s1, s2, 0x01));
+        buf.extend(write_frame(2, 2, s1, s2, 0x02));
+        std::fs::write(&path, &buf).unwrap();
+        build_wal_index_cached(&path, &cache).unwrap().unwrap();
+
+        // 同 salt、但只剩一帧。
+        buf.truncate(WAL_HDR_SZ + (WAL_FRAME_HDR + PAGE_SZ));
+        std::fs::write(&path, &buf).unwrap();
+        let after = build_wal_index_cached(&path, &cache).unwrap().unwrap();
+        assert_eq!(after.index.frames_total, 1, "缩短的文件必须全量重扫");
+        assert!(after.index.offset_for(2).is_none());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// 尾部残留半截帧（写入过程中被截断的典型形态）必须被忽略，不能 panic

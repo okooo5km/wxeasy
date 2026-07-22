@@ -50,7 +50,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use super::wal_index::{build_wal_index, wal_path_for, WalSource};
+use super::wal_index::{build_wal_index_cached, wal_path_for, WalIndexCache, WalSource};
+#[cfg(test)]
+use super::wal_index::build_wal_index;
 
 /// 主库在 `sqlite3_open` 时使用的固定 "路径" 标签。我们的 VFS 完全不理会这个
 /// 字符串对应的真实文件系统路径——加密文件路径、密钥、WAL 索引都直接烘焙进
@@ -103,6 +105,10 @@ pub struct WxVfs {
     key: [u8; 32],
     tmp_dir: PathBuf,
     stats: Arc<Mutex<ReadStats>>,
+    /// WAL 帧索引的增量缓存（与 stats 同构：VFS 按物理路径单例注册，缓存
+    /// 因此天然按物理路径分域、与 daemon 同寿命）。见 [`WalIndexCache`] 的
+    /// 正确性论证。
+    wal_cache: Arc<Mutex<WalIndexCache>>,
     tmp_counter: AtomicU64,
 }
 
@@ -114,6 +120,7 @@ impl WxVfs {
             key,
             tmp_dir,
             stats: stats.clone(),
+            wal_cache: Arc::new(Mutex::new(WalIndexCache::default())),
             tmp_counter: AtomicU64::new(0),
         };
         (vfs, stats)
@@ -137,11 +144,13 @@ impl Vfs for WxVfs {
             let file_len = file.seek(SeekFrom::End(0))?;
 
             // 扫 -wal 帧头建索引（若 -wal 不存在或没有有效帧，wal 为 None，
-            // 行为完全退化为"只读主库"）。每次 open() 都重新扫描，保证复用
-            // 同一个已注册 VFS 时，不同时间点打开的连接看到的是各自那一刻
-            // 最新的 WAL 视图，而不是注册时刻的陈旧快照。
+            // 行为完全退化为"只读主库"）。每次 open() 都重新读 header 真
+            // 字节做判定，保证复用同一个已注册 VFS 时，不同时间点打开的
+            // 连接看到的是各自那一刻最新的 WAL 视图；增量缓存只在「salt
+            // 未变 + 文件未缩」时把已扫过的同世代帧免于重扫（append-only
+            // 协议保证等价，见 WalIndexCache 文档），新帧照常现场解析。
             let wal_path = wal_path_for(&self.enc_path);
-            let wal = build_wal_index(&wal_path)?;
+            let wal = build_wal_index_cached(&wal_path, &self.wal_cache)?;
 
             return Ok(WxFile::Merged(MergedFile {
                 main: file,
