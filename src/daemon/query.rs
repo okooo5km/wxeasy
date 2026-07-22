@@ -232,6 +232,41 @@ async fn session_last_timestamp(db: &DbCache, username: &str) -> Option<i64> {
 
 /// 加载联系人缓存（从 contact/contact.db）
 pub async fn load_names(db: &DbCache) -> Result<Names> {
+    const CONTACT_REL_KEY: &str = "contact/contact.db";
+
+    // 快路径：加密持久化缓存命中（contact.db 快照未变 + 已安静满 slack）
+    // ⇒ 跳过几十万行全表扫描 + 逐页解密，亚秒完成。miss 一律走下面的冷
+    // 扫描（典型 miss 场景：开机后微信正在同步联系人、安静期过不去）。
+    // 见 `daemon::names_cache` 模块文档（含加密与失效判定的完整论证）。
+    if let Some(enc_key) = db.enc_key(CONTACT_REL_KEY) {
+        let snapshot = db.source_snapshot(CONTACT_REL_KEY);
+        if let Some((map, verify_flags)) = super::names_cache::load_names_cache(
+            db.cache_dir(),
+            db.db_dir(),
+            &enc_key,
+            snapshot,
+        ) {
+            eprintln!("[names] 联系人加密缓存命中: {} 条（跳过 contact.db 全表扫描）", map.len());
+            let md5_to_uname: HashMap<String, String> = map
+                .keys()
+                .map(|u| (format!("{:x}", md5::compute(u.as_bytes())), u.clone()))
+                .collect();
+            return Ok(Names {
+                map,
+                md5_to_uname,
+                msg_db_keys: Vec::new(),
+                verify_flags,
+            });
+        }
+    }
+
+    // 判定时刻快照：必须在扫描**开始前**采集（与 put_shard_schema 的
+    // TOCTOU 纪律同向——扫描期间 contact.db 被写只会让写回的缓存显得
+    // 更旧、下次启动判不相等重扫，绝不会反过来）。
+    let snapshot_before = db
+        .enc_key(CONTACT_REL_KEY)
+        .map(|_| db.source_snapshot(CONTACT_REL_KEY));
+
     let mut map = HashMap::new();
     let mut verify_flags: HashMap<String, i64> = HashMap::new();
     // 密钥缺失 / contact.db 不存在时，与旧版 `db.get(..)` 返回 `None` 语义一致：
@@ -277,6 +312,22 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
             };
             verify_flags.insert(uname.clone(), vf);
             map.insert(uname, display);
+        }
+    }
+
+    // 冷扫描完成：加密写回（分离线程，几十万条目的序列化 + 压缩 + 加密
+    // 不阻塞启动路径；失败静默——影子文件而已）。
+    if let (Some(enc_key), Some(snapshot)) = (db.enc_key(CONTACT_REL_KEY), snapshot_before) {
+        if !map.is_empty() {
+            let cache_dir = db.cache_dir().to_path_buf();
+            let db_dir = db.db_dir().to_path_buf();
+            let map2 = map.clone();
+            let vf2 = verify_flags.clone();
+            std::thread::spawn(move || {
+                super::names_cache::store_names_cache(
+                    &cache_dir, &db_dir, &enc_key, snapshot, &map2, &vf2,
+                );
+            });
         }
     }
 

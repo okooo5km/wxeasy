@@ -1,5 +1,6 @@
 pub mod cache;
 pub mod meta;
+mod names_cache;
 pub mod query;
 pub mod server;
 pub mod vfs;

@@ -149,6 +149,18 @@ impl DbCache {
         &self.db_dir
     }
 
+    /// 缓存目录（`names_cache` 等持久化影子文件的落盘位置）。
+    pub(crate) fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    /// 某个 rel_key 的 32 字节解密密钥（缺失 / 格式错误返回 `None`）。
+    pub(crate) fn enc_key(&self, rel_key: &str) -> Option<[u8; 32]> {
+        self.all_keys
+            .get(rel_key)
+            .and_then(|hex| hex_to_32bytes(hex).ok())
+    }
+
     fn cache_file_path(&self, rel_key: &str) -> PathBuf {
         let hash = format!("{:x}", md5::compute(rel_key.as_bytes()));
         self.cache_dir.join(format!("{}.db", hash))
@@ -957,7 +969,7 @@ impl SourceSnapshot {
     /// - WAL 存在但 metadata 读取失败 → `wal_present=true`、mtime/len 回退
     ///   为 0（`metadata_mtime_len` 的既有失败语义）——这才是真正的"未知"，
     ///   由 [`Self::has_unknown_component`] 识别并拒绝信任。
-    fn capture(db_path: &Path, wal_path: &Path) -> Self {
+    pub(crate) fn capture(db_path: &Path, wal_path: &Path) -> Self {
         let (db_mtime, db_len) = metadata_mtime_len(db_path);
         let wal_present = wal_path.exists();
         let (wal_mtime, wal_len) = if wal_present {
@@ -1013,7 +1025,7 @@ impl SourceSnapshot {
     /// Stale、重新读一遍——这正是用来兜住"内容已变、但 mtime 因跨进程可见性
     /// 滞后还没来得及体现出差异"这个窗口的手段：只信任已经安静了一整个
     /// slack 周期的分片，最近活跃的分片永远不走"精确相等就直接信任"这条捷径。
-    fn trusted_as_of(&self, now_nanos: u64) -> bool {
+    pub(crate) fn trusted_as_of(&self, now_nanos: u64) -> bool {
         if self.has_unknown_component() {
             return false;
         }
@@ -1068,7 +1080,7 @@ const HOT_CACHE_FRESHNESS_SLACK_NANOS: u64 = HOT_CACHE_FRESHNESS_SLACK_SECS * 1_
 /// 当前墙钟时间，纳秒精度，unix epoch 起算。与 [`mtime_nanos`] 用同一套
 /// 精度与回退语义（系统时钟早于 `UNIX_EPOCH` 这种不可能但理论上存在的
 /// 场景下 `unwrap_or_default()` 回退到 0，不 panic）。
-fn now_nanos() -> u64 {
+pub(crate) fn now_nanos() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
