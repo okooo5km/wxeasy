@@ -8,7 +8,6 @@ use crate::config;
 use crate::ipc::{Request, Response};
 
 const STARTUP_TIMEOUT_SECS: u64 = 15;
-#[cfg(unix)]
 const STOP_TIMEOUT_MS: u64 = 2_000;
 
 /// FIX 4：daemon 后台加载联系人期间（socket 已经可连接，`Request::Ping`
@@ -75,6 +74,16 @@ pub fn stop_daemon() -> Result<()> {
             }
             if belongs {
                 terminate_pid(pid_file.pid)?;
+                // 竞态修复（第二道保险）：进程退出后 IPC 端点（socket/命名
+                // 管道）随之消失，但这里仍显式确认「ping 不通」才返回——
+                // 保证 `daemon stop` 一旦返回，紧接着的任何命令看到的都是
+                // 干净状态（要么连不上 ⇒ 正常拉起新 daemon，绝不会 ping 到
+                // 半死的旧实例）。
+                let deadline =
+                    std::time::Instant::now() + Duration::from_millis(STOP_TIMEOUT_MS);
+                while std::time::Instant::now() < deadline && is_alive() {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
             }
         }
         None if daemon_alive => {
@@ -430,13 +439,70 @@ fn terminate_pid_windows(pid: u32) -> Result<()> {
     if !status.success() {
         bail!("停止 PID {} 失败: taskkill exit {:?}", pid, status.code());
     }
-    Ok(())
+
+    // 竞态修复（与 unix 路径对齐）：taskkill /F 只是「发出」终止，进程真正
+    // 退出、释放命名管道还要一小段时间。不等它死透就返回，调用方紧接着的
+    // 下一条命令会撞上「旧管道还在 → ping 到僵尸 daemon / 新 daemon 绑定
+    // 失败」的窗口——真实用户机器上表现为 stop 后立刻查询就挂住。
+    let deadline = std::time::Instant::now() + Duration::from_millis(STOP_TIMEOUT_MS);
+    while std::time::Instant::now() < deadline {
+        if !windows_process_exists(pid) {
+            return Ok(());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    bail!("等待 PID {} 退出超时", pid)
+}
+
+/// Windows 下探测进程是否仍然存活（已退出但句柄未回收的僵尸也算已退出）。
+#[cfg(windows)]
+fn windows_process_exists(pid: u32) -> bool {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+
+    let handle = match unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) } {
+        Ok(h) => h,
+        // 打不开（无效 PID / 已回收）⇒ 已退出。
+        Err(_) => return false,
+    };
+    let mut code: u32 = 0;
+    let alive = unsafe {
+        let ok = GetExitCodeProcess(handle, &mut code).is_ok();
+        let _ = CloseHandle(handle);
+        ok && code == STILL_ACTIVE
+    };
+    alive
 }
 
 /// 向 daemon 发送请求并返回响应
+///
+/// 竞态修复：`ensure_daemon` 的 ping 与真正发请求之间是两条独立连接，
+/// daemon 恰好在这个窗口退出（典型：另一个终端刚跑了 `daemon stop`，或
+/// 重启竞态里 ping 到了正在退出的旧实例）时，请求连接会失败。这里识别
+/// 「连接建立失败」这一类错误，重新拉起 daemon 后重试一次——只重试连接
+/// 失败，不重试业务错误，也只重试一轮，不会循环。
 pub fn send(req: Request) -> Result<Response> {
     ensure_daemon()?;
+    match send_platform(&req) {
+        Err(e) if is_connect_failure(&e) => {
+            eprintln!("daemon 连接中断（可能刚被停止/重启），重新拉起后重试...");
+            ensure_daemon()?;
+            send_platform(&req)
+        }
+        other => other,
+    }
+}
 
+/// 是否属于「连接建立失败」（而非业务错误 / 协议错误）。
+fn is_connect_failure(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.to_string().contains("连接 daemon"))
+}
+
+fn send_platform(req: &Request) -> Result<Response> {
     #[cfg(unix)]
     {
         send_unix(req)
@@ -447,12 +513,13 @@ pub fn send(req: Request) -> Result<Response> {
     }
     #[cfg(not(any(unix, windows)))]
     {
+        let _ = req;
         bail!("不支持当前平台")
     }
 }
 
 #[cfg(unix)]
-fn send_unix(req: Request) -> Result<Response> {
+fn send_unix(req: &Request) -> Result<Response> {
     use std::os::unix::net::UnixStream;
     let sock_path = config::sock_path();
 
@@ -502,7 +569,7 @@ fn send_unix(req: Request) -> Result<Response> {
 }
 
 #[cfg(windows)]
-fn send_windows(req: Request) -> Result<Response> {
+fn send_windows(req: &Request) -> Result<Response> {
     use interprocess::local_socket::{prelude::*, GenericNamespaced, Stream};
 
     let name = "wxeasy-daemon"

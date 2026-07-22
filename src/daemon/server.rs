@@ -95,9 +95,28 @@ async fn serve_windows(
 
     // interprocess 的 GenericNamespaced 在 Windows 上会自动拼接 `\\.\pipe\` 前缀，
     // 这里必须传相对名；client 端用 `\\.\pipe\wxeasy-daemon` 直接打开可以对上
-    let name = "wxeasy-daemon".to_ns_name::<GenericNamespaced>()?;
-    let opts = ListenerOptions::new().name(name);
-    let listener = opts.create_tokio()?;
+    //
+    // 竞态修复：daemon 重启（stop 后立即被新命令拉起）时，旧进程可能还差
+    // 几百毫秒才死透、管道名尚未释放，首次 create 会失败。这里带退避重试
+    // 最多 5 秒，而不是直接放弃退出（否则 CLI 侧只能等满 15s 启动超时）。
+    let listener = {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut warned = false;
+        loop {
+            let name = "wxeasy-daemon".to_ns_name::<GenericNamespaced>()?;
+            match ListenerOptions::new().name(name).create_tokio() {
+                Ok(l) => break l,
+                Err(e) if std::time::Instant::now() < deadline => {
+                    if !warned {
+                        eprintln!("[server] 管道暂不可用（旧实例退出中？），重试: {}", e);
+                        warned = true;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    };
 
     eprintln!("[server] 监听 \\\\.\\pipe\\wxeasy-daemon");
 
