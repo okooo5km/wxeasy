@@ -1,0 +1,19 @@
+# 静态链接 CRT：让 Windows 产物完全自包含，不依赖 VC++ 运行库
+# （VCRUNTIME140.dll / api-ms-win-crt-*.dll）。
+#
+# 背景（2026-07-22 真实用户事故）：默认 MSVC target 动态链接这些 DLL，
+# 开发机装了 VS 所以正常，但用户干净机器上没装 VC++ 2015-2022 Redistributable
+# 时，加载器在 main() 之前就以 0xC0000135(STATUS_DLL_NOT_FOUND) 静默退出——
+# 零 stdout、零 stderr、瞬间返回，极难排查。静态 CRT 后 exe 只依赖每台
+# Windows 都自带的核心系统 DLL，随处可跑。
+#
+# 代价：exe 体积 +0.2MB 左右，可忽略。GNU target 不受影响（本就静态）。
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.i686-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
