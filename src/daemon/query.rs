@@ -1809,6 +1809,42 @@ fn sortseq_floor_gt(since: i64) -> i64 {
     since.saturating_add(1).saturating_mul(1000)
 }
 
+/// 索引范围选择性门控。
+///
+/// 实测教训（2026-07-22 基准）：调用方 state 陈旧时 `since` 会覆盖几乎
+/// 整张表，「索引范围扫 + 逐行回表」的散乱页访问反而**慢于**顺序全表扫
+/// （开发机暖缓存下 ~90 会话/轮的 new-messages 从 ~400ms 恶化到 ~1150ms）。
+/// 索引下推只在匹配集小（真正的增量轮询）时才是赢的，因此先用 covering
+/// index 探针问一句「第 threshold+1 行存在吗」——`SELECT 1 … LIMIT 1
+/// OFFSET T` 只走索引 B-tree（`local_id` 即 rowid、天然在索引条目里），
+/// 至多触碰 ~T/200 个索引页，不回表。存在 ⇒ 匹配集大，回退全表扫
+/// （= baseline 行为，无回归）；不存在 ⇒ 匹配集有界，索引路径必赢。
+///
+/// 阈值以内「索引必赢」的论证：匹配 ≤ T 行 ⇒ 回表至多 T 次页访问，且
+/// 全部落在目标表 B-tree 内（重复页命中 pager 缓存）；小表回表页数被表
+/// 本身页数封顶，大表 T 次散读远小于全表顺序扫的页数。
+fn sortseq_range_is_selective(
+    conn: &Connection,
+    table: &str,
+    floor: i64,
+    threshold: usize,
+) -> bool {
+    match conn.query_row(
+        &format!(
+            "SELECT 1 FROM [{}] WHERE sort_seq >= ? LIMIT 1 OFFSET ?",
+            table
+        ),
+        rusqlite::params![floor, threshold as i64],
+        |row| row.get::<_, i64>(0),
+    ) {
+        // 第 threshold+1 个匹配存在 ⇒ 范围不选择性
+        Ok(_) => false,
+        Err(rusqlite::Error::QueryReturnedNoRows) => true,
+        // 未知错误：保守走旧路径
+        Err(_) => false,
+    }
+}
+
 /// `create_time >= since` 的 `_SORTSEQ` 范围下界：`create_time ≥ s` ⟹
 /// `sort_seq ≥ s×1000`。
 fn sortseq_floor_ge(since: i64) -> i64 {
@@ -1886,8 +1922,19 @@ fn fetch_message_rows(
 ) -> Result<Vec<MsgRow>> {
     match since {
         // s = 0 等价于无下界；s < 0 会让范围下界 (s+1)*1000 ≤ 0 与「sort_seq
-        // <= 0 兜底分支」重叠产生重复行——两者都直接走旧路径。
-        Some(s) if s > 0 && table_has_sortseq_index(conn, table) => {
+        // <= 0 兜底分支」重叠产生重复行——两者都直接走旧路径。范围不
+        // 选择性（since 陈旧、覆盖大半张表）时同样回退全表扫，见
+        // `sortseq_range_is_selective` 的实测教训。
+        Some(s)
+            if s > 0
+                && table_has_sortseq_index(conn, table)
+                && sortseq_range_is_selective(
+                    conn,
+                    table,
+                    sortseq_floor_ge(s),
+                    1024.max(limit.saturating_add(offset).saturating_mul(4)),
+                ) =>
+        {
             fetch_rows_sortseq_since(conn, table, s, until, msg_type, limit, offset)
         }
         None if until.is_none() && table_has_sortseq_index(conn, table) => {
@@ -2183,7 +2230,15 @@ fn fetch_new_rows_since(
     since: i64,
     per_table_limit: usize,
 ) -> Vec<MsgRow> {
-    if since >= 0 && table_has_sortseq_index(conn, table) {
+    if since >= 0
+        && table_has_sortseq_index(conn, table)
+        && sortseq_range_is_selective(
+            conn,
+            table,
+            sortseq_floor_gt(since),
+            1024.max(per_table_limit.saturating_mul(4)),
+        )
+    {
         let sql = format!(
             "SELECT {cols}, 0 AS fb FROM [{t}] WHERE sort_seq >= ? AND create_time > ? \
              UNION ALL SELECT {cols}, 1 AS fb FROM [{t}] WHERE sort_seq IS NULL AND create_time > ? \
@@ -2454,6 +2509,51 @@ mod sortseq_tests {
         assert_eq!(fast2[0].2, 169);
     }
 
+    /// 选择性门控：匹配集小 ⇒ 走索引；超过阈值 ⇒ 回退全表扫（baseline
+    /// 行为）。这是 2026-07-22 基准抓到的真实回归（state 陈旧使 since
+    /// 覆盖整表，索引 + 回表反而比顺序全表扫慢 3 倍）的防回归测试。
+    #[test]
+    fn selectivity_gate_falls_back_on_wide_ranges() {
+        let conn = conn_with_index();
+        let rows: Vec<(i64, Option<i64>, i64)> = (0..1500)
+            .map(|i| {
+                let ct = 2000 + i as i64;
+                (ct, Some(ct * 1000), 1i64)
+            })
+            .collect();
+        insert_rows(&conn, &rows);
+
+        // since=1 覆盖全部 1500 行 > 阈值 1024 ⇒ 不选择性
+        assert!(!sortseq_range_is_selective(
+            &conn,
+            T,
+            sortseq_floor_gt(1),
+            1024
+        ));
+        // 只覆盖尾部 100 行 ⇒ 选择性
+        assert!(sortseq_range_is_selective(
+            &conn,
+            T,
+            sortseq_floor_gt(2000 + 1400),
+            1024
+        ));
+        // 两条路径输出仍逐行一致（门控只是选路，不改语义）
+        for since in [1i64, 3400] {
+            let fast = fetch_new_rows_since(&conn, T, since, 200);
+            let expected: Vec<i64> = conn
+                .prepare(&format!(
+                    "SELECT local_id FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT 200",
+                    T
+                ))
+                .unwrap()
+                .query_map([since], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert_eq!(ids(&fast), expected, "since={}", since);
+        }
+    }
+
     /// EQP 锁定：三条快路径 SQL 在 rusqlite 捆绑的 SQLite 上，凡是触碰
     /// 目标表的执行节点都必须经 `_SORTSEQ` 索引，任何一个分支静默退化成
     /// 全表 SCAN 都是本测试要抓的回归。
@@ -2477,6 +2577,31 @@ mod sortseq_tests {
             "SELECT create_time FROM [{}] WHERE sort_seq IS NOT NULL ORDER BY sort_seq DESC LIMIT 1",
             T
         );
+        // 选择性探针必须是 covering index（只走索引 B-tree、不回表）
+        let probe = format!(
+            "SELECT 1 FROM [{}] WHERE sort_seq >= ? LIMIT 1 OFFSET ?",
+            T
+        );
+        {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", probe))
+                .unwrap();
+            let nulls = rusqlite::params_from_iter(
+                std::iter::repeat(rusqlite::types::Value::Null).take(stmt.parameter_count()),
+            );
+            let details: Vec<String> = stmt
+                .query_map(nulls, |row| row.get::<_, String>(3))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|d| d.contains("COVERING INDEX") && d.contains("_SORTSEQ")),
+                "选择性探针必须走 covering index: {:?}",
+                details
+            );
+        }
         for sql in [polling.as_str(), topn.as_str(), rightmost.as_str()] {
             let mut stmt = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {}", sql))
