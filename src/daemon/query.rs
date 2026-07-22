@@ -1096,13 +1096,7 @@ async fn find_msg_shards(
                         .filter_map(|r| r.ok())
                         .collect();
                     let ts = if tables.contains(&tname) {
-                        conn.query_row(
-                            &format!("SELECT MAX(create_time) FROM [{}]", tname),
-                            [],
-                            |row| row.get(0),
-                        )
-                        .ok()
-                        .flatten()
+                        max_create_time(conn, &tname)
                     } else {
                         None
                     };
@@ -1110,16 +1104,9 @@ async fn find_msg_shards(
                 } else {
                     // 缓存已确认该分片含目标表（否则上面已经 continue）；
                     // 万一实际不一致（理论上不该发生——任何写入都会 bump
-                    // mtime 使缓存失效），查询失败时 `.ok()` 安全退化为
-                    // None，不 panic、不误报数据。
-                    let ts = conn
-                        .query_row(
-                            &format!("SELECT MAX(create_time) FROM [{}]", tname),
-                            [],
-                            |row| row.get(0),
-                        )
-                        .ok()
-                        .flatten();
+                    // mtime 使缓存失效），查询失败时 `max_create_time` 内部
+                    // 的 `.ok()` 安全退化为 None，不 panic、不误报数据。
+                    let ts = max_create_time(conn, &tname);
                     Ok((None, ts))
                 }
             })?;
@@ -1685,6 +1672,98 @@ mod shard_scan_concurrency_cap_tests {
     }
 }
 
+/// 消息行的原始元组：(local_id, local_type, create_time, real_sender_id,
+/// content_bytes, WCDB_CT)。
+type MsgRow = (i64, i64, i64, i64, Vec<u8>, i64);
+
+/// 查询列清单（与 [`MsgRow`] 字段一一对应）。所有取数路径共用，保证行
+/// 映射闭包只写一份。
+const MSG_ROW_COLS: &str = "local_id, local_type, create_time, real_sender_id,
+                message_content, WCDB_CT_message_content";
+
+/// 检测表上是否存在微信 v4 WCDB 固定命名的 `<table>_SORTSEQ(sort_seq)`
+/// 索引，且首列确为 `sort_seq`。
+///
+/// 走 `PRAGMA index_info`——只读当前连接内存中已解析的 schema，零页 IO，
+/// 且判定结果与本连接实际执行查询所用的 schema 严格一致（不存在缓存与
+/// 连接不同步的问题）。表不存在、索引不存在、PRAGMA 失败一律返回 false，
+/// 调用方回退全表扫旧路径——这就是「未知微信版本 / 无索引账号」的护栏。
+fn table_has_sortseq_index(conn: &Connection, table: &str) -> bool {
+    let idx = format!("{}_SORTSEQ", table);
+    conn.prepare(&format!("PRAGMA index_info([{}])", idx))
+        .ok()
+        .and_then(|mut stmt| {
+            // 第一行 seqno=0 即索引首列；列 2 是列名（表达式索引为 NULL）。
+            stmt.query_row([], |row| row.get::<_, Option<String>>(2)).ok()
+        })
+        .flatten()
+        .map(|first_col| first_col == "sort_seq")
+        .unwrap_or(false)
+}
+
+/// `SELECT MAX(create_time)`（`create_time` 无索引 ⇒ 全表扫）的索引等价物。
+///
+/// `_SORTSEQ` 可用时改为「索引最右下潜 + 1 次回表」取 sort_seq 最大行的
+/// create_time：实测微信 v4 真实账号 77/77 张表与 `MAX(create_time)` 逐表
+/// 一致（sort_seq = create_time×1000 + 同秒序号，偏移恒非负、观测 ≤24s）。
+/// 理论偏差上界 = sort_seq 偏移上界，而该值只用于分片排序与 Meta 诊断
+/// （`derive_status` 的阈值是 24h 量级），`new_state` 检查点取自返回行
+/// 自身的 timestamp、不经过它——秒级偏差无影响。
+///
+/// 三个探针都走 `_SORTSEQ` 索引：最右下潜（正常行）+ NULL 区 + ≤0 区
+/// （后两者是未知微信版本的假想形态，真实账号 0 行、近零成本），取三者
+/// 最大值——NULL/0 异常行也能被精确覆盖，不会拉低返回值。
+fn max_create_time(conn: &Connection, table: &str) -> Option<i64> {
+    if table_has_sortseq_index(conn, table) {
+        let fast: Option<i64> = conn
+            .query_row(
+                &format!(
+                    "SELECT create_time FROM [{}] WHERE sort_seq IS NOT NULL \
+                     ORDER BY sort_seq DESC LIMIT 1",
+                    table
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        let mut best = fast;
+        for anomaly in ["sort_seq IS NULL", "sort_seq <= 0"] {
+            let v: Option<i64> = conn
+                .query_row(
+                    &format!(
+                        "SELECT MAX(create_time) FROM [{}] WHERE {}",
+                        table, anomaly
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .ok()
+                .flatten();
+            best = best.max(v);
+        }
+        return best;
+    }
+    conn.query_row(
+        &format!("SELECT MAX(create_time) FROM [{}]", table),
+        [],
+        |row| row.get(0),
+    )
+    .ok()
+    .flatten()
+}
+
+/// `create_time > since` 的 `_SORTSEQ` 范围下界：偏移恒非负 ⇒
+/// `create_time > s` ⟹ `sort_seq ≥ (s+1)×1000`。
+fn sortseq_floor_gt(since: i64) -> i64 {
+    since.saturating_add(1).saturating_mul(1000)
+}
+
+/// `create_time >= since` 的 `_SORTSEQ` 范围下界：`create_time ≥ s` ⟹
+/// `sort_seq ≥ s×1000`。
+fn sortseq_floor_ge(since: i64) -> i64 {
+    since.saturating_mul(1000)
+}
+
 fn query_messages(
     conn: &Connection,
     table: &str,
@@ -1700,50 +1779,7 @@ fn query_messages(
 ) -> Result<Vec<Value>> {
     let id2u = load_id2u(conn);
 
-    let mut clauses: Vec<String> = Vec::new();
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
-    if let Some(s) = since {
-        clauses.push("create_time >= ?".into());
-        params.push(Box::new(s));
-    }
-    if let Some(u) = until {
-        clauses.push("create_time <= ?".into());
-        params.push(Box::new(u));
-    }
-    if let Some(t) = msg_type {
-        push_msg_type_filter(&mut clauses, &mut params, t);
-    }
-    let where_clause = if clauses.is_empty() {
-        String::new()
-    } else {
-        format!("WHERE {}", clauses.join(" AND "))
-    };
-
-    let sql = format!(
-        "SELECT local_id, local_type, create_time, real_sender_id,
-                message_content, WCDB_CT_message_content
-         FROM [{}] {} ORDER BY create_time DESC LIMIT ? OFFSET ?",
-        table, where_clause
-    );
-
-    params.push(Box::new(limit as i64));
-    params.push(Box::new(offset as i64));
-
-    let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(params_ref.as_slice(), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                get_content_bytes(row, 4),
-                row.get::<_, i64>(5).unwrap_or(0),
-            ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect::<Vec<_>>();
+    let rows = fetch_message_rows(conn, table, since, until, msg_type, limit, offset)?;
 
     let mut result = Vec::new();
     for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in rows {
@@ -1774,6 +1810,668 @@ fn query_messages(
         result.push(msg);
     }
     Ok(result)
+}
+
+/// [`query_messages`] 的取数层：按「表上有无 `_SORTSEQ` 索引 + 查询形状」
+/// 选择执行路径，输出语义与旧的全表扫 SQL 逐行等价（含 `ORDER BY
+/// create_time DESC LIMIT/OFFSET` 的窗口语义；并列 create_time 的行序与
+/// 旧 SQL 一样不承诺确定性）。
+///
+/// 路径选择：
+/// - `since > 0` 且有索引：范围下推（[`fetch_rows_sortseq_since`]），
+///   `until`/`msg_type` 保留为残余过滤；
+/// - 无 `since`、无 `until` 且有索引：「最新 N 条」的 sort_seq 降序近似 +
+///   可证完备性判据（[`fetch_rows_sortseq_topn`]），判据不满足回退；
+/// - 其余（无索引 / `since<=0` / 仅 `until` 的深分页）：旧全表扫路径原样
+///   （[`fetch_rows_full_scan`]）。
+fn fetch_message_rows(
+    conn: &Connection,
+    table: &str,
+    since: Option<i64>,
+    until: Option<i64>,
+    msg_type: Option<i64>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<MsgRow>> {
+    match since {
+        // s = 0 等价于无下界；s < 0 会让范围下界 (s+1)*1000 ≤ 0 与「sort_seq
+        // <= 0 兜底分支」重叠产生重复行——两者都直接走旧路径。
+        Some(s) if s > 0 && table_has_sortseq_index(conn, table) => {
+            fetch_rows_sortseq_since(conn, table, s, until, msg_type, limit, offset)
+        }
+        None if until.is_none() && table_has_sortseq_index(conn, table) => {
+            if let Some(rows) = fetch_rows_sortseq_topn(conn, table, msg_type, limit, offset)? {
+                return Ok(rows);
+            }
+            // 完备性判据未满足（极端同秒爆发）：回退全表扫。
+            fetch_rows_full_scan(conn, table, since, until, msg_type, limit, offset)
+        }
+        _ => fetch_rows_full_scan(conn, table, since, until, msg_type, limit, offset),
+    }
+}
+
+/// 旧的全表扫路径，SQL 与改造前逐字相同。
+fn fetch_rows_full_scan(
+    conn: &Connection,
+    table: &str,
+    since: Option<i64>,
+    until: Option<i64>,
+    msg_type: Option<i64>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<MsgRow>> {
+    let mut clauses: Vec<String> = Vec::new();
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(s) = since {
+        clauses.push("create_time >= ?".into());
+        params.push(Box::new(s));
+    }
+    if let Some(u) = until {
+        clauses.push("create_time <= ?".into());
+        params.push(Box::new(u));
+    }
+    if let Some(t) = msg_type {
+        push_msg_type_filter(&mut clauses, &mut params, t);
+    }
+    let where_clause = if clauses.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", clauses.join(" AND "))
+    };
+
+    let sql = format!(
+        "SELECT {} FROM [{}] {} ORDER BY create_time DESC LIMIT ? OFFSET ?",
+        MSG_ROW_COLS, table, where_clause
+    );
+
+    params.push(Box::new(limit as i64));
+    params.push(Box::new(offset as i64));
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt
+        .query_map(params_ref.as_slice(), map_msg_row)?
+        .filter_map(|r| r.ok())
+        .collect::<Vec<_>>();
+    Ok(rows)
+}
+
+fn map_msg_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MsgRow> {
+    Ok((
+        row.get::<_, i64>(0)?,
+        row.get::<_, i64>(1)?,
+        row.get::<_, i64>(2)?,
+        row.get::<_, i64>(3)?,
+        get_content_bytes(row, 4),
+        row.get::<_, i64>(5).unwrap_or(0),
+    ))
+}
+
+/// 带 `since` 的索引下推路径。
+///
+/// 主分支 `sort_seq >= since×1000` 是 `create_time >= since` 的可证超集
+/// （偏移恒非负），原 `create_time` 谓词保留为残余过滤，输出逐行等价；
+/// 两个 UNION ALL 兜底分支把 `sort_seq` 为 NULL / ≤0 的行（未知微信版本的
+/// 假想形态，真实账号实测为 0 行）从「静默永久漏」降级为「多扫几行被残余
+/// 谓词滤掉」——它们各自也是索引探针，正常账号上近零成本。兜底分支真的
+/// 捕获到行时打哨兵日志（生产环境的值语义异常信号）。
+fn fetch_rows_sortseq_since(
+    conn: &Connection,
+    table: &str,
+    since: i64,
+    until: Option<i64>,
+    msg_type: Option<i64>,
+    limit: usize,
+    offset: usize,
+) -> Result<Vec<MsgRow>> {
+    // 残余子句（三个分支共用同一份文本；参数按分支各推一份）。
+    let mut residual_clauses: Vec<String> = vec!["create_time >= ?".into()];
+    if until.is_some() {
+        residual_clauses.push("create_time <= ?".into());
+    }
+    let mut type_clauses: Vec<String> = Vec::new();
+    let mut type_params_probe: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    if let Some(t) = msg_type {
+        push_msg_type_filter(&mut type_clauses, &mut type_params_probe, t);
+        residual_clauses.extend(type_clauses.iter().cloned());
+    }
+    let residual = residual_clauses.join(" AND ");
+
+    let sql = format!(
+        "SELECT {cols}, 0 AS fb FROM [{t}] WHERE sort_seq >= ? AND {residual} \
+         UNION ALL SELECT {cols}, 1 AS fb FROM [{t}] WHERE sort_seq IS NULL AND {residual} \
+         UNION ALL SELECT {cols}, 1 AS fb FROM [{t}] WHERE sort_seq <= 0 AND {residual} \
+         ORDER BY create_time DESC LIMIT ? OFFSET ?",
+        cols = MSG_ROW_COLS,
+        t = table,
+        residual = residual,
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+    let push_residual = |params: &mut Vec<Box<dyn rusqlite::types::ToSql>>| {
+        params.push(Box::new(since));
+        if let Some(u) = until {
+            params.push(Box::new(u));
+        }
+        if let Some(t) = msg_type {
+            let mut dummy = Vec::new();
+            push_msg_type_filter(&mut dummy, params, t);
+        }
+    };
+    params.push(Box::new(sortseq_floor_ge(since)));
+    push_residual(&mut params);
+    push_residual(&mut params); // sort_seq IS NULL 分支
+    push_residual(&mut params); // sort_seq <= 0 分支
+    params.push(Box::new(limit as i64));
+    params.push(Box::new(offset as i64));
+
+    let params_ref: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
+    let mut stmt = conn.prepare(&sql)?;
+    let mut fallback_hits = 0usize;
+    let rows = stmt
+        .query_map(params_ref.as_slice(), |row| {
+            let fb: i64 = row.get::<_, i64>(6).unwrap_or(0);
+            map_msg_row(row).map(|r| (r, fb))
+        })?
+        .filter_map(|r| r.ok())
+        .map(|(r, fb)| {
+            if fb != 0 {
+                fallback_hits += 1;
+            }
+            r
+        })
+        .collect::<Vec<_>>();
+    if fallback_hits > 0 {
+        eprintln!(
+            "[sortseq] {}: NULL/0 sort_seq 兜底分支捕获 {} 行（值语义异常，请上报）",
+            table, fallback_hits
+        );
+    }
+    Ok(rows)
+}
+
+/// 无 `since`/`until` 的「最新 N 条」索引路径。
+///
+/// `ORDER BY create_time DESC LIMIT+OFFSET` 在无 create_time 索引的表上是
+/// 全表扫 + 全量排序；这里改用 `_SORTSEQ` 降序扫描取前 M 行再按 create_time
+/// 精排。完备性判据（只依赖「偏移恒非负 ⇒ create_time ≤ sort_seq/1000」）：
+/// 记主扫描最后一行的 sort_seq 为 s_last、结果窗口最小 create_time 为
+/// c_low，任何未取到的行满足 create_time ≤ s_last/1000，因此
+/// `s_last/1000 <= c_low` 时未取行不可能严格挤进窗口（与 c_low 并列的行
+/// 本就不承诺行序）。判据不满足则扩大 M 重试一次，仍不满足返回 `None`
+/// 让调用方回退全表扫——宁可退回旧成本，不引入近似结果。
+///
+/// NULL / ≤0 sort_seq 的行由两个独立索引探针补齐（正常账号 0 行）；任一
+/// 探针命中数达到自身上限说明数据形态未知，同样返回 `None` 回退。
+fn fetch_rows_sortseq_topn(
+    conn: &Connection,
+    table: &str,
+    msg_type: Option<i64>,
+    limit: usize,
+    offset: usize,
+) -> Result<Option<Vec<MsgRow>>> {
+    let need = offset.saturating_add(limit);
+    if need == 0 {
+        return Ok(Some(Vec::new()));
+    }
+
+    let type_clause = {
+        let mut clauses: Vec<String> = Vec::new();
+        let mut dummy: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        if let Some(t) = msg_type {
+            push_msg_type_filter(&mut clauses, &mut dummy, t);
+        }
+        if clauses.is_empty() {
+            String::new()
+        } else {
+            format!(" AND {}", clauses.join(" AND "))
+        }
+    };
+    let push_type = |params: &mut Vec<Box<dyn rusqlite::types::ToSql>>| {
+        if let Some(t) = msg_type {
+            let mut dummy: Vec<String> = Vec::new();
+            push_msg_type_filter(&mut dummy, params, t);
+        }
+    };
+
+    // NULL / ≤0 探针：正常账号 0 行；命中数达到上限 ⇒ 未知数据形态，回退。
+    let probe_cap = need.saturating_add(64);
+    let mut probe_rows: Vec<MsgRow> = Vec::new();
+    for probe_where in ["sort_seq IS NULL", "sort_seq <= 0"] {
+        let sql = format!(
+            "SELECT {} FROM [{}] WHERE {}{} LIMIT ?",
+            MSG_ROW_COLS, table, probe_where, type_clause
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        push_type(&mut params);
+        params.push(Box::new(probe_cap as i64));
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let got: Vec<MsgRow> = stmt
+            .query_map(params_ref.as_slice(), map_msg_row)?
+            .filter_map(|r| r.ok())
+            .collect();
+        if got.len() >= probe_cap {
+            return Ok(None);
+        }
+        probe_rows.extend(got);
+    }
+    if !probe_rows.is_empty() {
+        eprintln!(
+            "[sortseq] {}: 最新 N 条路径的 NULL/0 探针捕获 {} 行（值语义异常，请上报）",
+            table,
+            probe_rows.len()
+        );
+    }
+
+    let mut fetch_m = need.saturating_add(64);
+    for _attempt in 0..2 {
+        // `> 0`（而非 IS NOT NULL）：与两个异常探针（IS NULL / <= 0）严格
+        // 互斥，否则 sort_seq=0 的行会被主扫描和探针各取一次产生重复。
+        let sql = format!(
+            "SELECT {}, sort_seq FROM [{}] WHERE sort_seq > 0{} \
+             ORDER BY sort_seq DESC LIMIT ?",
+            MSG_ROW_COLS, table, type_clause
+        );
+        let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
+        push_type(&mut params);
+        params.push(Box::new(fetch_m as i64));
+        let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+            params.iter().map(|p| p.as_ref()).collect();
+        let mut stmt = conn.prepare(&sql)?;
+        let main_rows: Vec<(MsgRow, i64)> = stmt
+            .query_map(params_ref.as_slice(), |row| {
+                let seq: i64 = row.get(6)?;
+                map_msg_row(row).map(|r| (r, seq))
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+
+        let exhausted = main_rows.len() < fetch_m;
+        let s_last = main_rows.last().map(|(_, seq)| *seq);
+
+        let mut candidates: Vec<MsgRow> = probe_rows.clone();
+        candidates.extend(main_rows.into_iter().map(|(r, _)| r));
+        // create_time DESC（与旧 SQL 的输出序一致；并列行序两边都不承诺）。
+        candidates.sort_by_key(|r| std::cmp::Reverse(r.2));
+
+        let complete = if exhausted {
+            true
+        } else {
+            match (s_last, candidates.get(need.saturating_sub(1))) {
+                // 候选不足 need 行但主扫描没穷尽——不可能（candidates ≥
+                // main_rows = fetch_m ≥ need），防御性回退。
+                (_, None) => false,
+                (Some(s), Some(row)) => s / 1000 <= row.2,
+                (None, _) => false,
+            }
+        };
+        if complete {
+            return Ok(Some(
+                candidates.into_iter().skip(offset).take(limit).collect(),
+            ));
+        }
+        fetch_m = fetch_m.saturating_mul(8);
+    }
+    Ok(None)
+}
+
+/// 轮询增量取数（`create_time > since` + `ORDER BY create_time ASC LIMIT`，
+/// [`aggregate_new_messages_by_shard`] 专用）。
+///
+/// `_SORTSEQ` 可用且 `since >= 0` 时走范围下推 + NULL/0 兜底 UNION（等价性
+/// 论证见 [`fetch_rows_sortseq_since`]；`since < 0` 时下界 `(s+1)×1000 ≤ 0`
+/// 会与 `sort_seq <= 0` 兜底分支重叠出重复行，直接走旧路径）。「ASC +
+/// LIMIT 截断掉的是最新行、由检查点协议下轮补取」的语义由外层 ORDER BY
+/// 原样保证。任何错误安全退化：快路径失败降级旧路径，旧路径失败返回空集
+/// （与改造前的 `.unwrap_or_default()` 语义一致）。
+fn fetch_new_rows_since(
+    conn: &Connection,
+    table: &str,
+    since: i64,
+    per_table_limit: usize,
+) -> Vec<MsgRow> {
+    if since >= 0 && table_has_sortseq_index(conn, table) {
+        let sql = format!(
+            "SELECT {cols}, 0 AS fb FROM [{t}] WHERE sort_seq >= ? AND create_time > ? \
+             UNION ALL SELECT {cols}, 1 AS fb FROM [{t}] WHERE sort_seq IS NULL AND create_time > ? \
+             UNION ALL SELECT {cols}, 1 AS fb FROM [{t}] WHERE sort_seq <= 0 AND create_time > ? \
+             ORDER BY create_time ASC LIMIT ?",
+            cols = MSG_ROW_COLS,
+            t = table,
+        );
+        let fetched: rusqlite::Result<Vec<(MsgRow, i64)>> =
+            conn.prepare(&sql).and_then(|mut stmt| {
+                stmt.query_map(
+                    rusqlite::params![
+                        sortseq_floor_gt(since),
+                        since,
+                        since,
+                        since,
+                        per_table_limit as i64
+                    ],
+                    |row| {
+                        let fb: i64 = row.get::<_, i64>(6).unwrap_or(0);
+                        map_msg_row(row).map(|r| (r, fb))
+                    },
+                )
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+            });
+        if let Ok(rows) = fetched {
+            let fallback_hits = rows.iter().filter(|(_, fb)| *fb != 0).count();
+            if fallback_hits > 0 {
+                eprintln!(
+                    "[sortseq] {}: 轮询兜底分支捕获 {} 行（NULL/0 sort_seq，值语义异常，请上报）",
+                    table, fallback_hits
+                );
+            }
+            return rows.into_iter().map(|(r, _)| r).collect();
+        }
+        // 快路径意外失败：降级走旧路径，宁可付一次全表扫也不丢消息。
+    }
+    let sql = format!(
+        "SELECT {} FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT ?",
+        MSG_ROW_COLS, table
+    );
+    conn.prepare(&sql)
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![since, per_table_limit as i64], map_msg_row)
+                .map(|it| it.filter_map(|r| r.ok()).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// `_SORTSEQ` 索引下推路径的等价性测试。
+///
+/// 取数辅助函数只依赖 `&Connection`，直接用内存库对拍「快路径 vs 旧全表扫
+/// SQL」——测试数据刻意包含真实账号观测到的形态（同秒偏移、rowid/时间
+/// 倒挂）与假想的异常形态（NULL / 0 sort_seq），验证快路径在异常形态下
+/// 也不漏行。
+#[cfg(test)]
+mod sortseq_tests {
+    use super::*;
+
+    const T: &str = "Msg_test";
+
+    /// 建带 `_SORTSEQ` 索引的真实 DDL 形状表。
+    fn conn_with_index() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE [{t}](
+                local_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                server_id INTEGER,
+                local_type INTEGER,
+                sort_seq INTEGER,
+                real_sender_id INTEGER,
+                create_time INTEGER,
+                message_content TEXT,
+                WCDB_CT_message_content INTEGER
+            );
+            CREATE INDEX [{t}_SORTSEQ] ON [{t}](sort_seq);",
+            t = T
+        ))
+        .unwrap();
+        conn
+    }
+
+    /// (create_time, sort_seq, local_type)；sort_seq=None ⇒ NULL。
+    fn insert_rows(conn: &Connection, rows: &[(i64, Option<i64>, i64)]) {
+        for (ct, seq, lt) in rows {
+            conn.execute(
+                &format!(
+                    "INSERT INTO [{}](local_type, sort_seq, real_sender_id, create_time,
+                     message_content, WCDB_CT_message_content) VALUES (?, ?, 1, ?, 'x', 0)",
+                    T
+                ),
+                rusqlite::params![lt, seq, ct],
+            )
+            .unwrap();
+        }
+    }
+
+    /// 真实形态 + 异常形态混合的数据集：
+    /// - 正常行：sort_seq = ct×1000 + 同秒偏移（含 +2s 级偏移）
+    /// - 倒挂行：插入顺序（local_id 序）与时间序不一致
+    /// - 异常行：NULL sort_seq（ct=1004）、0 sort_seq（ct=1006，**全表最新**）
+    fn seed_mixed(conn: &Connection) {
+        insert_rows(
+            conn,
+            &[
+                (1000, Some(1000005), 1),
+                (1005, Some(1005000), 1),
+                (1001, Some(1001002), 3), // 倒挂：晚插入、时间更早
+                (1002, Some(1004500), 1), // 同秒偏移 +2.5s
+                (1004, None, 1),          // NULL 异常
+                (1006, Some(0), 1),       // 0 异常，且是全表最大 create_time
+                (1003, Some(1003000), 3),
+            ],
+        );
+    }
+
+    fn ids(rows: &[MsgRow]) -> Vec<i64> {
+        rows.iter().map(|r| r.0).collect()
+    }
+
+    #[test]
+    fn detects_sortseq_index_and_rejects_wrong_shape() {
+        let conn = conn_with_index();
+        assert!(table_has_sortseq_index(&conn, T));
+
+        // 无索引表
+        let bare = Connection::open_in_memory().unwrap();
+        bare.execute_batch("CREATE TABLE Msg_bare(local_id INTEGER PRIMARY KEY, create_time INTEGER);")
+            .unwrap();
+        assert!(!table_has_sortseq_index(&bare, "Msg_bare"));
+        // 表不存在
+        assert!(!table_has_sortseq_index(&bare, "Msg_missing"));
+
+        // 同名索引但首列不是 sort_seq ⇒ 必须拒绝
+        let wrong = Connection::open_in_memory().unwrap();
+        wrong
+            .execute_batch(
+                "CREATE TABLE Msg_w(local_id INTEGER PRIMARY KEY, local_type INTEGER, sort_seq INTEGER);
+                 CREATE INDEX Msg_w_SORTSEQ ON Msg_w(local_type, sort_seq);",
+            )
+            .unwrap();
+        assert!(!table_has_sortseq_index(&wrong, "Msg_w"));
+    }
+
+    #[test]
+    fn max_create_time_exact_even_with_null_and_zero_anomalies() {
+        let conn = conn_with_index();
+        seed_mixed(&conn);
+        // 全表最新的 ct=1006 挂在 sort_seq=0 的异常行上，三探针必须补到它。
+        assert_eq!(max_create_time(&conn, T), Some(1006));
+
+        // 空表：None
+        let empty = conn_with_index();
+        assert_eq!(max_create_time(&empty, T), None);
+
+        // 无索引表：回退全表扫 MAX
+        let bare = Connection::open_in_memory().unwrap();
+        bare.execute_batch(
+            "CREATE TABLE Msg_bare(local_id INTEGER PRIMARY KEY, create_time INTEGER);
+             INSERT INTO Msg_bare(create_time) VALUES (42), (7);",
+        )
+        .unwrap();
+        assert_eq!(max_create_time(&bare, "Msg_bare"), Some(42));
+    }
+
+    #[test]
+    fn polling_fast_path_catches_null_and_zero_rows() {
+        let conn = conn_with_index();
+        seed_mixed(&conn);
+        for since in [0i64, 999, 1002, 1004, 1005, 1006, 2000] {
+            let fast = fetch_new_rows_since(&conn, T, since, 200);
+            // 旧语义参照：create_time > since，ASC
+            let expected: Vec<i64> = conn
+                .prepare(&format!(
+                    "SELECT local_id FROM [{}] WHERE create_time > ? ORDER BY create_time ASC",
+                    T
+                ))
+                .unwrap()
+                .query_map([since], |r| r.get(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            assert_eq!(
+                ids(&fast),
+                expected,
+                "since={} 时快路径必须与旧全表扫逐行一致（含 NULL/0 异常行）",
+                since
+            );
+        }
+    }
+
+    #[test]
+    fn polling_fast_path_respects_per_table_limit_truncation() {
+        let conn = conn_with_index();
+        seed_mixed(&conn);
+        // ASC + LIMIT 截断掉的必须是**最新**的行（检查点协议靠「下轮
+        // since > returned_max 补尾巴」，截错方向就是永久漏消息）。
+        let truncated = fetch_new_rows_since(&conn, T, 0, 3);
+        let cts: Vec<i64> = truncated.iter().map(|r| r.2).collect();
+        assert_eq!(cts, vec![1000, 1001, 1002]);
+    }
+
+    #[test]
+    fn since_path_matches_full_scan_with_until_and_type_filters() {
+        let conn = conn_with_index();
+        seed_mixed(&conn);
+        for (since, until, ty) in [
+            (Some(1001i64), None, None),
+            (Some(1001), Some(1005i64), None),
+            (Some(1000), None, Some(3i64)),
+            (Some(1001), Some(1006), Some(1)),
+        ] {
+            for (limit, offset) in [(200usize, 0usize), (2, 0), (2, 1)] {
+                let fast = fetch_message_rows(&conn, T, since, until, ty, limit, offset).unwrap();
+                let slow = fetch_rows_full_scan(&conn, T, since, until, ty, limit, offset).unwrap();
+                assert_eq!(
+                    ids(&fast),
+                    ids(&slow),
+                    "since={:?} until={:?} type={:?} limit={} offset={}",
+                    since,
+                    until,
+                    ty,
+                    limit,
+                    offset
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn topn_path_matches_full_scan_including_anomalies() {
+        let conn = conn_with_index();
+        seed_mixed(&conn);
+        for (limit, offset) in [(200usize, 0usize), (3, 0), (2, 2), (1, 6), (2, 6)] {
+            let fast = fetch_message_rows(&conn, T, None, None, None, limit, offset).unwrap();
+            let slow = fetch_rows_full_scan(&conn, T, None, None, None, limit, offset).unwrap();
+            assert_eq!(ids(&fast), ids(&slow), "limit={} offset={}", limit, offset);
+        }
+        // 带类型过滤
+        let fast = fetch_message_rows(&conn, T, None, None, Some(3), 10, 0).unwrap();
+        let slow = fetch_rows_full_scan(&conn, T, None, None, Some(3), 10, 0).unwrap();
+        assert_eq!(ids(&fast), ids(&slow));
+    }
+
+    /// 大量同秒行 + 巨偏移异常行：第一轮完备性判据不满足 ⇒ 扩大重试；
+    /// 全 NULL 探针超上限 ⇒ 整体回退全表扫。两条防御路径都不能产出与旧
+    /// 语义不同的结果。
+    #[test]
+    fn topn_retry_and_fallback_paths_stay_equivalent() {
+        // 判据触发重试：70 行同一 create_time、sort_seq 偏移拉满
+        let conn = conn_with_index();
+        let rows: Vec<(i64, Option<i64>, i64)> = (0..70)
+            .map(|i| (100i64, Some(200000 + i as i64 * 1000), 1i64))
+            .collect();
+        insert_rows(&conn, &rows);
+        let fast = fetch_message_rows(&conn, T, None, None, None, 1, 0).unwrap();
+        assert_eq!(fast.len(), 1);
+        assert_eq!(fast[0].2, 100);
+
+        // NULL 探针超上限 ⇒ 回退全表扫
+        let conn2 = conn_with_index();
+        let rows2: Vec<(i64, Option<i64>, i64)> =
+            (0..70).map(|i| (100 + i as i64, None, 1i64)).collect();
+        insert_rows(&conn2, &rows2);
+        let fast2 = fetch_message_rows(&conn2, T, None, None, None, 1, 0).unwrap();
+        let slow2 = fetch_rows_full_scan(&conn2, T, None, None, None, 1, 0).unwrap();
+        assert_eq!(ids(&fast2), ids(&slow2));
+        assert_eq!(fast2[0].2, 169);
+    }
+
+    /// EQP 锁定：三条快路径 SQL 在 rusqlite 捆绑的 SQLite 上，凡是触碰
+    /// 目标表的执行节点都必须经 `_SORTSEQ` 索引，任何一个分支静默退化成
+    /// 全表 SCAN 都是本测试要抓的回归。
+    #[test]
+    fn fast_path_query_plans_use_the_index() {
+        let conn = conn_with_index();
+        seed_mixed(&conn);
+        let polling = format!(
+            "SELECT {cols}, 0 AS fb FROM [{t}] WHERE sort_seq >= ? AND create_time > ? \
+             UNION ALL SELECT {cols}, 1 AS fb FROM [{t}] WHERE sort_seq IS NULL AND create_time > ? \
+             UNION ALL SELECT {cols}, 1 AS fb FROM [{t}] WHERE sort_seq <= 0 AND create_time > ? \
+             ORDER BY create_time ASC LIMIT ?",
+            cols = MSG_ROW_COLS,
+            t = T,
+        );
+        let topn = format!(
+            "SELECT {}, sort_seq FROM [{}] WHERE sort_seq > 0 ORDER BY sort_seq DESC LIMIT ?",
+            MSG_ROW_COLS, T
+        );
+        let rightmost = format!(
+            "SELECT create_time FROM [{}] WHERE sort_seq IS NOT NULL ORDER BY sort_seq DESC LIMIT 1",
+            T
+        );
+        for sql in [polling.as_str(), topn.as_str(), rightmost.as_str()] {
+            let mut stmt = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {}", sql))
+                .unwrap();
+            let nulls = rusqlite::params_from_iter(
+                std::iter::repeat(rusqlite::types::Value::Null).take(stmt.parameter_count()),
+            );
+            let details: Vec<String> = stmt
+                .query_map(nulls, |row| row.get::<_, String>(3))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .collect();
+            for d in &details {
+                if d.contains(T) {
+                    assert!(
+                        d.contains("_SORTSEQ"),
+                        "执行节点未走索引: {:?}\nSQL: {}",
+                        d,
+                        sql
+                    );
+                }
+            }
+        }
+    }
+
+    /// 无索引表：三条路径全部走旧 SQL，行为与改造前完全一致。
+    #[test]
+    fn tables_without_index_use_legacy_path() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE Msg_bare(
+                local_id INTEGER PRIMARY KEY,
+                local_type INTEGER DEFAULT 1,
+                real_sender_id INTEGER DEFAULT 1,
+                create_time INTEGER,
+                message_content TEXT DEFAULT 'x',
+                WCDB_CT_message_content INTEGER DEFAULT 0
+            );
+             INSERT INTO Msg_bare(create_time) VALUES (10), (30), (20);",
+        )
+        .unwrap();
+        let rows = fetch_message_rows(&conn, "Msg_bare", None, None, None, 2, 0).unwrap();
+        assert_eq!(rows.iter().map(|r| r.2).collect::<Vec<_>>(), vec![30, 20]);
+        let inc = fetch_new_rows_since(&conn, "Msg_bare", 10, 200);
+        assert_eq!(inc.iter().map(|r| r.2).collect::<Vec<_>>(), vec![20, 30]);
+    }
 }
 
 fn search_in_table(
@@ -3860,31 +4558,8 @@ async fn aggregate_new_messages_by_shard(
                     if matched_any {
                         let id2u = load_id2u(conn);
                         for job in jobs {
-                            let sql = format!(
-                                "SELECT local_id, local_type, create_time, real_sender_id,
-                                        message_content, WCDB_CT_message_content
-                                 FROM [{}] WHERE create_time > ? ORDER BY create_time ASC LIMIT ?",
-                                job.table
-                            );
-                            let rows: Vec<_> = conn
-                                .prepare(&sql)
-                                .and_then(|mut stmt| {
-                                    stmt.query_map(
-                                        rusqlite::params![job.since_ts, per_table_limit as i64],
-                                        |row| {
-                                            Ok((
-                                                row.get::<_, i64>(0)?,
-                                                row.get::<_, i64>(1)?,
-                                                row.get::<_, i64>(2)?,
-                                                row.get::<_, i64>(3)?,
-                                                get_content_bytes(row, 4),
-                                                row.get::<_, i64>(5).unwrap_or(0),
-                                            ))
-                                        },
-                                    )
-                                    .map(|it| it.filter_map(|r| r.ok()).collect())
-                                })
-                                .unwrap_or_default();
+                            let rows =
+                                fetch_new_rows_since(conn, &job.table, job.since_ts, per_table_limit);
 
                             for (local_id, local_type, ts, real_sender_id, content_bytes, ct) in
                                 rows
