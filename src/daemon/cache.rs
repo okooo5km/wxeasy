@@ -101,6 +101,10 @@ pub struct DbCache {
     /// 都把"读/改这个世代号"移进了 `shard_routes` 那把锁的临界区内部完成，
     /// 用锁本身把两者串行化，不再有独立的两步窗口，见两个方法各自的文档。
     route_generation: AtomicU64,
+    /// 路由缓存持久化（见 [`RouteCacheFile`]）：write-behind 脏标记 + 上次
+    /// 落盘时刻（去抖）。
+    routes_dirty: std::sync::atomic::AtomicBool,
+    routes_last_flush: std::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl DbCache {
@@ -126,9 +130,16 @@ impl DbCache {
             shard_routes: ShardRouteCache::new(),
             hot_conns: HotConnPool::new(),
             route_generation: AtomicU64::new(0),
+            routes_dirty: std::sync::atomic::AtomicBool::new(false),
+            routes_last_flush: std::sync::Mutex::new(None),
         };
 
         cache.load_persistent().await;
+        // 路由缓存的持久化加载必须发生在**这里**（构造期、server 开始
+        // accept 之前）：此刻不存在任何并发调用者，直接灌入 shard_routes
+        // 不经过世代号校验是安全的——§4.4/§4.5 的约束管的是并发期的
+        // put/invalidate 串行化，构造期天然满足。
+        cache.load_route_cache();
         Ok(cache)
     }
 
@@ -615,13 +626,97 @@ impl DbCache {
     ) {
         // 先持锁，世代号的读取和校验都必须在这把锁的临界区内部完成——
         // 这是 LOW-1 修复的关键：不能像旧实现那样在锁外单独 load。
-        let mut guard = self.shard_routes.lock();
-        if self.route_generation.load(Ordering::SeqCst) != expected_generation {
-            // 世代号已经变化：期间发生过至少一次 invalidate_shard，这份
-            // 回写可能反映的是作废之前的旧状态，直接丢弃，不写入。
+        {
+            let mut guard = self.shard_routes.lock();
+            if self.route_generation.load(Ordering::SeqCst) != expected_generation {
+                // 世代号已经变化：期间发生过至少一次 invalidate_shard，这份
+                // 回写可能反映的是作废之前的旧状态，直接丢弃，不写入。
+                return;
+            }
+            guard.insert(rel_key, ShardSchemaEntry { snapshot, msg_tables });
+        }
+        // 持久化 write-behind：锁外打脏标记 + 去抖落盘（见 RouteCacheFile）。
+        self.note_routes_dirty();
+    }
+
+    /// 路由缓存持久化文件路径。
+    fn route_cache_path(&self) -> PathBuf {
+        self.cache_dir.join(ROUTE_CACHE_FILE_NAME)
+    }
+
+    /// 构造期加载持久化的路由缓存（见 [`RouteCacheFile`] 的安全性论证与
+    /// 已拍板取舍）。任何不匹配 / 损坏 ⇒ 静默丢弃走冷路径。
+    fn load_route_cache(&self) {
+        let content = match std::fs::read_to_string(self.route_cache_path()) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let parsed: RouteCacheFile = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if parsed.version != ROUTE_CACHE_VERSION
+            || parsed.db_dir != self.db_dir.to_string_lossy()
+        {
             return;
         }
-        guard.insert(rel_key, ShardSchemaEntry { snapshot, msg_tables });
+        let count = parsed.entries.len();
+        if count == 0 {
+            return;
+        }
+        let mut guard = self.shard_routes.lock();
+        for (rel_key, entry) in parsed.entries {
+            // 只接受当前配置仍然认识的 rel_key，防止改配置后残留条目复活。
+            if self.all_keys.contains_key(&rel_key) {
+                guard.insert(rel_key, entry);
+            }
+        }
+        eprintln!("[cache] 路由缓存: 从磁盘恢复 {} 个分片条目", count);
+    }
+
+    /// write-behind：打脏标记，去抖间隔已过就把当前路由表快照落盘（详见
+    /// [`RouteCacheFile`]——文件按「天然可丢最近一个去抖周期」设计）。
+    /// 序列化 + 写文件在分离线程执行，不阻塞调用方（put/invalidate 可能
+    /// 发生在 async 收割循环里）。
+    fn note_routes_dirty(&self) {
+        self.routes_dirty
+            .store(true, std::sync::atomic::Ordering::Release);
+        let now = std::time::Instant::now();
+        {
+            let mut last = self
+                .routes_last_flush
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = *last {
+                if now.duration_since(prev).as_secs() < ROUTE_FLUSH_DEBOUNCE_SECS {
+                    return;
+                }
+            }
+            *last = Some(now);
+        }
+        self.routes_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
+        let path = self.route_cache_path();
+        let file = self.route_cache_snapshot();
+        std::thread::spawn(move || {
+            let _ = write_route_cache_file(&path, &file);
+        });
+    }
+
+    /// 测试钩子 + 内部复用：同步落盘当前路由表（绕过去抖）。
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn flush_routes_now(&self) {
+        self.routes_dirty
+            .store(false, std::sync::atomic::Ordering::Release);
+        let _ = write_route_cache_file(&self.route_cache_path(), &self.route_cache_snapshot());
+    }
+
+    fn route_cache_snapshot(&self) -> RouteCacheFile {
+        RouteCacheFile {
+            version: ROUTE_CACHE_VERSION,
+            db_dir: self.db_dir.to_string_lossy().into_owned(),
+            entries: self.shard_routes.lock().clone(),
+        }
     }
 
     /// FIX-MEDIUM：读取当前作废世代号（同步、非阻塞，纯原子读）。调用方
@@ -772,7 +867,20 @@ impl DbCache {
         self.shard_routes
             .remove_and_bump_generation(rel_key, &self.route_generation);
         self.hot_conns.evict(rel_key);
+        // 作废也是路由表状态变化，同样打脏标记（去抖之内只是标记，无 IO）。
+        self.note_routes_dirty();
     }
+}
+
+/// 原子写路由缓存文件：临时文件 + rename（Windows 上 `fs::rename` 走
+/// `MOVEFILE_REPLACE_EXISTING`，可覆盖既有文件）。任何失败静默忽略——
+/// 文件只是影子，丢了走冷路径。
+fn write_route_cache_file(path: &Path, file: &RouteCacheFile) -> std::io::Result<()> {
+    let json = serde_json::to_string(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)
 }
 
 /// [`DbCache::conn_params`] 的返回值：`open_conn` 建立连接所需的全部数据，
@@ -822,7 +930,7 @@ impl ConnParams {
 /// [`ShardSchemaEntry`]（优化 A）与 [`HotConn`]（优化 B）都存这个类型、用
 /// 同一套 [`Self::trusted_as_of`] 判定逻辑，避免两处独立实现同一套"要不要
 /// 信任缓存"规则、后续改动漏改一处。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SourceSnapshot {
     db_mtime: u64,
     db_len: u64,
@@ -1115,11 +1223,45 @@ mod snapshot_tests {
 /// 同一个分片被多个不同会话命中时，只有第一个会话触发真正的 `sqlite_master`
 /// 扫描，其余全部内存命中——把 `find_msg_shards` 的复杂度从 O(会话数 × 活跃
 /// 分片数) 压到 O(真正 dirty 的分片数)。
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 struct ShardSchemaEntry {
     snapshot: SourceSnapshot,
     msg_tables: HashSet<String>,
 }
+
+/// 路由缓存的持久化文件格式（`cache_dir/route_cache.json`）。
+///
+/// # 为什么可以安全持久化（以及交易掉了什么）
+/// [`SourceSnapshot`] 是**纯外部事实**（源文件 mtime 纳秒 + 长度 +
+/// `wal_present`），不依赖任何进程内状态；加载回来的条目走与内存条目完全
+/// 相同的门控（快照逐字段相等 + `trusted_as_of` 安静期），不需要发明新的
+/// 失效机制。版本号或 `db_dir` 身份不匹配、文件损坏 ⇒ 整体丢弃走冷路径；
+/// 内存永远是真相，文件只是影子。
+///
+/// **已拍板的取舍（2026-07-22，Boss 决策：选快）**：daemon 重启后首轮
+/// `q_new_messages` 的 unresolved 全量作废，在持久化路由命中时会退化为
+/// 精准作废——等于放弃了「重启 = 对 mtime 滞后超 slack 残余窗口的免费
+/// 全量重置」这道隐形保险。残余风险为 LOW（需要 mtime 滞后持续超过
+/// 600s slack + 分片滚动 + 精准撞窗同时发生；且滞后主要出现在微信持续
+/// 持句柄写入期间，而 daemon 重启多伴随开机、元数据已落定）。
+///
+/// # Windows 无退出钩子
+/// `setup_signal_handler` 是 `#[cfg(unix)]`，daemon 被 taskkill 时没有任何
+/// 通知——本文件按「天然可丢最近 [`ROUTE_FLUSH_DEBOUNCE_SECS`] 秒」设计，
+/// 丢了只是下次冷启动多扫几个分片，不存在正确性影响。
+#[derive(Serialize, Deserialize)]
+struct RouteCacheFile {
+    version: u32,
+    /// 身份字段：db_dir 不同的账号绝不混用彼此的路由缓存。
+    db_dir: String,
+    entries: HashMap<String, ShardSchemaEntry>,
+}
+
+const ROUTE_CACHE_VERSION: u32 = 1;
+const ROUTE_CACHE_FILE_NAME: &str = "route_cache.json";
+/// write-behind 去抖间隔：稳态轮询里 put/invalidate 每轮都发生，去抖后
+/// 磁盘写至多每 30 秒一次。
+const ROUTE_FLUSH_DEBOUNCE_SECS: u64 = 30;
 
 /// rel_key -> [`ShardSchemaEntry`] 的路由缓存。用 `std::sync::Mutex`（不是
 /// tokio `Mutex`）：临界区只是纯内存 `HashMap` 读写，不跨越任何 `.await`，
@@ -2065,6 +2207,176 @@ pub(crate) mod test_support {
             .open(path)
             .expect("打开待回拨 mtime 的文件失败");
         file.set_modified(old).expect("回拨 mtime 失败");
+    }
+}
+
+/// 路由缓存持久化（[`RouteCacheFile`]）的单元测试：重启存活、身份/版本
+/// 校验、损坏容忍、未知 rel_key 丢弃、加载后门控仍然生效。
+#[cfg(test)]
+mod route_persistence_tests {
+    use super::test_support::{backdate_beyond_slack, unique_tmpdir};
+    use super::*;
+
+    struct Env {
+        db_dir: PathBuf,
+        cache_dir: PathBuf,
+        rel_key: String,
+        all_keys: HashMap<String, String>,
+    }
+
+    fn env(tag: &str) -> Env {
+        let root = unique_tmpdir(tag);
+        let db_dir = root.join("db_storage");
+        let cache_dir = root.join("cache");
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let rel_key = "message_0.db".to_string();
+        let db_path = db_dir.join(&rel_key);
+        std::fs::write(&db_path, b"fake encrypted db").unwrap();
+        backdate_beyond_slack(&db_path);
+        let mut all_keys = HashMap::new();
+        all_keys.insert(rel_key.clone(), "aa".repeat(32));
+        Env {
+            db_dir,
+            cache_dir,
+            rel_key,
+            all_keys,
+        }
+    }
+
+    async fn mk_cache(e: &Env) -> DbCache {
+        DbCache::with_dirs(
+            e.db_dir.clone(),
+            e.cache_dir.clone(),
+            e.cache_dir.join("_mtimes.json"),
+            e.all_keys.clone(),
+        )
+        .await
+        .unwrap()
+    }
+
+    fn put_and_flush(cache: &DbCache, rel_key: &str) -> HashSet<String> {
+        let snapshot = cache.source_snapshot(rel_key);
+        let mut tables = HashSet::new();
+        tables.insert("Msg_persisted".to_string());
+        cache.put_shard_schema(
+            rel_key.to_string(),
+            snapshot,
+            tables.clone(),
+            cache.route_generation(),
+        );
+        cache.flush_routes_now();
+        tables
+    }
+
+    /// 核心场景：daemon「重启」（同目录新建 DbCache）后，安静分片的路由
+    /// 直接 Fresh 命中，零 IO——这就是冷启动收益的来源。
+    #[tokio::test]
+    async fn routes_survive_daemon_restart() {
+        let e = env("route-persist-roundtrip");
+        let cache = mk_cache(&e).await;
+        let tables = put_and_flush(&cache, &e.rel_key);
+
+        let restarted = mk_cache(&e).await;
+        match restarted.shard_route_lookup(&e.rel_key) {
+            ShardRouteLookup::Fresh(got) => assert_eq!(got, tables),
+            ShardRouteLookup::Stale(_) => {
+                panic!("安静分片的持久化路由应在重启后直接 Fresh 命中")
+            }
+        }
+    }
+
+    /// 加载后门控仍然生效：文件在两次启动之间被写过（快照变了）⇒ 必须
+    /// Stale，持久化不构成任何新的信任捷径。
+    #[tokio::test]
+    async fn loaded_entry_still_fails_gating_after_source_change() {
+        let e = env("route-persist-gating");
+        let cache = mk_cache(&e).await;
+        put_and_flush(&cache, &e.rel_key);
+
+        // 模拟重启间隙微信写入：内容与长度都变、mtime 变新。
+        std::fs::write(e.db_dir.join(&e.rel_key), b"changed content, longer than before").unwrap();
+
+        let restarted = mk_cache(&e).await;
+        assert!(
+            matches!(
+                restarted.shard_route_lookup(&e.rel_key),
+                ShardRouteLookup::Stale(_)
+            ),
+            "源文件变化后，加载的持久化条目必须被门控拒绝"
+        );
+    }
+
+    /// db_dir 身份不匹配 ⇒ 整文件丢弃（不同账号绝不混用路由缓存）。
+    #[tokio::test]
+    async fn mismatched_db_dir_identity_is_rejected() {
+        let e = env("route-persist-identity");
+        let cache = mk_cache(&e).await;
+        put_and_flush(&cache, &e.rel_key);
+
+        // 把持久化文件原样搬到另一个账号（不同 db_dir）的缓存目录下。
+        let other = env("route-persist-identity-other");
+        std::fs::copy(
+            e.cache_dir.join(ROUTE_CACHE_FILE_NAME),
+            other.cache_dir.join(ROUTE_CACHE_FILE_NAME),
+        )
+        .unwrap();
+
+        let victim = mk_cache(&other).await;
+        assert!(
+            matches!(
+                victim.shard_route_lookup(&other.rel_key),
+                ShardRouteLookup::Stale(_)
+            ),
+            "db_dir 不同的账号必须拒绝加载彼此的路由缓存"
+        );
+    }
+
+    /// 损坏 / 版本不匹配的文件必须被静默忽略，不影响启动。
+    #[tokio::test]
+    async fn corrupt_or_wrong_version_files_are_ignored() {
+        let e = env("route-persist-corrupt");
+        std::fs::write(e.cache_dir.join(ROUTE_CACHE_FILE_NAME), b"{not valid json").unwrap();
+        let cache = mk_cache(&e).await;
+        assert!(matches!(
+            cache.shard_route_lookup(&e.rel_key),
+            ShardRouteLookup::Stale(_)
+        ));
+
+        let wrong_version = format!(
+            r#"{{"version":999,"db_dir":"{}","entries":{{}}}}"#,
+            e.db_dir.to_string_lossy().replace('\\', "\\\\")
+        );
+        std::fs::write(e.cache_dir.join(ROUTE_CACHE_FILE_NAME), wrong_version).unwrap();
+        let cache2 = mk_cache(&e).await;
+        assert!(matches!(
+            cache2.shard_route_lookup(&e.rel_key),
+            ShardRouteLookup::Stale(_)
+        ));
+    }
+
+    /// 配置里已不存在的 rel_key（改配置 / 分片消失）在加载时被丢弃。
+    #[tokio::test]
+    async fn unknown_rel_keys_are_dropped_on_load() {
+        let e = env("route-persist-unknown-key");
+        let cache = mk_cache(&e).await;
+        put_and_flush(&cache, &e.rel_key);
+
+        let mut stripped = Env {
+            db_dir: e.db_dir.clone(),
+            cache_dir: e.cache_dir.clone(),
+            rel_key: e.rel_key.clone(),
+            all_keys: HashMap::new(), // rel_key 不再被配置认识
+        };
+        stripped.all_keys.insert("other.db".into(), "bb".repeat(32));
+        let restarted = mk_cache(&stripped).await;
+        assert!(
+            matches!(
+                restarted.shard_route_lookup(&e.rel_key),
+                ShardRouteLookup::Stale(_)
+            ),
+            "配置不再认识的 rel_key 不得从持久化文件复活"
+        );
     }
 }
 
