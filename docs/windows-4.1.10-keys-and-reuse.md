@@ -16,12 +16,13 @@
 | 内存中 `x'<64hex_key><32hex_salt>'` | 常可扫描到 | **稳态几乎不存在** |
 | 可读内存中 raw 32B / 常见编码变体 / AES 扩展表 | 常有机会 | **稳态实测 0 命中** |
 | 登录/开库后短窗 hex 扫描 | 有机会 | **实测仍 0 有效密钥**（见 §五） |
-| 推荐路径 | `wxeasy init` 内存扫描 | **扫描 + page1 校验复用 `all_keys.json`** |
+| 推荐路径 | `wxeasy init` 内存扫描 | **扫描 + page1 校验复用 `all_keys.json`**；冷启动无旧钥时用 **Frida AES-NI 设钥 hook**（§八） |
 
 **一句话：**
 
 - **加密格式没换** → 升级前/本机已有密钥，校验通过后可继续用。  
-- **内存提钥变难** → 不能依赖「冷启动、无旧密钥、只靠扫进程」在 4.1.10+ 上稳定成功。  
+- **被动内存提钥变难** → 不能依赖「冷启动、无旧密钥、只靠扫进程」在 4.1.10+ 上稳定成功。  
+- **动态 hook 可突破** → 库被使用时 `aesni_set_encrypt_key(bits=256)` 仍暴露 32B raw key（`tools/frida_capture_keys.py`）。  
 - **`~/.wxeasy/all_keys.json` 是生产资产** → 务必备份，勿泄露。
 
 ---
@@ -184,10 +185,11 @@ wxeasy init [--force]
 | 稳态：salt 邻域候选 + 强校验 | **0** |
 | 退出 → 重登后 Python 短窗 hex 扫描（约 120s） | 候选数百，**有效 0/18** |
 | 同窗口 `WXEASY_SCAN_ROUNDS=60` 的 `init --force` | 候选数千，扫描 **0/18**，复用 **18/18** |
+| Frida hook `aesni_set_encrypt_key`（bits=256）+ page1 校验 | **可捕获正在使用的库密钥**（见 §八） |
 | `wxeasy sessions`（复用后） | 正常 |
 
-**冷启动定义（本文）：** 本机 **没有任何** 可通过 page1 校验的历史 `all_keys.json` / 等价密钥备份，仅依赖当前 4.1.10+ 进程内存扫描。  
-在该定义下，**当前 wxeasy 版本不保证成功**。
+**冷启动定义（本文）：** 本机 **没有任何** 可通过 page1 校验的历史 `all_keys.json` / 等价密钥备份，仅依赖当前 4.1.10+ **被动内存扫描**。  
+在该定义下，`wxeasy init` **内置扫描不保证成功**。动态 hook（§八）是另一条路径。
 
 ---
 
@@ -238,19 +240,60 @@ wxeasy init --force
 
 ---
 
-## 八、明确不在当前版本保证范围内的事
+## 八、4.1.10+ 动态提钥（Frida AES-NI 设钥 hook）
 
-1. **无历史密钥的 4.1.10+ 冷启动内存提钥**（含登录短窗 hex 盲扫）。  
+### 8.1 原理（2026-07 在 Weixin 4.1.11.24 验证）
+
+| 观察 | 结论 |
+|------|------|
+| 稳态可读内存 | raw 32B / `x'…'` / AES 扩展表 **不驻留**（`cipher_memory_security` 一类行为） |
+| BCrypt 设钥 | 基本无 DB 相关调用；密码学在 `Weixin.dll` 内静态 OpenSSL |
+| 软件 AES_set_* 表 | 存在但 DB 路径几乎不走 |
+| **AES-NI `aesni_set_encrypt_key`** | 某库被真正解锁/读写时，以 **bits=256** 调用，**RCX = 32 字节 raw DB key** |
+| `roam_server.dll` 内同类符号 | 有独立实现；实测 DB 主路径多在 **Weixin.dll** |
+
+因此：
+
+- **被动扫内存** ≈ 失败（4.1.10+ 预期）
+- **在 AES-256 设钥瞬间 hook** ≈ 可拿到正在使用的库密钥
+- 捕获后仍用 **page1 强校验** 绑定到具体 `*.db`（与 `init` 复用同一套密码学）
+
+调用链特征（示意）：DB 使用 → `aesni_set_decrypt_key` / `aesni_set_encrypt_key`（OpenSSL AES-NI）→ userKey 为 32B。
+
+### 8.2 工具：`tools/frida_capture_keys.py`
+
+```powershell
+pip install frida==16.5.9 pycryptodome
+# 微信已登录；建议管理员 PowerShell
+python tools/frida_capture_keys.py --seconds 120 --merge
+# 可选显式指定账号库目录
+python tools/frida_capture_keys.py --db-dir "D:\wechat\xwechat_files\<id>\db_storage" --seconds 180 --merge
+wxeasy init   # 合并后走校验复用写入 config
+```
+
+脚本行为：
+
+1. 附加加载了 `Weixin.dll` 的 `Weixin.exe`
+2. 在 `Weixin.dll` / `roam_server.dll` 内 **特征扫描** `aesni_set_encrypt_key` 序言（不写死单一版本 RVA）
+3. 仅处理 `bits == 256` 的设钥，读取 32 字节 userKey
+4. 对 `db_storage` 下加密库做 page1 强校验
+5. `--merge` 时写入 `~/.wxeasy/all_keys.json`（`source: frida_aesni_set_key`）
+
+**覆盖率提示：** 只有「捕获窗口内被触达」的库会出钥。请在运行期间切换会话、打开联系人/朋友圈/收藏/搜索等；重新登录通常能一次拉起更多库。未触达的库会留在输出的 `missing` 列表中，可加长 `--seconds` 再跑或与已有 `all_keys.json` 合并。
+
+### 8.3 仍不在保证范围内的事
+
+1. **`wxeasy init` 内置被动内存扫描**在 4.1.10+ 冷启动成功（无 hook、无历史 keys）。  
 2. 未授权访问他人微信数据。  
-3. 绕过账号登录态去「远程偷钥」。  
-4. 依赖已 DMCA 下架的第三方闭源提钥工具（上游随时消失，勿作为唯一备份链）。
+3. 绕过账号登录态「远程偷钥」。  
+4. 依赖已下架第三方闭源提钥工具作为唯一备份链。  
+5. Frida 脚本在 **所有** 微信小版本上的 RVA/特征 100% 命中（特征扫描会尽量自适应，大改版仍可能要更新）。
 
-**可能的未来方向（研究级，未产品化）：** 在 SQLCipher/WCDB **设钥瞬间** 做动态 hook（例如针对 `roam_server` / cipher 配置路径），在 key 写入后、内存安全清零前截取 32 字节。这与「全进程字符串扫描」不是同一条技术路线。
+**务实策略：**
 
-**务实替代：**
-
-- 在仍可扫描的旧客户端上完成一次 `init`，备份 `all_keys.json`，再升级；或  
-- 长期保管已校验的 `all_keys.json`（密钥未轮换则持续有效）。
+- 优先保管已校验的 `all_keys.json`（密钥未轮换则长期有效）；  
+- 冷启动 / 丢钥：用 §8.2 动态捕获补齐，再 `wxeasy init`；  
+- 升级微信前备份 `~/.wxeasy/`。
 
 ---
 
@@ -263,6 +306,7 @@ wxeasy init --force
 | 扫描失败后的校验复用 | `src/cli/init.rs`（`reuse_verified_keys`） |
 | `MyDocument:` 等路径与 `xwechat_files` 回退扫描 | `src/config.rs` |
 | 配置与密钥目录 | `~/.wxeasy/`（`config.json`、`all_keys.json`） |
+| 4.1.10+ Frida AES-NI 动态提钥（可选） | `tools/frida_capture_keys.py` |
 
 ---
 

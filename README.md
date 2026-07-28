@@ -135,7 +135,7 @@ sudo wxeasy init
 wxeasy init
 ```
 
-> **Windows 微信 4.1.10+ 说明**：磁盘加密格式未变，但进程内存中往往不再常驻 `x'<key><salt>'` / 明文 raw key，**纯冷启动扫内存可能 0 命中**。`init` 会在扫描不足时 **page1 强校验复用** `~/.wxeasy/all_keys.json`（并兼容 `~/.wx-cli/all_keys.json`）。升级微信前请备份该文件。详见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
+> **Windows 微信 4.1.10+ 说明**：磁盘加密格式未变，但进程内存中往往不再常驻 `x'<key><salt>'` / 明文 raw key，**纯冷启动扫内存可能 0 命中**。`init` 会在扫描不足时 **page1 强校验复用** `~/.wxeasy/all_keys.json`（并兼容 `~/.wx-cli/all_keys.json`）。升级微信前请备份该文件。无历史密钥时可用可选工具 [`tools/frida_capture_keys.py`](tools/frida_capture_keys.py) 在 AES-NI 设钥瞬间动态捕获（需本机已登录微信）。详见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
 
 验证安装：
 
@@ -344,7 +344,7 @@ daemon 首次解密后将数据库和 mtime 持久化到 `~/.wxeasy/cache/`。�
 
 历史上 WCDB/SQLCipher 可能在进程内存中留下 `x'<64hex_key><32hex_salt>'` 一类特征串。wxeasy 通过 macOS Mach VM API（`mach_vm_region` + `mach_vm_read`）、Linux `/proc/<pid>/mem` 或 Windows `VirtualQueryEx` + `ReadProcessMemory`（需要 `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION`）扫描微信进程内存并匹配密钥，daemon 按需解密并缓存。
 
-**Windows 4.1.10+** 常见启用内存密钥保护（如 `cipher_memory_security`）：稳态甚至登录短窗内可读内存中往往 **不再** 暴露可用 raw key，经典扫描会 0 命中。此时 `wxeasy init` 会 **校验复用** 本机已有 `all_keys.json`（page1 魔数强校验，避免弱校验假阳性）。磁盘侧参数与旧密钥兼容时，**重启微信不会使已保存密钥失效**。完整说明见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
+**Windows 4.1.10+** 常见启用内存密钥保护（如 `cipher_memory_security`）：稳态甚至登录短窗内可读内存中往往 **不再** 暴露可用 raw key，经典扫描会 0 命中。此时 `wxeasy init` 会 **校验复用** 本机已有 `all_keys.json`（page1 魔数强校验，避免弱校验假阳性）。磁盘侧参数与旧密钥兼容时，**重启微信不会使已保存密钥失效**。若完全没有历史密钥，可用 [`tools/frida_capture_keys.py`](tools/frida_capture_keys.py) hook OpenSSL `aesni_set_encrypt_key`（AES-256）在库被使用时截取 raw key，再 `--merge` 回 `all_keys.json`。完整说明见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
 
 ---
 
