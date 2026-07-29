@@ -53,11 +53,15 @@ brew install mingw-w64   # 提供 x86_64-w64-mingw32-gcc，zstd-sys 等 C 依赖
 
 ## CI 结构
 
+自 v0.3.3 起只构建并发布 **Windows** 版本（`release.yml`）：
+
 ```
-check job（ubuntu）
-  └── cargo check --target linux-x86, linux-arm64, windows-x86
-        ↓ 通过后
-build jobs（5平台并行）
-        ↓ 全部通过后
-publish-npm job
+build job（windows-latest）
+  ├── cargo build --release --locked --target x86_64-pc-windows-msvc
+  ├── 打包 wxeasy-windows-x86_64.exe → upload-artifact
+  └── 打 tag 时上传到 GitHub Release（softprops/action-gh-release）
 ```
+
+- 触发：push main（仅构建验证，不发布）/ push tag `v*`（构建 + 发布）/ workflow_dispatch。
+- 已停用：mac/Linux 构建、独立 check job、整套 npm 发布（`publish-npm`）。
+- 注意：源码仍保留 macOS/Linux 的 `#[cfg]` 分支，本地改动仍按上面「平台兼容性检查清单」做跨平台 `cargo check`；CI 不再产出非 Windows 二进制。
