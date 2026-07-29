@@ -65,3 +65,5 @@ build job（windows-latest）
 - 触发：push main（仅构建验证，不发布）/ push tag `v*`（构建 + 发布）/ workflow_dispatch。
 - 已停用：mac/Linux 构建、独立 check job、整套 npm 发布（`publish-npm`）。
 - 注意：源码仍保留 macOS/Linux 的 `#[cfg]` 分支，本地改动仍按上面「平台兼容性检查清单」做跨平台 `cargo check`；CI 不再产出非 Windows 二进制。
+- **坑：workflow 可能处于 `disabled_manually` 状态**——此时 push/tag 都不触发任何 run（表现为「推了没反应」）。先 `gh workflow list --all` 看状态，禁用了就 `gh workflow enable Release` 重新启用，再用 `gh workflow run Release --ref main` 手动补跑。
+- action 运行时须为 **node24**（GitHub 已弃用 node20，否则 Actions 报警告）：当前锁 `checkout@v5`、`cache@v5`、`upload-artifact@v7`、`softprops/action-gh-release@v3`。反直觉点：`upload-artifact@v5` 仍是 node20，必须用 v7；升版本前先 `gh api repos/<owner>/<action>/contents/action.yml?ref=<tag> --jq .content | base64 -d | grep using:` 逐个核实运行时。
