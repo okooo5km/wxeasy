@@ -71,6 +71,9 @@ windows = { version = "0.58", features = [
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
     "Win32_System_Threading",
+    # live-hook 提钥（src/scanner/windows_live）：CONTEXT 结构与 Get-/SetThreadContext
+    # 在 windows 0.58 里 gated 于此 feature，硬件断点读写线程上下文必须启用。
+    "Win32_System_Kernel",
     "Win32_Foundation",
     "Win32_System_Memory",
     # 命名管道占用诊断（src/pipe_diag.rs）：CreateFileW 探测管道 +
@@ -81,6 +84,11 @@ windows = { version = "0.58", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Pipes",
 ] }
+
+# PE 解析：定位 Weixin.dll 中的 AES-NI 密钥扩展函数（aeskeygenassist 特征 +
+# .pdata 函数边界），纯 Rust、无 C 依赖，仅 Windows live-hook 提钥使用。放在
+# windows target 依赖内，Linux/macOS 的 cargo check 不会拉取。
+object = { version = "0.36", default-features = false, features = ["read_core", "pe", "std"] }
 
 [profile.release]
 opt-level = 3

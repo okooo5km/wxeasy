@@ -39,11 +39,17 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 初始化：检测数据目录并扫描加密密钥
+    /// 初始化：检测数据目录并扫描加密密钥（自动判断稳态扫描 / 实时断点提钥）
     Init {
         /// 强制重新扫描（覆盖已有配置）
         #[arg(long)]
         force: bool,
+        /// 实时提钥（增量）：附加已登录微信，在开库瞬间抓密钥（微信 4.1.10+，仅 Windows，需管理员）
+        #[arg(long)]
+        live: bool,
+        /// 实时提钥（全量）：以调试模式重新带起微信，登录同步一次抓齐（仅 Windows，需管理员）
+        #[arg(long)]
+        relaunch: bool,
     },
     /// 列出最近会话
     Sessions {
@@ -357,7 +363,11 @@ fn dispatch(cli: Cli) -> Result<()> {
     let base_with_meta = cli.with_meta;
     let base_debug_source = cli.debug_source;
     match cli.command {
-        Commands::Init { force } => init::cmd_init(force),
+        Commands::Init {
+            force,
+            live,
+            relaunch,
+        } => init::cmd_init(force, live, relaunch),
         Commands::Sessions { limit, json } => sessions::cmd_sessions(
             limit,
             OutputOpts {

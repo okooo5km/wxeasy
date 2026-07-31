@@ -1,16 +1,17 @@
 use anyhow::{Context, Result};
 use serde_json::json;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use crate::config;
 use crate::scanner;
 
-pub fn cmd_init(force: bool) -> Result<()> {
+pub fn cmd_init(force: bool, live: bool, relaunch: bool) -> Result<()> {
     // 查找 config.json
     let config_path = find_or_create_config_path();
 
-    // 检查是否已初始化
-    if !force && config_path.exists() {
+    // 检查是否已初始化。显式 --live/--relaunch 意味着要重新抓，跳过短路。
+    if !force && !live && !relaunch && config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
                 let db_dir = cfg.get("db_dir").and_then(|v| v.as_str()).unwrap_or("");
@@ -39,28 +40,10 @@ pub fn cmd_init(force: bool) -> Result<()> {
         .context("未能自动检测到微信数据目录\n请手动编辑 config.json 中的 db_dir 字段")?;
     println!("找到数据目录: {}", db_dir.display());
 
-    // Step 2: 扫描密钥（需要 root/sudo）
-    println!("扫描加密密钥（需要管理员/root 权限）...");
-    let mut entries = scanner::scan_keys(&db_dir).unwrap_or_else(|e| {
-        eprintln!("内存扫描失败: {}", e);
-        Vec::new()
-    });
-
-    // 4.1.10+：进程内存可能不再常驻 x'<key><salt>' / 明文 raw key。
-    // 扫描为空或明显不全时，尝试复用本机已有 all_keys（经 page1 强校验）。
-    let expected_dbs = scanner::collect_db_salts(&db_dir).len();
-    if entries.len() < expected_dbs || entries.is_empty() {
-        println!(
-            "内存扫描命中 {}/{}，尝试复用本机已有密钥并校验...",
-            entries.len(),
-            expected_dbs
-        );
-        let reused = reuse_verified_keys(&db_dir, &config_path, &entries);
-        if reused.len() > entries.len() {
-            println!("校验复用后可用密钥: {}/{}", reused.len(), expected_dbs);
-            entries = reused;
-        }
-    }
+    // Step 2: 获取密钥。自动判断处理方式——
+    //   · 默认：旧稳态扫描 → 历史复用补缺 →（Windows 且仍不足）自动实时断点抓取；
+    //   · --live：附加已登录微信实时抓（增量）；--relaunch：带起微信一次抓齐（全量）。
+    let entries = acquire_keys(&db_dir, &config_path, live, relaunch)?;
 
     if entries.is_empty() {
         anyhow::bail!(
@@ -93,18 +76,8 @@ pub fn cmd_init(force: bool) -> Result<()> {
     }
 
     // Step 3: 保存 all_keys.json
-    let keys_file_path = config_path.parent()
-        .unwrap_or(std::path::Path::new("."))
-        .join("all_keys.json");
-
-    let mut keys_json = serde_json::Map::new();
-    for entry in &entries {
-        keys_json.insert(entry.db_name.clone(), json!({
-            "enc_key": entry.enc_key,
-        }));
-    }
-    std::fs::write(&keys_file_path, serde_json::to_string_pretty(&keys_json)?)
-        .context("写入 all_keys.json 失败")?;
+    let keys_file_path = keys_file_path_of(&config_path);
+    persist_keys(&keys_file_path, &entries)?;
     println!("成功准备 {} 个数据库密钥", entries.len());
     println!("密钥已保存: {}", keys_file_path.display());
 
@@ -228,6 +201,166 @@ fn drop_privileges_if_sudo() -> Result<()> {
         Ok(())
     }
 
+    Ok(())
+}
+
+/// 获取密钥的决策入口：保留旧稳态扫描，自动判断是否升级到实时断点提钥。
+///
+/// - 显式 `--live` / `--relaunch`：直接走 live-hook（增量 / 全量），失败上抛。
+/// - 默认：旧稳态扫描 → 历史 all_keys 校验复用补缺 →（仅 Windows 且仍不足）自动
+///   附加微信实时抓取。旧版本（≤4.1.9）稳态扫描即可全中，不会触发 live。
+fn acquire_keys(
+    db_dir: &Path,
+    config_path: &Path,
+    live: bool,
+    relaunch: bool,
+) -> Result<Vec<scanner::KeyEntry>> {
+    let expected = scanner::collect_db_salts(db_dir).len();
+
+    // 显式实时抓取
+    if live || relaunch {
+        let mode = if relaunch {
+            scanner::LiveMode::Relaunch
+        } else {
+            scanner::LiveMode::Attach
+        };
+        return live_flow(db_dir, config_path, mode, expected);
+    }
+
+    // 默认：旧稳态扫描（≤4.1.9 直接全中；4.1.10+ 常 0 命中）
+    println!("扫描加密密钥（需要管理员/root 权限）...");
+    let mut entries = scanner::scan_keys(db_dir).unwrap_or_else(|e| {
+        eprintln!("内存扫描失败: {}", e);
+        Vec::new()
+    });
+
+    // 历史 all_keys.json 校验复用补缺
+    if entries.len() < expected {
+        println!(
+            "内存扫描命中 {}/{}，尝试复用本机已有密钥并校验...",
+            entries.len(),
+            expected
+        );
+        let reused = reuse_verified_keys(db_dir, config_path, &entries);
+        if reused.len() > entries.len() {
+            println!("校验复用后可用密钥: {}/{}", reused.len(), expected);
+            entries = reused;
+        }
+    }
+
+    // 仍不足 → 自动升级到实时断点抓取（仅 Windows，微信 4.1.10+）
+    #[cfg(target_os = "windows")]
+    {
+        if entries.len() < expected {
+            println!();
+            println!(
+                "稳态扫描 + 历史复用得到 {}/{} 个密钥，判断微信可能为 4.1.10+（内存密钥用完即擦）。",
+                entries.len(),
+                expected
+            );
+            println!("自动切换到实时断点抓取，补齐缺失的库……");
+            // 保命：先把已拿到的落盘，避免实时抓取被中断时丢失
+            if !entries.is_empty() {
+                let _ = persist_keys(&keys_file_path_of(config_path), &entries);
+            }
+            match scanner::capture_keys_live(db_dir, scanner::LiveMode::Attach, &entries) {
+                Ok(mut live_found) => {
+                    merge_entries(&mut entries, live_found.drain(..));
+                    if entries.len() < expected {
+                        let reused = reuse_verified_keys(db_dir, config_path, &entries);
+                        if reused.len() > entries.len() {
+                            entries = reused;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("实时抓取未完成：{}", e);
+                    eprintln!(
+                        "可稍后启动并登录微信后运行 `wxeasy init --live` 增量补齐，\n\
+                         或 `wxeasy init --relaunch` 一次带起抓齐。"
+                    );
+                }
+            }
+        }
+    }
+
+    Ok(entries)
+}
+
+/// 显式实时抓取流程。
+///
+/// **先**用历史 all_keys.json 校验复用垫底，再把已可用的库作为 `existing` 传给
+/// live-hook——否则 Attach 模式下微信登录时已开过的库不会再触发开库，`done` 永远
+/// 到不了 `total`，事件循环会空转到用户 Ctrl-C，且补缺发生在抓取之后而永不执行。
+fn live_flow(
+    db_dir: &Path,
+    config_path: &Path,
+    mode: scanner::LiveMode,
+    expected: usize,
+) -> Result<Vec<scanner::KeyEntry>> {
+    // 历史复用垫底：让 live 只针对真正缺失的库
+    let mut entries = reuse_verified_keys(db_dir, config_path, &[]);
+    if !entries.is_empty() {
+        println!(
+            "历史密钥校验复用 {}/{} 个，实时抓取只针对缺失的库。",
+            entries.len(),
+            expected
+        );
+    }
+    if entries.len() >= expected {
+        println!("历史密钥已覆盖全部库，无需实时抓取。");
+        return Ok(entries);
+    }
+
+    // 保命：抓取前先把已复用的落盘，避免实时抓取被 Ctrl-C 中断时丢失
+    let _ = persist_keys(&keys_file_path_of(config_path), &entries);
+
+    let live_found = scanner::capture_keys_live(db_dir, mode, &entries)?;
+    merge_entries(&mut entries, live_found.into_iter());
+
+    // 抓取后再复用补缺（幂等兜底）
+    if entries.len() < expected {
+        let reused = reuse_verified_keys(db_dir, config_path, &entries);
+        if reused.len() > entries.len() {
+            entries = reused;
+        }
+    }
+    Ok(entries)
+}
+
+/// 把新抓到的密钥并入 base（按 db_name 去重，已有的不覆盖）。
+fn merge_entries(
+    base: &mut Vec<scanner::KeyEntry>,
+    extra: impl Iterator<Item = scanner::KeyEntry>,
+) {
+    use std::collections::HashSet;
+    let mut names: HashSet<String> = base.iter().map(|e| e.db_name.clone()).collect();
+    for e in extra {
+        if names.insert(e.db_name.clone()) {
+            base.push(e);
+        }
+    }
+}
+
+/// all_keys.json 的落盘路径（config.json 同目录）。
+fn keys_file_path_of(config_path: &Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("all_keys.json")
+}
+
+/// 把密钥写入 all_keys.json（`{db_name: {enc_key}}`）。
+fn persist_keys(keys_file_path: &Path, entries: &[scanner::KeyEntry]) -> Result<()> {
+    let mut keys_json = serde_json::Map::new();
+    for entry in entries {
+        keys_json.insert(entry.db_name.clone(), json!({ "enc_key": entry.enc_key }));
+    }
+    if let Some(parent) = keys_file_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    std::fs::write(keys_file_path, serde_json::to_string_pretty(&keys_json)?)
+        .context("写入 all_keys.json 失败")?;
     Ok(())
 }
 

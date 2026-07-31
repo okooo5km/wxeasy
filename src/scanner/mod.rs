@@ -8,6 +8,8 @@ mod macos;
 mod linux;
 #[cfg(target_os = "windows")]
 mod windows;
+#[cfg(target_os = "windows")]
+mod windows_live;
 
 /// 扫描到的一条密钥记录
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +36,40 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     {
         anyhow::bail!("当前平台不支持自动密钥扫描")
     }
+}
+
+/// live-hook 抓取模式（微信 4.1.10+，仅 Windows 有实现）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveMode {
+    /// 附加已登录的微信，靠日常使用 / 同步逐步抓齐（增量）。
+    Attach,
+    /// 以调试模式重新带起微信，登录同步一次抓全（全量）。
+    Relaunch,
+}
+
+/// 用调试器 + 硬件断点在开库瞬间截获 raw key（微信 4.1.10+，仅 Windows）。
+///
+/// - `mode`：附加已运行微信（增量）或带起微信（全量）。
+/// - `existing`：已可用的密钥，对应库会被跳过，只抓仍缺的库。
+///
+/// 返回本次新抓到的密钥（不含 `existing`）。需要管理员权限。
+#[cfg(target_os = "windows")]
+pub fn capture_keys_live(
+    db_dir: &Path,
+    mode: LiveMode,
+    existing: &[KeyEntry],
+) -> Result<Vec<KeyEntry>> {
+    windows_live::run_capture(db_dir, mode, existing)
+}
+
+/// 非 Windows 平台：live-hook 暂不支持（保留旧稳态扫描路径）。
+#[cfg(not(target_os = "windows"))]
+pub fn capture_keys_live(
+    _db_dir: &Path,
+    _mode: LiveMode,
+    _existing: &[KeyEntry],
+) -> Result<Vec<KeyEntry>> {
+    anyhow::bail!("live-hook 提钥当前仅支持 Windows（微信 4.1.10+）")
 }
 
 /// 读取 DB 文件前 16 字节作为 salt（hex），如果是明文 SQLite 则返回 None
