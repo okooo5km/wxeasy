@@ -87,8 +87,8 @@ pub fn lookup_md5_blocking(
         )
         .ok();
 
-    let packed: Option<Vec<u8>> = packed_exact.or_else(|| conn
-        .query_row(
+    let packed: Option<Vec<u8>> = packed_exact.or_else(|| {
+        conn.query_row(
             "SELECT packed_info FROM MessageResourceInfo
              WHERE chat_id = ?1
                AND message_local_id = ?2
@@ -98,7 +98,8 @@ pub fn lookup_md5_blocking(
             rusqlite::params![chat_id, local_id, msg_local_type_lo32],
             |row| row.get(0),
         )
-        .ok());
+        .ok()
+    });
 
     let Some(blob) = packed else {
         return Ok(None);
@@ -145,9 +146,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || needle.len() > haystack.len() {
         return None;
     }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 /// 在 `<attach_root>/<md5(chat)>/<YYYY-MM>/Img/<md5>[_t|_h].dat` 下找文件。
@@ -280,7 +279,12 @@ pub fn resolve_blocking(
     )?;
     let size = std::fs::metadata(&dat_path).map(|m| m.len()).unwrap_or(0);
 
-    Ok(ResolvedAttachment { id: id.clone(), md5: meta.md5, dat_path, size })
+    Ok(ResolvedAttachment {
+        id: id.clone(),
+        md5: meta.md5,
+        dat_path,
+        size,
+    })
 }
 
 #[cfg(test)]
@@ -334,11 +338,8 @@ mod tests {
         let dir = tempdir_for_test();
         let db_path = dir.join("message_resource.db");
         let conn = Connection::open(&db_path).unwrap();
-        conn.execute(
-            "CREATE TABLE ChatName2Id (user_name TEXT)",
-            [],
-        )
-        .unwrap();
+        conn.execute("CREATE TABLE ChatName2Id (user_name TEXT)", [])
+            .unwrap();
         conn.execute(
             "INSERT INTO ChatName2Id (rowid, user_name) VALUES (1, 'room@chatroom')",
             [],
@@ -415,13 +416,19 @@ mod tests {
         std::fs::write(img.join(format!("{}_h.dat", md5)), b"hd").unwrap();
         // 只有 _t / _h 时取 _h
         assert_eq!(
-            pick_best_in_img_dir(&img, md5).unwrap().file_name().unwrap(),
+            pick_best_in_img_dir(&img, md5)
+                .unwrap()
+                .file_name()
+                .unwrap(),
             format!("{}_h.dat", md5).as_str()
         );
         // 加 full 后取 full
         std::fs::write(img.join(format!("{}.dat", md5)), b"full").unwrap();
         assert_eq!(
-            pick_best_in_img_dir(&img, md5).unwrap().file_name().unwrap(),
+            pick_best_in_img_dir(&img, md5)
+                .unwrap()
+                .file_name()
+                .unwrap(),
             format!("{}.dat", md5).as_str()
         );
     }

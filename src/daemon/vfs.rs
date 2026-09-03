@@ -50,9 +50,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
-use super::wal_index::{build_wal_index_cached, wal_path_for, WalIndexCache, WalSource};
 #[cfg(test)]
 use super::wal_index::build_wal_index;
+use super::wal_index::{build_wal_index_cached, wal_path_for, WalIndexCache, WalSource};
 
 /// 主库在 `sqlite3_open` 时使用的固定 "路径" 标签。我们的 VFS 完全不理会这个
 /// 字符串对应的真实文件系统路径——加密文件路径、密钥、WAL 索引都直接烘焙进
@@ -117,7 +117,11 @@ pub struct WxVfs {
 }
 
 impl WxVfs {
-    pub fn new(enc_path: PathBuf, key: [u8; 32], tmp_dir: PathBuf) -> (Self, Arc<Mutex<ReadStats>>) {
+    pub fn new(
+        enc_path: PathBuf,
+        key: [u8; 32],
+        tmp_dir: PathBuf,
+    ) -> (Self, Arc<Mutex<ReadStats>>) {
         let stats = Arc::new(Mutex::new(ReadStats::default()));
         let wal_persist_dir = tmp_dir.parent().map(|c| c.join("wal-index"));
         let vfs = WxVfs {
@@ -496,7 +500,13 @@ fn registry() -> &'static Mutex<HashMap<PathBuf, VfsRegistration>> {
 
 fn sanitize_tag(tag: &str) -> String {
     tag.chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
         .collect()
 }
 
@@ -577,7 +587,12 @@ fn ensure_vfs_registered(
 /// 合并视图当成唯一的事实来源。如果不加这个参数，SQLite 会尝试自己去 open
 /// `<label>-wal` / 请求共享内存锁，而我们的 VFS 根本没实现那套接口，会直接
 /// 报 `SQLITE_IOERR_SHMLOCK` 类错误。
-pub fn open_conn(enc_db_path: &Path, key: [u8; 32], tmp_dir: &Path, tag: &str) -> Result<Connection> {
+pub fn open_conn(
+    enc_db_path: &Path,
+    key: [u8; 32],
+    tmp_dir: &Path,
+    tag: &str,
+) -> Result<Connection> {
     Ok(open_conn_with_stats(enc_db_path, key, tmp_dir, tag)?.0)
 }
 
@@ -765,8 +780,13 @@ mod tests {
         std::fs::write(&wal_path, &wal_bytes).unwrap();
 
         // ---- 构造 MergedFile（绕开 Vfs::open，直接测算法本体）----
-        let wal_source = build_wal_index(&wal_path).unwrap().expect("应解析出有效 WalSource");
-        assert_eq!(wal_source.index.frames_valid, 3, "4帧里应有3帧 salt 匹配（排除 bad 帧）");
+        let wal_source = build_wal_index(&wal_path)
+            .unwrap()
+            .expect("应解析出有效 WalSource");
+        assert_eq!(
+            wal_source.index.frames_valid, 3,
+            "4帧里应有3帧 salt 匹配（排除 bad 帧）"
+        );
         assert_eq!(wal_source.index.last_commit_pgcnt(), Some(4));
 
         let main_file = File::open(&main_path).unwrap();
@@ -784,23 +804,24 @@ mod tests {
         // size() 必须反映 WAL 扩展后的 4 页，而不是主库物理的 3 页。
         assert_eq!(wxfile.size().unwrap(), 4 * PAGE_SZ as u64);
 
-        let assert_page = |wxfile: &mut WxFile, pgno: u32, expected_marker: u8, first_page_route: bool| {
-            let mut buf = vec![0u8; PAGE_SZ];
-            wxfile
-                .read_exact_at(&mut buf, (pgno as u64 - 1) * PAGE_SZ as u64)
-                .unwrap();
-            let region = if first_page_route {
-                16..PAGE_SZ - RESERVE_SZ
-            } else {
-                0..PAGE_SZ - RESERVE_SZ
+        let assert_page =
+            |wxfile: &mut WxFile, pgno: u32, expected_marker: u8, first_page_route: bool| {
+                let mut buf = vec![0u8; PAGE_SZ];
+                wxfile
+                    .read_exact_at(&mut buf, (pgno as u64 - 1) * PAGE_SZ as u64)
+                    .unwrap();
+                let region = if first_page_route {
+                    16..PAGE_SZ - RESERVE_SZ
+                } else {
+                    0..PAGE_SZ - RESERVE_SZ
+                };
+                assert!(
+                    buf[region].iter().all(|&b| b == expected_marker),
+                    "pgno={} 期望 marker={}，实际内容不匹配",
+                    pgno,
+                    expected_marker
+                );
             };
-            assert!(
-                buf[region].iter().all(|&b| b == expected_marker),
-                "pgno={} 期望 marker={}，实际内容不匹配",
-                pgno,
-                expected_marker
-            );
-        };
 
         // pgno=1：应读到 WAL 覆盖版本（marker=101），不是主库原始的 marker=1。
         assert_page(&mut wxfile, 1, 101, true);
@@ -881,9 +902,7 @@ mod tests {
         });
 
         let mut buf = vec![0xAAu8; PAGE_SZ]; // 非零哨兵
-        wxfile
-            .read_exact_at(&mut buf, PAGE_SZ as u64)
-            .unwrap();
+        wxfile.read_exact_at(&mut buf, PAGE_SZ as u64).unwrap();
         assert!(
             buf.iter().all(|&b| b == 0),
             "洞页必须是全零明文，不能是 decrypt_page(全零密文) 的垃圾输出"
@@ -942,12 +961,20 @@ mod tests {
         std::fs::write(&main_path, &main_p1).unwrap();
         let tmp_dir = tmp_path("idempotent-tmp");
 
-        let (name1, stats1) = ensure_vfs_registered(&main_path, key, &tmp_dir, "idempotent-test").unwrap();
-        let (name2, stats2) = ensure_vfs_registered(&main_path, key, &tmp_dir, "idempotent-test").unwrap();
+        let (name1, stats1) =
+            ensure_vfs_registered(&main_path, key, &tmp_dir, "idempotent-test").unwrap();
+        let (name2, stats2) =
+            ensure_vfs_registered(&main_path, key, &tmp_dir, "idempotent-test").unwrap();
         let (name3, stats3) =
             ensure_vfs_registered(&main_path, key, &tmp_dir, "different-tag-ignored").unwrap();
-        assert_eq!(name1, name2, "同一物理路径重复调用必须复用同一个已注册 VFS 名字");
-        assert_eq!(name1, name3, "第二次调用的 tag 不应影响已注册路径的复用结果");
+        assert_eq!(
+            name1, name2,
+            "同一物理路径重复调用必须复用同一个已注册 VFS 名字"
+        );
+        assert_eq!(
+            name1, name3,
+            "第二次调用的 tag 不应影响已注册路径的复用结果"
+        );
         assert!(
             Arc::ptr_eq(&stats1, &stats2) && Arc::ptr_eq(&stats1, &stats3),
             "复用同一个已注册 VFS 时，stats 句柄也必须是同一个 Arc（累计统计共享）"
@@ -980,7 +1007,10 @@ mod tests {
             panic!("intentional poison for test");
         })
         .join();
-        assert!(poison_result.is_err(), "生产线程应该真的 panic 了，否则这个测试没有制造出 poison");
+        assert!(
+            poison_result.is_err(),
+            "生产线程应该真的 panic 了，否则这个测试没有制造出 poison"
+        );
 
         let (name_after, _stats_after) =
             ensure_vfs_registered(&main_path, key, &tmp_dir, "poison-after").expect(

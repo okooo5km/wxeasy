@@ -40,7 +40,8 @@ fn open_plain(path: &Path) -> Result<Connection> {
 }
 
 fn list_tables(conn: &Connection) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
+    let mut stmt =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for r in rows {
@@ -177,9 +178,18 @@ struct CaseSpec {
 /// 之后都只读这同一份复制品，不影响"两条路径读同一份输入是否一致"这个核心断言。
 fn stage_case(spec: &CaseSpec, scratch_root: &Path) -> Result<(DbCache, String)> {
     let real_db_path = PathBuf::from(env_or(spec.db_env, &spec.db_default));
-    anyhow::ensure!(real_db_path.exists(), "{} 不存在: {:?}", spec.db_env, real_db_path);
-    let key_hex = std::env::var(spec.key_env)
-        .with_context(|| format!("需要设置环境变量 {}（{} 的 32 字节十六进制密钥）", spec.key_env, spec.rel_key))?;
+    anyhow::ensure!(
+        real_db_path.exists(),
+        "{} 不存在: {:?}",
+        spec.db_env,
+        real_db_path
+    );
+    let key_hex = std::env::var(spec.key_env).with_context(|| {
+        format!(
+            "需要设置环境变量 {}（{} 的 32 字节十六进制密钥）",
+            spec.key_env, spec.rel_key
+        )
+    })?;
 
     let case_dir = scratch_root.join(spec.name);
     let db_dir = case_dir.join("db_storage");
@@ -270,8 +280,9 @@ fn run_oracle_case(spec: &CaseSpec, scratch_root: &Path) -> Result<()> {
     //      Msg_ 前缀，session.db 不限定）。
     let max_table = pick_max_table(&oracle_counts, spec.max_table_prefix)
         .with_context(|| format!("[{}] 没有可用的表做 latest-N 对拍", spec.name))?;
-    let (id_col, time_col) = pick_id_time_columns(&oracle_conn, &max_table, spec.prefer_msg_style_columns)?
-        .with_context(|| format!("[{}] 表 {} 找不到可用的时间/标识列", spec.name, max_table))?;
+    let (id_col, time_col) =
+        pick_id_time_columns(&oracle_conn, &max_table, spec.prefer_msg_style_columns)?
+            .with_context(|| format!("[{}] 表 {} 找不到可用的时间/标识列", spec.name, max_table))?;
 
     let limit = 20usize;
     let oracle_rows = latest_rows(&oracle_conn, &max_table, &id_col, &time_col, limit)?;
@@ -407,10 +418,14 @@ async fn live_wal_create_table_visible_through_migrated_conn_params_path() {
 
     // 这就是 query.rs 迁移后真正使用的调用序列：async 上下文里同步拿
     // ConnParams，move 进 spawn_blocking，闭包内部 `.open()` 建连接、查询、销毁。
-    let conn_params = db.conn_params(rel_key).expect("conn_params 应成功解析（key/文件都存在）");
+    let conn_params = db
+        .conn_params(rel_key)
+        .expect("conn_params 应成功解析（key/文件都存在）");
     let (table_exists, live_count, name2id_count): (bool, i64, i64) =
         tokio::task::spawn_blocking(move || {
-            let conn = conn_params.open().expect("迁移后集成路径打开活体 WAL 快照失败（NOTADB？）");
+            let conn = conn_params
+                .open()
+                .expect("迁移后集成路径打开活体 WAL 快照失败（NOTADB？）");
 
             let exists: Option<i64> = conn
                 .query_row(
@@ -460,8 +475,9 @@ async fn oracle_session_open_conn_matches_full_decrypt() {
         name: "session",
         rel_key: "session/session.db",
         db_env: "WX_SESSION_DB",
-        db_default: r"C:\Users\okooo\Documents\xwechat_files\a1206407149_c11a\db_storage\session\session.db"
-            .to_string(),
+        db_default:
+            r"C:\Users\okooo\Documents\xwechat_files\a1206407149_c11a\db_storage\session\session.db"
+                .to_string(),
         key_env: "WX_SESSION_KEY",
         max_table_prefix: None,
         prefer_msg_style_columns: false,

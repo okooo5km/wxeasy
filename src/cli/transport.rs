@@ -86,8 +86,7 @@ pub fn stop_daemon() -> Result<()> {
                 // 保证 `daemon stop` 一旦返回，紧接着的任何命令看到的都是
                 // 干净状态（要么连不上 ⇒ 正常拉起新 daemon，绝不会 ping 到
                 // 半死的旧实例）。
-                let deadline =
-                    std::time::Instant::now() + Duration::from_millis(STOP_TIMEOUT_MS);
+                let deadline = std::time::Instant::now() + Duration::from_millis(STOP_TIMEOUT_MS);
                 while std::time::Instant::now() < deadline && is_alive() {
                     std::thread::sleep(Duration::from_millis(50));
                 }
@@ -226,10 +225,7 @@ fn start_daemon() -> Result<()> {
             msg.push_str(&hint);
         }
     }
-    msg.push_str(&format!(
-        "\n\n请查看日志: {}",
-        config::log_path().display()
-    ));
+    msg.push_str(&format!("\n\n请查看日志: {}", config::log_path().display()));
     bail!("{}", msg)
 }
 
@@ -516,8 +512,7 @@ pub fn send(req: Request) -> Result<Response> {
 
 /// 是否属于「连接建立失败」（而非业务错误 / 协议错误）。
 fn is_connect_failure(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.to_string().contains("连接 daemon"))
+    e.chain().any(|c| c.to_string().contains("连接 daemon"))
 }
 
 fn send_platform(req: &Request) -> Result<Response> {

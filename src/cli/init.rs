@@ -15,14 +15,20 @@ pub fn cmd_init(force: bool, live: bool, relaunch: bool) -> Result<()> {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
                 let db_dir = cfg.get("db_dir").and_then(|v| v.as_str()).unwrap_or("");
-                let keys_file = cfg.get("keys_file").and_then(|v| v.as_str()).unwrap_or("all_keys.json");
+                let keys_file = cfg
+                    .get("keys_file")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("all_keys.json");
                 let keys_path = if std::path::Path::new(keys_file).is_absolute() {
                     std::path::PathBuf::from(keys_file)
                 } else {
-                    config_path.parent().unwrap_or(std::path::Path::new("."))
+                    config_path
+                        .parent()
+                        .unwrap_or(std::path::Path::new("."))
                         .join(keys_file)
                 };
-                if !db_dir.is_empty() && !db_dir.contains("your_wxid")
+                if !db_dir.is_empty()
+                    && !db_dir.contains("your_wxid")
                     && std::path::Path::new(db_dir).exists()
                     && keys_path.exists()
                 {
@@ -94,8 +100,10 @@ pub fn cmd_init(force: bool, live: bool, relaunch: bool) -> Result<()> {
         }
     }
     cfg.insert("db_dir".into(), json!(db_dir.to_string_lossy()));
-    cfg.entry("keys_file".into()).or_insert_with(|| json!("all_keys.json"));
-    cfg.entry("decrypted_dir".into()).or_insert_with(|| json!("decrypted"));
+    cfg.entry("keys_file".into())
+        .or_insert_with(|| json!("all_keys.json"));
+    cfg.entry("decrypted_dir".into())
+        .or_insert_with(|| json!("decrypted"));
 
     std::fs::write(&config_path, serde_json::to_string_pretty(&cfg)?)
         .context("写入 config.json 失败")?;
@@ -155,7 +163,9 @@ fn drop_privileges_if_sudo() -> Result<()> {
     }
 
     // 设置 umask，让后续 create 出来的文件/目录默认是 0600 / 0700。
-    unsafe { libc::umask(0o077); }
+    unsafe {
+        libc::umask(0o077);
+    }
 
     // 必须先 setgid 再 setuid：一旦 uid 降下来就没法再改 gid 了。
     unsafe {
@@ -179,8 +189,9 @@ fn drop_privileges_if_sudo() -> Result<()> {
         Ok(())
     }
     fn chown_one(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-        let c = CString::new(path.as_os_str().as_bytes())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))?;
+        let c = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL")
+        })?;
         if unsafe { libc::chown(c.as_ptr(), uid, gid) } != 0 {
             return Err(std::io::Error::last_os_error());
         }

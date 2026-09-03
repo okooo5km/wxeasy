@@ -16,8 +16,8 @@ use crate::config;
 
 use super::{
     attach_root_for_db_dir, configured_db_dir_for_wxid, derive_xor_key_from_v2_dat,
-    find_v2_template_ciphertexts, join_components, normalize_wxid, verify_aes_key, wxid_from_db_dir,
-    ImageKeyMaterial, ImageKeyProvider,
+    find_v2_template_ciphertexts, join_components, normalize_wxid, verify_aes_key,
+    wxid_from_db_dir, ImageKeyMaterial, ImageKeyProvider,
 };
 
 pub struct MacosImageKeyProvider {
@@ -132,7 +132,11 @@ fn extract_wxid_parts(db_dir: &Path) -> Option<(String, String, String)> {
     if suffix.len() != 4 || !suffix.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    Some((raw.clone(), normalize_wxid(&raw), suffix.to_ascii_lowercase()))
+    Some((
+        raw.clone(),
+        normalize_wxid(&raw),
+        suffix.to_ascii_lowercase(),
+    ))
 }
 
 fn preferred_wxid_candidates<'a>(raw: &'a str, normalized: &'a str) -> Vec<&'a str> {
@@ -167,7 +171,9 @@ fn derive_kvcomm_dir_candidates(db_dir: &Path) -> Vec<PathBuf> {
     }
     if let Some(home) = dirs::home_dir() {
         candidates.push(
-            home.join("Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/kvcomm"),
+            home.join(
+                "Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/kvcomm",
+            ),
         );
     }
 
@@ -278,8 +284,8 @@ fn hex_prefix_to_bytes(hex: &str) -> Result<[u8; 2]> {
 
 #[cfg(test)]
 mod tests {
-    use super::{derive_key_for_paths, find_existing_kvcomm_dir};
     use super::collect_wxid_candidates;
+    use super::{derive_key_for_paths, find_existing_kvcomm_dir};
     use crate::attachment::image_key::normalize_wxid;
     use aes::cipher::{generic_array::GenericArray, BlockEncrypt, KeyInit};
     use aes::Aes128;
@@ -328,9 +334,8 @@ mod tests {
         let db_dir = dir.join(
             "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/your_wxid_a1b2/db_storage",
         );
-        let kvcomm = dir.join(
-            "Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/kvcomm",
-        );
+        let kvcomm =
+            dir.join("Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/kvcomm");
         fs::create_dir_all(&db_dir).unwrap();
         fs::create_dir_all(&kvcomm).unwrap();
         assert_eq!(find_existing_kvcomm_dir(&db_dir), Some(kvcomm));
@@ -346,9 +351,8 @@ mod tests {
         let attach = dir.join(
             "Library/Containers/com.tencent.xinWeChat/Data/Documents/xwechat_files/your_wxid_a1b2/msg/attach/chat/2026-05/Img",
         );
-        let kvcomm = dir.join(
-            "Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/kvcomm",
-        );
+        let kvcomm =
+            dir.join("Library/Containers/com.tencent.xinWeChat/Data/Documents/app_data/net/kvcomm");
         fs::create_dir_all(&db_dir).unwrap();
         fs::create_dir_all(&kvcomm).unwrap();
         fs::write(kvcomm.join("key_42_x.statistic"), b"").unwrap();
@@ -363,8 +367,11 @@ mod tests {
             b"\xFF\xD8\xFFtemplate-001!",
         );
 
-        let derived = derive_key_for_paths(&db_dir, db_dir.parent().unwrap().join("msg/attach").as_path())
-            .unwrap();
+        let derived = derive_key_for_paths(
+            &db_dir,
+            db_dir.parent().unwrap().join("msg/attach").as_path(),
+        )
+        .unwrap();
         assert_eq!(derived.aes_key, aes_key);
         assert_eq!(derived.xor_key, 42);
 
@@ -401,8 +408,11 @@ mod tests {
             );
         }
 
-        let derived = derive_key_for_paths(&db_dir, db_dir.parent().unwrap().join("msg/attach").as_path())
-            .unwrap();
+        let derived = derive_key_for_paths(
+            &db_dir,
+            db_dir.parent().unwrap().join("msg/attach").as_path(),
+        )
+        .unwrap();
         assert_eq!(derived.aes_key, aes_key);
         assert_eq!(derived.xor_key, 42);
 
@@ -417,7 +427,10 @@ mod tests {
         );
         fs::create_dir_all(&db_dir).unwrap();
         let wxids = collect_wxid_candidates(&db_dir);
-        assert_eq!(wxids, vec!["your_wxid_a1b2".to_string(), "your_wxid".to_string()]);
+        assert_eq!(
+            wxids,
+            vec!["your_wxid_a1b2".to_string(), "your_wxid".to_string()]
+        );
         let _ = fs::remove_dir_all(dir);
     }
 }

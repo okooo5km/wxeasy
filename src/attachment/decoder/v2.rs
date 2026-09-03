@@ -22,16 +22,20 @@ const HEADER_SIZE: usize = 15;
 
 pub fn decode(file_bytes: &[u8], key: V2KeyMaterial<'_>) -> Result<DecodedImage> {
     if file_bytes.len() < HEADER_SIZE {
-        bail!("V2 .dat: 文件过短（{} < {} 字节）", file_bytes.len(), HEADER_SIZE);
+        bail!(
+            "V2 .dat: 文件过短（{} < {} 字节）",
+            file_bytes.len(),
+            HEADER_SIZE
+        );
     }
     let magic: &[u8; 6] = file_bytes[..6].try_into().unwrap();
     if magic != &V2_MAGIC && magic != &V1_MAGIC {
         bail!("V2 .dat: header magic 不匹配 V1/V2");
     }
 
-    let aes_key = key.aes_key.ok_or_else(|| {
-        anyhow!("V2 .dat: 需要 image AES key（codex 的 image_key 模块尚未填充）")
-    })?;
+    let aes_key = key
+        .aes_key
+        .ok_or_else(|| anyhow!("V2 .dat: 需要 image AES key（codex 的 image_key 模块尚未填充）"))?;
 
     let aes_size = u32::from_le_bytes(file_bytes[6..10].try_into().unwrap()) as usize;
     let xor_size = u32::from_le_bytes(file_bytes[10..14].try_into().unwrap()) as usize;
@@ -39,7 +43,9 @@ pub fn decode(file_bytes: &[u8], key: V2KeyMaterial<'_>) -> Result<DecodedImage>
     // PKCS7 对齐：aes_size 不是 16 的倍数 → 向上对齐；是 16 的倍数 → 再加一整块
     let aligned_aes_size = aes_size + (16 - (aes_size % 16));
 
-    let aes_end = HEADER_SIZE.checked_add(aligned_aes_size).ok_or_else(|| anyhow!("aes 段长度溢出"))?;
+    let aes_end = HEADER_SIZE
+        .checked_add(aligned_aes_size)
+        .ok_or_else(|| anyhow!("aes 段长度溢出"))?;
     if aes_end > file_bytes.len() {
         bail!(
             "V2 .dat: 头部宣称 aes_size={} (aligned={}) 超过文件长度 {}",
@@ -49,7 +55,11 @@ pub fn decode(file_bytes: &[u8], key: V2KeyMaterial<'_>) -> Result<DecodedImage>
         );
     }
     let raw_end = file_bytes.len().checked_sub(xor_size).ok_or_else(|| {
-        anyhow!("V2 .dat: 头部宣称 xor_size={} 超过文件长度 {}", xor_size, file_bytes.len())
+        anyhow!(
+            "V2 .dat: 头部宣称 xor_size={} 超过文件长度 {}",
+            xor_size,
+            file_bytes.len()
+        )
     })?;
     if aes_end > raw_end {
         bail!(
@@ -67,7 +77,10 @@ pub fn decode(file_bytes: &[u8], key: V2KeyMaterial<'_>) -> Result<DecodedImage>
     let raw_data = &file_bytes[aes_end..raw_end];
 
     // === XOR 段 ===
-    let xor_data: Vec<u8> = file_bytes[raw_end..].iter().map(|b| b ^ key.xor_key).collect();
+    let xor_data: Vec<u8> = file_bytes[raw_end..]
+        .iter()
+        .map(|b| b ^ key.xor_key)
+        .collect();
 
     let mut out = Vec::with_capacity(dec_aes.len() + raw_data.len() + xor_data.len());
     out.extend_from_slice(&dec_aes);
@@ -78,7 +91,11 @@ pub fn decode(file_bytes: &[u8], key: V2KeyMaterial<'_>) -> Result<DecodedImage>
     if format == "bin" {
         bail!("V2 .dat: AES 解密成功但产物 magic 不识别（key 可能错）");
     }
-    Ok(DecodedImage { data: out, format, decoder: "v2" })
+    Ok(DecodedImage {
+        data: out,
+        format,
+        decoder: "v2",
+    })
 }
 
 /// AES-128-ECB 解密 + PKCS7 unpad。失败时返回 `Err`，不返回半结果。

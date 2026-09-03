@@ -41,7 +41,10 @@ pub struct V2KeyMaterial<'a> {
 
 impl<'a> V2KeyMaterial<'a> {
     pub fn with_aes(key: &'a [u8; 16]) -> Self {
-        Self { aes_key: Some(key), xor_key: 0x88 }
+        Self {
+            aes_key: Some(key),
+            xor_key: 0x88,
+        }
     }
 }
 
@@ -59,7 +62,10 @@ pub fn dispatch(dat_bytes: &[u8], v2_key: V2KeyMaterial<'_>) -> Result<DecodedIm
             let fixed_key: [u8; 16] = *b"cfcd208495d565ef";
             return v2::decode(
                 dat_bytes,
-                V2KeyMaterial { aes_key: Some(&fixed_key), xor_key: v2_key.xor_key },
+                V2KeyMaterial {
+                    aes_key: Some(&fixed_key),
+                    xor_key: v2_key.xor_key,
+                },
             )
             .map(|mut d| {
                 d.decoder = "v1_aes";

@@ -220,7 +220,11 @@ pub fn bind_failure_report(err: &std::io::Error) -> Vec<String> {
 }
 
 /// [`bind_failure_report`] 的纯函数内核（探测结果由外部传入，便于单测）。
-fn render_bind_failure(err_display: &str, access_denied: bool, diag: &PipeDiagnosis) -> Vec<String> {
+fn render_bind_failure(
+    err_display: &str,
+    access_denied: bool,
+    diag: &PipeDiagnosis,
+) -> Vec<String> {
     let mut lines = vec![format!("绑定 {PIPE_PATH} 失败: {err_display}")];
     if !access_denied {
         lines.push(
@@ -450,7 +454,10 @@ mod tests {
     fn access_denied_advice_names_pids_and_kill_command() {
         let advice = diag(
             PipeState::AccessDenied,
-            vec![suspect(8124, None), suspect(9001, Some(r"C:\bin\wxeasy.exe"))],
+            vec![
+                suspect(8124, None),
+                suspect(9001, Some(r"C:\bin\wxeasy.exe")),
+            ],
         )
         .advice()
         .expect("拒绝访问必须给出诊断");
@@ -588,6 +595,9 @@ mod tests {
         }
 
         assert_eq!(state, PipeState::AccessDenied);
-        assert!(pid.is_none(), "连不上就拿不到服务端 PID，只能走进程快照兜底");
+        assert!(
+            pid.is_none(),
+            "连不上就拿不到服务端 PID，只能走进程快照兜底"
+        );
     }
 }

@@ -457,7 +457,12 @@ impl DbCache {
         rel_key: &str,
     ) -> Result<(rusqlite::Connection, Arc<std::sync::Mutex<vfs::ReadStats>>)> {
         let params = self.resolve_conn_params(rel_key)?;
-        vfs::open_conn_with_stats(&params.enc_db_path, params.key, &params.tmp_dir, &params.tag)
+        vfs::open_conn_with_stats(
+            &params.enc_db_path,
+            params.key,
+            &params.tmp_dir,
+            &params.tag,
+        )
     }
 
     /// 供 `query.rs` 里 `db: &DbCache`（借用，生命周期绑在调用方 async fn 的
@@ -486,8 +491,8 @@ impl DbCache {
             .all_keys
             .get(rel_key)
             .with_context(|| format!("未找到 {} 的解密密钥（all_keys 缺失该 rel_key）", rel_key))?;
-        let key = hex_to_32bytes(enc_key_hex)
-            .with_context(|| format!("密钥格式错误: {}", rel_key))?;
+        let key =
+            hex_to_32bytes(enc_key_hex).with_context(|| format!("密钥格式错误: {}", rel_key))?;
 
         let enc_db_path = self.db_dir.join(
             rel_key
@@ -645,7 +650,13 @@ impl DbCache {
                 // 回写可能反映的是作废之前的旧状态，直接丢弃，不写入。
                 return;
             }
-            guard.insert(rel_key, ShardSchemaEntry { snapshot, msg_tables });
+            guard.insert(
+                rel_key,
+                ShardSchemaEntry {
+                    snapshot,
+                    msg_tables,
+                },
+            );
         }
         // 持久化 write-behind：锁外打脏标记 + 去抖落盘（见 RouteCacheFile）。
         self.note_routes_dirty();
@@ -667,9 +678,7 @@ impl DbCache {
             Ok(v) => v,
             Err(_) => return,
         };
-        if parsed.version != ROUTE_CACHE_VERSION
-            || parsed.db_dir != self.db_dir.to_string_lossy()
-        {
+        if parsed.version != ROUTE_CACHE_VERSION || parsed.db_dir != self.db_dir.to_string_lossy() {
             return;
         }
         let count = parsed.entries.len();
@@ -1095,7 +1104,13 @@ pub(crate) fn now_nanos() -> u64 {
 mod snapshot_tests {
     use super::*;
 
-    fn snap(db_mtime: u64, db_len: u64, wal_mtime: u64, wal_len: u64, wal_present: bool) -> SourceSnapshot {
+    fn snap(
+        db_mtime: u64,
+        db_len: u64,
+        wal_mtime: u64,
+        wal_len: u64,
+        wal_present: bool,
+    ) -> SourceSnapshot {
         SourceSnapshot {
             db_mtime,
             db_len,
@@ -1163,7 +1178,10 @@ mod snapshot_tests {
         let newest = 1_000_000_000_000u64;
         let s = snap(newest, 10, 0, 0, false);
         let now = newest + HOT_CACHE_FRESHNESS_SLACK_NANOS;
-        assert!(s.trusted_as_of(now), "无 WAL 的休眠分片安静满一个 slack 周期后应该可信");
+        assert!(
+            s.trusted_as_of(now),
+            "无 WAL 的休眠分片安静满一个 slack 周期后应该可信"
+        );
     }
 
     #[test]
@@ -1523,14 +1541,17 @@ impl HotConnPool {
                 map.remove(&evict_key);
             }
         }
-        let entry = map.entry(rel_key.to_string()).or_insert_with(|| HotShardSlot {
-            slot: Arc::new(std::sync::Mutex::new(None)),
-            last_used: Arc::new(AtomicU64::new(0)),
-            rebuild_count: Arc::new(AtomicU64::new(0)),
-        });
-        entry
-            .last_used
-            .store(HOT_CONN_CLOCK.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
+        let entry = map
+            .entry(rel_key.to_string())
+            .or_insert_with(|| HotShardSlot {
+                slot: Arc::new(std::sync::Mutex::new(None)),
+                last_used: Arc::new(AtomicU64::new(0)),
+                rebuild_count: Arc::new(AtomicU64::new(0)),
+            });
+        entry.last_used.store(
+            HOT_CONN_CLOCK.fetch_add(1, Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         (entry.slot.clone(), entry.rebuild_count.clone())
     }
 
@@ -2307,7 +2328,11 @@ mod route_persistence_tests {
         put_and_flush(&cache, &e.rel_key);
 
         // 模拟重启间隙微信写入：内容与长度都变、mtime 变新。
-        std::fs::write(e.db_dir.join(&e.rel_key), b"changed content, longer than before").unwrap();
+        std::fs::write(
+            e.db_dir.join(&e.rel_key),
+            b"changed content, longer than before",
+        )
+        .unwrap();
 
         let restarted = mk_cache(&e).await;
         assert!(
@@ -2445,7 +2470,12 @@ mod shard_route_tests {
         let mut tables = HashSet::new();
         tables.insert("Msg_aaaa".to_string());
         tables.insert("Msg_bbbb".to_string());
-        cache.put_shard_schema(rel_key.clone(), snapshot, tables.clone(), cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            tables.clone(),
+            cache.route_generation(),
+        );
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Fresh(got) => assert_eq!(got, tables),
@@ -2458,9 +2488,17 @@ mod shard_route_tests {
         let (cache, db_path, rel_key) = setup("db-bump").await;
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            HashSet::new(),
+            cache.route_generation(),
+        );
         assert!(
-            matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Fresh(_)),
+            matches!(
+                cache.shard_route_lookup(&rel_key),
+                ShardRouteLookup::Fresh(_)
+            ),
             "写入后、快照未变、且已安静满 slack，应先命中"
         );
 
@@ -2481,9 +2519,17 @@ mod shard_route_tests {
         let (cache, db_path, rel_key) = setup("wal-bump").await;
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            HashSet::new(),
+            cache.route_generation(),
+        );
         assert!(
-            matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Fresh(_)),
+            matches!(
+                cache.shard_route_lookup(&rel_key),
+                ShardRouteLookup::Fresh(_)
+            ),
             "写入后、快照未变、且已安静满 slack，应先命中"
         );
 
@@ -2509,9 +2555,17 @@ mod shard_route_tests {
         let (cache, db_path, rel_key) = setup("len-pin").await;
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            HashSet::new(),
+            cache.route_generation(),
+        );
         assert!(
-            matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Fresh(_)),
+            matches!(
+                cache.shard_route_lookup(&rel_key),
+                ShardRouteLookup::Fresh(_)
+            ),
             "写入基线后应先命中"
         );
 
@@ -2537,9 +2591,9 @@ mod shard_route_tests {
                     "文件长度应该已经变化——这正是本测试要验证的信号"
                 );
             }
-            ShardRouteLookup::Fresh(_) => panic!(
-                "mtime 相同但文件长度已变化，必须判 Stale——这是长度加入失效键要堵的场景"
-            ),
+            ShardRouteLookup::Fresh(_) => {
+                panic!("mtime 相同但文件长度已变化，必须判 Stale——这是长度加入失效键要堵的场景")
+            }
         }
     }
 
@@ -2567,7 +2621,12 @@ mod shard_route_tests {
             .unwrap();
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            HashSet::new(),
+            cache.route_generation(),
+        );
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Stale(got) => {
@@ -2605,7 +2664,12 @@ mod shard_route_tests {
 
         // 故意把这份"看起来相同"的快照也塞进缓存，模拟"两次读取都失败，
         // 凑巧数值相同"的最坏情况。
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            HashSet::new(),
+            cache.route_generation(),
+        );
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Stale(_) => {}
@@ -2638,7 +2702,12 @@ mod shard_route_tests {
         let snapshot = cache.source_snapshot(&rel_key);
         let mut tables = HashSet::new();
         tables.insert("Msg_aaaa".to_string());
-        cache.put_shard_schema(rel_key.clone(), snapshot, tables.clone(), cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            tables.clone(),
+            cache.route_generation(),
+        );
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Fresh(got) => assert_eq!(got, tables),
@@ -2672,9 +2741,17 @@ mod shard_route_tests {
             .unwrap();
 
         let snapshot = cache.source_snapshot(&rel_key);
-        cache.put_shard_schema(rel_key.clone(), snapshot, HashSet::new(), cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            HashSet::new(),
+            cache.route_generation(),
+        );
         assert!(
-            matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Fresh(_)),
+            matches!(
+                cache.shard_route_lookup(&rel_key),
+                ShardRouteLookup::Fresh(_)
+            ),
             "测试前提：无 WAL 的休眠分片此刻应该已经 Fresh 命中"
         );
 
@@ -2684,10 +2761,7 @@ mod shard_route_tests {
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Stale(got) => {
-                assert_ne!(
-                    got, snapshot,
-                    "wal_present 翻转必须让快照判定为不同"
-                );
+                assert_ne!(got, snapshot, "wal_present 翻转必须让快照判定为不同");
             }
             ShardRouteLookup::Fresh(_) => {
                 panic!("WAL 从不存在变为存在必须强制判 Stale，不能继续信任旧路由缓存")
@@ -2706,7 +2780,12 @@ mod shard_route_tests {
         let expected_generation = cache.route_generation();
         let mut tables = HashSet::new();
         tables.insert("Msg_ok".to_string());
-        cache.put_shard_schema(rel_key.clone(), snapshot, tables.clone(), expected_generation);
+        cache.put_shard_schema(
+            rel_key.clone(),
+            snapshot,
+            tables.clone(),
+            expected_generation,
+        );
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Fresh(got) => assert_eq!(got, tables, "世代号匹配时应该正常写入"),
@@ -2737,9 +2816,9 @@ mod shard_route_tests {
 
         match cache.shard_route_lookup(&rel_key) {
             ShardRouteLookup::Stale(_) => {}
-            ShardRouteLookup::Fresh(_) => panic!(
-                "过期世代号的回写不应该复活刚被 invalidate_shard 作废的路由缓存"
-            ),
+            ShardRouteLookup::Fresh(_) => {
+                panic!("过期世代号的回写不应该复活刚被 invalidate_shard 作废的路由缓存")
+            }
         }
     }
 
@@ -2849,7 +2928,10 @@ mod shard_route_tests {
         stale_tables.insert("Msg_stale".to_string());
         cache.put_shard_schema(rel_key.clone(), snapshot, stale_tables, stale_generation);
         assert!(
-            matches!(cache.shard_route_lookup(&rel_key), ShardRouteLookup::Stale(_)),
+            matches!(
+                cache.shard_route_lookup(&rel_key),
+                ShardRouteLookup::Stale(_)
+            ),
             "过期世代号的回写必须被拒绝，不能 insert"
         );
 
@@ -2972,7 +3054,12 @@ mod hot_conn_tests {
 
         std::thread::sleep(std::time::Duration::from_millis(20));
         // 重写整份加密文件（内容变化 + bump mtime）。
-        build_encrypted_fixture(&db_path, &key_fixture(), "Msg_test", &[(1, 1000), (2, 2000)]);
+        build_encrypted_fixture(
+            &db_path,
+            &key_fixture(),
+            "Msg_test",
+            &[(1, 1000), (2, 2000)],
+        );
 
         probe(&cache, &rel_key).await;
         assert_eq!(
@@ -3111,11 +3198,8 @@ mod hot_conn_tests {
                 hot.with(|conn| {
                     let cnt: i64 =
                         conn.query_row("SELECT count(*) FROM Msg_test", [], |r| r.get(0))?;
-                    let max_ts: i64 = conn.query_row(
-                        "SELECT MAX(create_time) FROM Msg_test",
-                        [],
-                        |r| r.get(0),
-                    )?;
+                    let max_ts: i64 =
+                        conn.query_row("SELECT MAX(create_time) FROM Msg_test", [], |r| r.get(0))?;
                     Ok::<_, anyhow::Error>((unsafe { conn.handle() } as usize, cnt, max_ts))
                 })
             })
@@ -3567,13 +3651,21 @@ mod invalidate_tests {
         let snapshot = cache.source_snapshot(rel_key);
         let mut tables = HashSet::new();
         tables.insert(table_name.to_string());
-        cache.put_shard_schema(rel_key.to_string(), snapshot, tables, cache.route_generation());
+        cache.put_shard_schema(
+            rel_key.to_string(),
+            snapshot,
+            tables,
+            cache.route_generation(),
+        );
 
         // 热连接：预热一次，rebuild_count 从 1 开始。
         probe(&cache, rel_key).await;
         assert_eq!(rebuild_count(&cache, rel_key), 1, "预热应该只触发一次重建");
         assert!(
-            matches!(cache.shard_route_lookup(rel_key), ShardRouteLookup::Fresh(_)),
+            matches!(
+                cache.shard_route_lookup(rel_key),
+                ShardRouteLookup::Fresh(_)
+            ),
             "预热后路由缓存应该已经 Fresh 命中"
         );
 
@@ -3615,7 +3707,10 @@ mod invalidate_tests {
 
         // 路由缓存：作废后必须 Stale，即便源文件字节上什么都没变。
         assert!(
-            matches!(cache.shard_route_lookup(rel_key), ShardRouteLookup::Stale(_)),
+            matches!(
+                cache.shard_route_lookup(rel_key),
+                ShardRouteLookup::Stale(_)
+            ),
             "invalidate_shard 后路由缓存必须强制 Stale，不能继续信任"
         );
 
@@ -3672,7 +3767,12 @@ mod invalidate_tests {
             let snapshot = cache.source_snapshot(rel_key);
             let mut tables = HashSet::new();
             tables.insert(table_name.to_string());
-            cache.put_shard_schema(rel_key.to_string(), snapshot, tables, cache.route_generation());
+            cache.put_shard_schema(
+                rel_key.to_string(),
+                snapshot,
+                tables,
+                cache.route_generation(),
+            );
             probe(&cache, rel_key).await;
             assert_eq!(rebuild_count(&cache, rel_key), 1);
         }
@@ -3707,7 +3807,10 @@ mod invalidate_tests {
         // 分片 B：完全不受影响，路由缓存仍 Fresh，热连接仍复用（rebuild_count
         // 保持 1）。
         assert!(
-            matches!(cache.shard_route_lookup(rel_key_b), ShardRouteLookup::Fresh(_)),
+            matches!(
+                cache.shard_route_lookup(rel_key_b),
+                ShardRouteLookup::Fresh(_)
+            ),
             "无关分片的路由缓存不应该被误作废"
         );
         probe(&cache, rel_key_b).await;

@@ -16,7 +16,10 @@ use crate::ipc::{Request, Response};
 /// `contact.db` 在慢机上要扫很久，CLI 的存活探测（`Request::Ping`，`serve`
 /// 绑定完成后立刻可服务，见 [`dispatch`]）也不会被拖慢，从根上解决"CLI
 /// 15s 启动超时被机械盘上的 contact.db 冷扫触发"这个问题。
-pub async fn serve(db: Arc<DbCache>, names: Arc<tokio::sync::RwLock<Option<Arc<Names>>>>) -> Result<()> {
+pub async fn serve(
+    db: Arc<DbCache>,
+    names: Arc<tokio::sync::RwLock<Option<Arc<Names>>>>,
+) -> Result<()> {
     #[cfg(unix)]
     serve_unix(db, names).await?;
     #[cfg(windows)]
@@ -25,7 +28,10 @@ pub async fn serve(db: Arc<DbCache>, names: Arc<tokio::sync::RwLock<Option<Arc<N
 }
 
 #[cfg(unix)]
-async fn serve_unix(db: Arc<DbCache>, names: Arc<tokio::sync::RwLock<Option<Arc<Names>>>>) -> Result<()> {
+async fn serve_unix(
+    db: Arc<DbCache>,
+    names: Arc<tokio::sync::RwLock<Option<Arc<Names>>>>,
+) -> Result<()> {
     use tokio::net::UnixListener;
     let sock_path = crate::config::sock_path();
 
@@ -209,9 +215,7 @@ async fn dispatch(
         match guard.as_ref() {
             Some(n) => Arc::clone(n),
             None => {
-                return Response::warming_up(
-                    "daemon 正在后台加载联系人（预热中），请稍后重试",
-                );
+                return Response::warming_up("daemon 正在后台加载联系人（预热中），请稍后重试");
             }
         }
     };
@@ -475,10 +479,7 @@ mod dispatch_warmup_tests {
         let resp = dispatch(Request::Ping, &db, &names).await;
         assert!(resp.ok, "Ping 不依赖 names，即便未就绪也必须立刻正常响应");
         assert!(!resp.warming_up);
-        assert_eq!(
-            resp.data.get("pong").and_then(|v| v.as_bool()),
-            Some(true)
-        );
+        assert_eq!(resp.data.get("pong").and_then(|v| v.as_bool()), Some(true));
     }
 
     #[tokio::test]
@@ -487,7 +488,10 @@ mod dispatch_warmup_tests {
         let names: tokio::sync::RwLock<Option<Arc<Names>>> = tokio::sync::RwLock::new(None);
 
         let resp = dispatch(Request::ReloadConfig, &db, &names).await;
-        assert!(resp.ok, "ReloadConfig 不依赖 names，即便未就绪也必须立刻正常响应");
+        assert!(
+            resp.ok,
+            "ReloadConfig 不依赖 names，即便未就绪也必须立刻正常响应"
+        );
         assert!(!resp.warming_up);
     }
 
@@ -577,9 +581,6 @@ mod dispatch_warmup_tests {
         // 没有注册任何密钥，q_sessions 会因为找不到 session.db 的密钥而
         // 返回 Err——这是预期之中的、与"预热中"完全无关的失败，用来确认
         // 请求确实穿过了 warming_up 分支、走到了真正的查询路径）。
-        assert!(
-            !resp.warming_up,
-            "names 已就绪时绝不应该再落入预热中分支"
-        );
+        assert!(!resp.warming_up, "names 已就绪时绝不应该再落入预热中分支");
     }
 }

@@ -33,8 +33,8 @@ pub struct FuncCandidate {
 ///
 /// 实测 4.1.11.24 的设钥函数含 31 条 aeskeygenassist，稳居榜首。
 pub fn locate_key_schedule_funcs(dll_path: &Path, take_top: usize) -> Result<Vec<FuncCandidate>> {
-    let data = std::fs::read(dll_path)
-        .with_context(|| format!("读取 {} 失败", dll_path.display()))?;
+    let data =
+        std::fs::read(dll_path).with_context(|| format!("读取 {} 失败", dll_path.display()))?;
     let pe = PeFile64::parse(&*data).context("解析 Weixin.dll（PE64）失败")?;
     let image_base = pe.relative_address_base();
 

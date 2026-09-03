@@ -147,10 +147,12 @@ pub(crate) fn store_names_cache(
     iv_src.update(now_nanos().to_le_bytes());
     iv_src.update(&compressed);
     let digest = iv_src.finalize();
-    let iv: [u8; IV_LEN] = digest[..IV_LEN].try_into().expect("SHA256 摘要必然 ≥ 16 字节");
+    let iv: [u8; IV_LEN] = digest[..IV_LEN]
+        .try_into()
+        .expect("SHA256 摘要必然 ≥ 16 字节");
 
-    let ciphertext =
-        Aes256CbcEnc::new(enc_key.into(), (&iv).into()).encrypt_padded_vec_mut::<Pkcs7>(&compressed);
+    let ciphertext = Aes256CbcEnc::new(enc_key.into(), (&iv).into())
+        .encrypt_padded_vec_mut::<Pkcs7>(&compressed);
 
     let mut out = Vec::with_capacity(MAGIC.len() + IV_LEN + ciphertext.len() + TAG_LEN);
     out.extend_from_slice(MAGIC);
@@ -303,9 +305,7 @@ mod tests {
         let raw = std::fs::read(e.cache_dir.join(NAMES_CACHE_FILE_NAME)).unwrap();
         for needle in ["wxid_abc", "老王", "verify_flags"] {
             assert!(
-                !raw
-                    .windows(needle.len())
-                    .any(|w| w == needle.as_bytes()),
+                !raw.windows(needle.len()).any(|w| w == needle.as_bytes()),
                 "缓存文件里出现了明文片段: {}",
                 needle
             );

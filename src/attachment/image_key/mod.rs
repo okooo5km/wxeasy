@@ -55,7 +55,9 @@ pub fn default_provider() -> Option<Box<dyn ImageKeyProvider + Send + Sync>> {
     }
     #[cfg(target_os = "windows")]
     {
-        return Some(Box::new(windows::WindowsImageKeyProvider::from_current_config()));
+        return Some(Box::new(
+            windows::WindowsImageKeyProvider::from_current_config(),
+        ));
     }
     #[cfg(target_os = "linux")]
     {
@@ -67,7 +69,10 @@ pub fn default_provider() -> Option<Box<dyn ImageKeyProvider + Send + Sync>> {
     }
 }
 
-pub(crate) fn configured_db_dir_for_wxid(configured_db_dir: &Path, requested_wxid: &str) -> PathBuf {
+pub(crate) fn configured_db_dir_for_wxid(
+    configured_db_dir: &Path,
+    requested_wxid: &str,
+) -> PathBuf {
     if requested_wxid.trim().is_empty() {
         return configured_db_dir.to_path_buf();
     }

@@ -80,18 +80,30 @@ fn aes_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
 ///   加密侧无需还原）；
 /// - `pgno != 1` 时，参与加密的是 `logical_page[0..PAGE_SZ-RESERVE_SZ]`。
 #[cfg(test)]
-pub(crate) fn encrypt_page(enc_key: &[u8; 32], logical_page: &[u8], iv: &[u8; 16], pgno: u32) -> Vec<u8> {
+pub(crate) fn encrypt_page(
+    enc_key: &[u8; 32],
+    logical_page: &[u8],
+    iv: &[u8; 16],
+    pgno: u32,
+) -> Vec<u8> {
     use cbc::cipher::BlockEncryptMut;
     type Aes256CbcEnc = cbc::Encryptor<Aes256>;
 
-    assert_eq!(logical_page.len(), PAGE_SZ, "测试构造的逻辑页必须是完整 PAGE_SZ 字节");
+    assert_eq!(
+        logical_page.len(),
+        PAGE_SZ,
+        "测试构造的逻辑页必须是完整 PAGE_SZ 字节"
+    );
 
     let mut result = vec![0u8; PAGE_SZ];
     let iv_offset = PAGE_SZ - RESERVE_SZ;
 
     if pgno == 1 {
         let plain = &logical_page[SALT_SZ..PAGE_SZ - RESERVE_SZ];
-        let mut blocks: Vec<Block> = plain.chunks_exact(16).map(Block::clone_from_slice).collect();
+        let mut blocks: Vec<Block> = plain
+            .chunks_exact(16)
+            .map(Block::clone_from_slice)
+            .collect();
         Aes256CbcEnc::new(enc_key.into(), iv.into()).encrypt_blocks_mut(&mut blocks);
         // 加密侧的头 16 字节代表 SALT，测试里内容不重要（decrypt_page 从不读取它）。
         result[..SALT_SZ].fill(0xAA);
@@ -100,7 +112,10 @@ pub(crate) fn encrypt_page(enc_key: &[u8; 32], logical_page: &[u8], iv: &[u8; 16
         }
     } else {
         let plain = &logical_page[..PAGE_SZ - RESERVE_SZ];
-        let mut blocks: Vec<Block> = plain.chunks_exact(16).map(Block::clone_from_slice).collect();
+        let mut blocks: Vec<Block> = plain
+            .chunks_exact(16)
+            .map(Block::clone_from_slice)
+            .collect();
         Aes256CbcEnc::new(enc_key.into(), iv.into()).encrypt_blocks_mut(&mut blocks);
         for (i, b) in blocks.iter().enumerate() {
             result[i * 16..i * 16 + 16].copy_from_slice(b);

@@ -79,9 +79,12 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     }
 
     // salt -> db_name（同一 salt 理论上只对应一个库）
-    let mut salt_to_db: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut salt_to_db: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     for (salt, name) in &db_salts {
-        salt_to_db.entry(salt.clone()).or_insert_with(|| name.clone());
+        salt_to_db
+            .entry(salt.clone())
+            .or_insert_with(|| name.clone());
     }
 
     // page1 校验用：预读各库路径
@@ -112,14 +115,15 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
 
         for pid in pids {
             // SAFETY: OpenProcess 请求读取权限
-            let process =
-                match unsafe { OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid) } {
-                    Ok(h) => h,
-                    Err(e) => {
-                        eprintln!("PID {} OpenProcess 失败: {}（可尝试管理员权限）", pid, e);
-                        continue;
-                    }
-                };
+            let process = match unsafe {
+                OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, false, pid)
+            } {
+                Ok(h) => h,
+                Err(e) => {
+                    eprintln!("PID {} OpenProcess 失败: {}（可尝试管理员权限）", pid, e);
+                    continue;
+                }
+            };
 
             eprintln!("扫描进程内存 PID {} ...", pid);
             let raw_keys = match scan_memory(process) {
@@ -216,8 +220,7 @@ fn hex_to_32(s: &str) -> Result<[u8; 32]> {
     }
     let mut out = [0u8; 32];
     for i in 0..32 {
-        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
-            .map_err(|e| anyhow::anyhow!(e))?;
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(|e| anyhow::anyhow!(e))?;
     }
     Ok(out)
 }
@@ -335,8 +338,7 @@ fn search_pattern(buf: &[u8], results: &mut Vec<(String, String)>) {
                 i += 1;
                 continue;
             }
-            let key_hex =
-                String::from_utf8_lossy(&buf[hex_start..hex_start + 64]).to_lowercase();
+            let key_hex = String::from_utf8_lossy(&buf[hex_start..hex_start + 64]).to_lowercase();
             let salt_hex =
                 String::from_utf8_lossy(&buf[hex_start + 64..hex_start + 96]).to_lowercase();
             let is_dup = results.iter().any(|(k, s)| k == &key_hex && s == &salt_hex);

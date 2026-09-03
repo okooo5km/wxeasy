@@ -29,7 +29,8 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Security::{
     AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES, SE_DEBUG_NAME,
-    SE_PRIVILEGE_ENABLED, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+    SE_PRIVILEGE_ENABLED, TOKEN_ACCESS_MASK, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+    TOKEN_QUERY,
 };
 use windows::Win32::System::Diagnostics::Debug::{
     ContinueDebugEvent, DebugActiveProcess, DebugActiveProcessStop, DebugSetProcessKillOnExit,
@@ -109,8 +110,9 @@ pub fn run_capture(db_dir: &Path, mode: LiveMode, existing: &[KeyEntry]) -> Resu
         LiveMode::Attach => {
             let pid = find_wechat_pid()
                 .context("找不到 Weixin.exe 进程，请先启动并登录微信，再用 wxeasy init --live")?;
-            unsafe { DebugActiveProcess(pid) }
-                .map_err(|e| anyhow!("附加到微信失败（通常是权限不足，请以管理员身份运行）: {e}"))?;
+            unsafe { DebugActiveProcess(pid) }.map_err(|e| {
+                anyhow!("附加到微信失败（通常是权限不足，请以管理员身份运行）: {e}")
+            })?;
             // 立即保命：无论如何分离/退出都不杀微信
             unsafe { DebugSetProcessKillOnExit(false) }.ok();
             eprintln!(
@@ -390,7 +392,11 @@ fn prepare_relaunch() -> Result<PathBuf> {
 
 /// 以 DEBUG_PROCESS 启动微信（跟随子进程树——微信可能经 launcher 拉起主进程）。
 fn launch_wechat_debugged(exe: &Path) -> Result<u32> {
-    let app: Vec<u16> = exe.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let app: Vec<u16> = exe
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
     let si = STARTUPINFOW {
         cb: size_of::<STARTUPINFOW>() as u32,
         ..Default::default()
@@ -445,7 +451,9 @@ fn get_wechat_exe_path(pid: u32) -> Option<PathBuf> {
         let _ = CloseHandle(h);
     }
     ok.ok()?;
-    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+    Some(PathBuf::from(String::from_utf16_lossy(
+        &buf[..len as usize],
+    )))
 }
 
 /// 用 ToolHelp 模块快照找某 PID 的 Weixin.dll，返回 (模块基址, 磁盘路径)。
@@ -547,7 +555,9 @@ fn enable_se_debug_privilege() -> Result<()> {
         let _ = CloseHandle(token);
         adjust.map_err(|e| anyhow!("AdjustTokenPrivileges 失败: {e}"))?;
         if last == ERROR_NOT_ALL_ASSIGNED {
-            return Err(anyhow!("SeDebugPrivilege 未授予（通常是未以管理员身份运行）"));
+            return Err(anyhow!(
+                "SeDebugPrivilege 未授予（通常是未以管理员身份运行）"
+            ));
         }
     }
     Ok(())

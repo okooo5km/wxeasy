@@ -73,14 +73,21 @@ pub fn detect_key(file_bytes: &[u8]) -> Option<u8> {
 
 /// XOR 解码整个 `.dat` 内容。
 pub fn decode(file_bytes: &[u8]) -> Result<DecodedImage> {
-    let key =
-        detect_key(file_bytes).ok_or_else(|| anyhow!("legacy XOR: 无法识别图片 magic（key 探测失败）"))?;
+    let key = detect_key(file_bytes)
+        .ok_or_else(|| anyhow!("legacy XOR: 无法识别图片 magic（key 探测失败）"))?;
     let data: Vec<u8> = file_bytes.iter().map(|b| b ^ key).collect();
     let format = detect_image_format(&data);
     if format == "bin" {
-        return Err(anyhow!("legacy XOR: 解出 key=0x{:02x} 但产物 magic 不识别", key));
+        return Err(anyhow!(
+            "legacy XOR: 解出 key=0x{:02x} 但产物 magic 不识别",
+            key
+        ));
     }
-    Ok(DecodedImage { data, format, decoder: "legacy_xor" })
+    Ok(DecodedImage {
+        data,
+        format,
+        decoder: "legacy_xor",
+    })
 }
 
 #[cfg(test)]

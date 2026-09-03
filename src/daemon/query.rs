@@ -240,13 +240,13 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
     // 见 `daemon::names_cache` 模块文档（含加密与失效判定的完整论证）。
     if let Some(enc_key) = db.enc_key(CONTACT_REL_KEY) {
         let snapshot = db.source_snapshot(CONTACT_REL_KEY);
-        if let Some((map, verify_flags)) = super::names_cache::load_names_cache(
-            db.cache_dir(),
-            db.db_dir(),
-            &enc_key,
-            snapshot,
-        ) {
-            eprintln!("[names] 联系人加密缓存命中: {} 条（跳过 contact.db 全表扫描）", map.len());
+        if let Some((map, verify_flags)) =
+            super::names_cache::load_names_cache(db.cache_dir(), db.db_dir(), &enc_key, snapshot)
+        {
+            eprintln!(
+                "[names] 联系人加密缓存命中: {} 条（跳过 contact.db 全表扫描）",
+                map.len()
+            );
             let md5_to_uname: HashMap<String, String> = map
                 .keys()
                 .map(|u| (format!("{:x}", md5::compute(u.as_bytes())), u.clone()))
@@ -610,7 +610,12 @@ pub async fn q_search(
                         shard.rel_key.clone(),
                         shard.path.to_string_lossy().into_owned(),
                     );
-                    targets.push((shard.rel_key, shard.table, names.display(&uname), uname.clone()));
+                    targets.push((
+                        shard.rel_key,
+                        shard.table,
+                        names.display(&uname),
+                        uname.clone(),
+                    ));
                 }
             }
         }
@@ -736,55 +741,55 @@ pub async fn q_search(
 
         spawn_shard_scan(&mut join_set, &scan_semaphore, move || {
             hot.with(|conn| {
-            let mut all = Vec::new();
-            let empty_group_nicknames = HashMap::new();
-            for (tname, display, uname) in &table_list {
-                let is_group = uname.contains("@chatroom");
-                let group_nicknames = group_nicknames_by_chat2
-                    .get(uname)
-                    .unwrap_or(&empty_group_nicknames);
-                match search_in_table(
-                    conn,
-                    tname,
-                    &uname,
-                    is_group,
-                    &names_map2,
-                    group_nicknames,
-                    &kw2,
-                    since2,
-                    until2,
-                    msg_type,
-                    limit2,
-                ) {
-                    Ok(rows) => {
-                        for mut row in rows {
-                            if row
-                                .get("chat")
-                                .map(|v| v.as_str().unwrap_or(""))
-                                .unwrap_or("")
-                                .is_empty()
-                            {
-                                if let Some(obj) = row.as_object_mut() {
-                                    obj.insert(
-                                        "chat".into(),
-                                        serde_json::Value::String(if display.is_empty() {
-                                            tname.clone()
-                                        } else {
-                                            display.clone()
-                                        }),
-                                    );
+                let mut all = Vec::new();
+                let empty_group_nicknames = HashMap::new();
+                for (tname, display, uname) in &table_list {
+                    let is_group = uname.contains("@chatroom");
+                    let group_nicknames = group_nicknames_by_chat2
+                        .get(uname)
+                        .unwrap_or(&empty_group_nicknames);
+                    match search_in_table(
+                        conn,
+                        tname,
+                        &uname,
+                        is_group,
+                        &names_map2,
+                        group_nicknames,
+                        &kw2,
+                        since2,
+                        until2,
+                        msg_type,
+                        limit2,
+                    ) {
+                        Ok(rows) => {
+                            for mut row in rows {
+                                if row
+                                    .get("chat")
+                                    .map(|v| v.as_str().unwrap_or(""))
+                                    .unwrap_or("")
+                                    .is_empty()
+                                {
+                                    if let Some(obj) = row.as_object_mut() {
+                                        obj.insert(
+                                            "chat".into(),
+                                            serde_json::Value::String(if display.is_empty() {
+                                                tname.clone()
+                                            } else {
+                                                display.clone()
+                                            }),
+                                        );
+                                    }
                                 }
+                                all.push(row);
                             }
-                            all.push(row);
                         }
+                        Err(e) => eprintln!(
+                            "[search] skip table {} (rel_key={}): {}",
+                            tname, rel_key_for_log, e
+                        ),
                     }
-                    Err(e) => eprintln!(
-                        "[search] skip table {} (rel_key={}): {}",
-                        tname, rel_key_for_log, e
-                    ),
                 }
-            }
-            Ok((rel_key_for_log, all))
+                Ok((rel_key_for_log, all))
             })
         });
     }
@@ -1391,40 +1396,44 @@ async fn find_msg_shards(
         // 与旧实现完全相同。
         let expected_generation = db.route_generation();
 
-        spawn_shard_scan(&mut join_set, &scan_semaphore, move || -> Result<ShardScanOutcome> {
-            let (tables_opt, max_ts) = hot.with(|conn| {
-                if need_rebuild {
-                    let mut stmt = conn.prepare(
+        spawn_shard_scan(
+            &mut join_set,
+            &scan_semaphore,
+            move || -> Result<ShardScanOutcome> {
+                let (tables_opt, max_ts) = hot.with(|conn| {
+                    if need_rebuild {
+                        let mut stmt = conn.prepare(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
                     )?;
-                    let tables: HashSet<String> = stmt
-                        .query_map([], |row| row.get::<_, String>(0))?
-                        .filter_map(|r| r.ok())
-                        .collect();
-                    let ts = if tables.contains(&tname) {
-                        max_create_time(conn, &tname)
+                        let tables: HashSet<String> = stmt
+                            .query_map([], |row| row.get::<_, String>(0))?
+                            .filter_map(|r| r.ok())
+                            .collect();
+                        let ts = if tables.contains(&tname) {
+                            max_create_time(conn, &tname)
+                        } else {
+                            None
+                        };
+                        Ok::<_, anyhow::Error>((Some(tables), ts))
                     } else {
-                        None
-                    };
-                    Ok::<_, anyhow::Error>((Some(tables), ts))
-                } else {
-                    // 缓存已确认该分片含目标表（否则上面已经 continue）；
-                    // 万一实际不一致（理论上不该发生——任何写入都会 bump
-                    // mtime 使缓存失效），查询失败时 `max_create_time` 内部
-                    // 的 `.ok()` 安全退化为 None，不 panic、不误报数据。
-                    let ts = max_create_time(conn, &tname);
-                    Ok((None, ts))
-                }
-            })?;
-            Ok(ShardScanOutcome {
-                rel_key: rel_key_owned,
-                tables_opt,
-                max_ts,
-                enc_path,
-                snap_at_judgement,
-                expected_generation,
-            })
-        });
+                        // 缓存已确认该分片含目标表（否则上面已经 continue）；
+                        // 万一实际不一致（理论上不该发生——任何写入都会 bump
+                        // mtime 使缓存失效），查询失败时 `max_create_time` 内部
+                        // 的 `.ok()` 安全退化为 None，不 panic、不误报数据。
+                        let ts = max_create_time(conn, &tname);
+                        Ok((None, ts))
+                    }
+                })?;
+                Ok(ShardScanOutcome {
+                    rel_key: rel_key_owned,
+                    tables_opt,
+                    max_ts,
+                    enc_path,
+                    snap_at_judgement,
+                    expected_generation,
+                })
+            },
+        );
     }
 
     // I/O 段：并发收割。任意一个分片扫描失败（真实 I/O/decrypt 错误，不是
@@ -1623,7 +1632,10 @@ mod find_msg_shards_concurrency_tests {
             .expect("冷启动下应该成功并发扫描全部分片");
 
         assert_eq!(skipped, 0, "since=None 时不应该跳过任何分片");
-        assert_eq!(scanned, 3, "路由缓存为空，全部 3 个分片都应该真正被 open 扫描");
+        assert_eq!(
+            scanned, 3,
+            "路由缓存为空，全部 3 个分片都应该真正被 open 扫描"
+        );
 
         assert_eq!(shards.len(), 2, "只有承载目标表的两个分片应该出现在结果里");
         assert_eq!(
@@ -1692,18 +1704,21 @@ mod find_msg_shards_concurrency_tests {
             .unwrap();
         let names = names_for(vec!["message_0.db".to_string(), "message_1.db".to_string()]);
 
-        let (first, first_scanned, _) = find_msg_shards(&db, &names, username, None)
-            .await
-            .unwrap();
+        let (first, first_scanned, _) = find_msg_shards(&db, &names, username, None).await.unwrap();
         assert_eq!(first.len(), 1);
-        assert_eq!(first_scanned, 2, "第一次调用路由缓存为空，两个分片都必须真正 open");
+        assert_eq!(
+            first_scanned, 2,
+            "第一次调用路由缓存为空，两个分片都必须真正 open"
+        );
 
-        let (second, second_scanned, _) = find_msg_shards(&db, &names, username, None)
-            .await
-            .unwrap();
+        let (second, second_scanned, _) =
+            find_msg_shards(&db, &names, username, None).await.unwrap();
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].rel_key, "message_0.db");
-        assert_eq!(second[0].max_ts, 1000, "复用路由缓存 schema 后查到的 max_ts 应该仍然正确");
+        assert_eq!(
+            second[0].max_ts, 1000,
+            "复用路由缓存 schema 后查到的 max_ts 应该仍然正确"
+        );
         assert_eq!(
             second_scanned, 1,
             "只有承载目标表的分片需要 touch 一次拿 MAX(create_time)；\
@@ -1787,9 +1802,8 @@ mod find_msg_shards_concurrency_tests {
             .unwrap();
         let names = names_for(vec!["message_0.db".to_string(), "message_1.db".to_string()]);
 
-        let (_first, first_scanned, _) = find_msg_shards(&db, &names, username, None)
-            .await
-            .unwrap();
+        let (_first, first_scanned, _) =
+            find_msg_shards(&db, &names, username, None).await.unwrap();
         assert_eq!(first_scanned, 2, "首次调用两个分片都应该真正 open");
 
         // 只给 shard_a 追加一个 WAL 文件（模拟微信刚开始往这个分片写新消息），
@@ -1797,9 +1811,8 @@ mod find_msg_shards_concurrency_tests {
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(wal_sidecar_path(&shard_a), [0u8; 31]).unwrap();
 
-        let (second, second_scanned, _) = find_msg_shards(&db, &names, username, None)
-            .await
-            .unwrap();
+        let (second, second_scanned, _) =
+            find_msg_shards(&db, &names, username, None).await.unwrap();
         assert_eq!(
             second_scanned, 1,
             "只有 WAL 变化的 shard_a 应该重新 open，shard_b 应该继续走路由缓存零 I/O"
@@ -1888,7 +1901,11 @@ mod shard_scan_concurrency_cap_tests {
         }
         let mut baseline: Vec<usize> = Vec::new();
         while let Some(joined) = baseline_set.join_next().await {
-            baseline.push(joined.expect("baseline 任务不应 panic").expect("baseline 任务不应返回 Err"));
+            baseline.push(
+                joined
+                    .expect("baseline 任务不应 panic")
+                    .expect("baseline 任务不应返回 Err"),
+            );
         }
         baseline.sort_unstable();
 
@@ -1899,7 +1916,11 @@ mod shard_scan_concurrency_cap_tests {
         }
         let mut capped: Vec<usize> = Vec::new();
         while let Some(joined) = capped_set.join_next().await {
-            capped.push(joined.expect("capped 任务不应 panic").expect("capped 任务不应返回 Err"));
+            capped.push(
+                joined
+                    .expect("capped 任务不应 panic")
+                    .expect("capped 任务不应返回 Err"),
+            );
         }
         capped.sort_unstable();
 
@@ -1938,12 +1959,7 @@ mod shard_scan_concurrency_cap_tests {
                 // 分片滚动：目标表也出现在最后一个分片，承载更旧的一段。
                 build_encrypted_fixture(&path, &key, &table_name, &[(1, 200), (2, 2000)]);
             } else {
-                build_encrypted_fixture(
-                    &path,
-                    &key,
-                    &format!("Msg_unrelated_{}", i),
-                    &[(1, 1)],
-                );
+                build_encrypted_fixture(&path, &key, &format!("Msg_unrelated_{}", i), &[(1, 1)]);
             }
             backdate_beyond_slack(&path);
             all_keys.insert(rel_key.clone(), key_to_hex(&key));
@@ -2000,7 +2016,8 @@ fn table_has_sortseq_index(conn: &Connection, table: &str) -> bool {
         .ok()
         .and_then(|mut stmt| {
             // 第一行 seqno=0 即索引首列；列 2 是列名（表达式索引为 NULL）。
-            stmt.query_row([], |row| row.get::<_, Option<String>>(2)).ok()
+            stmt.query_row([], |row| row.get::<_, Option<String>>(2))
+                .ok()
         })
         .flatten()
         .map(|first_col| first_col == "sort_seq")
@@ -2036,10 +2053,7 @@ fn max_create_time(conn: &Connection, table: &str) -> Option<i64> {
         for anomaly in ["sort_seq IS NULL", "sort_seq <= 0"] {
             let v: Option<i64> = conn
                 .query_row(
-                    &format!(
-                        "SELECT MAX(create_time) FROM [{}] WHERE {}",
-                        table, anomaly
-                    ),
+                    &format!("SELECT MAX(create_time) FROM [{}] WHERE {}", table, anomaly),
                     [],
                     |row| row.get(0),
                 )
@@ -2537,8 +2551,11 @@ fn fetch_new_rows_since(
     );
     conn.prepare(&sql)
         .and_then(|mut stmt| {
-            stmt.query_map(rusqlite::params![since, per_table_limit as i64], map_msg_row)
-                .map(|it| it.filter_map(|r| r.ok()).collect())
+            stmt.query_map(
+                rusqlite::params![since, per_table_limit as i64],
+                map_msg_row,
+            )
+            .map(|it| it.filter_map(|r| r.ok()).collect())
         })
         .unwrap_or_default()
 }
@@ -2621,8 +2638,10 @@ mod sortseq_tests {
 
         // 无索引表
         let bare = Connection::open_in_memory().unwrap();
-        bare.execute_batch("CREATE TABLE Msg_bare(local_id INTEGER PRIMARY KEY, create_time INTEGER);")
-            .unwrap();
+        bare.execute_batch(
+            "CREATE TABLE Msg_bare(local_id INTEGER PRIMARY KEY, create_time INTEGER);",
+        )
+        .unwrap();
         assert!(!table_has_sortseq_index(&bare, "Msg_bare"));
         // 表不存在
         assert!(!table_has_sortseq_index(&bare, "Msg_missing"));
@@ -2833,10 +2852,7 @@ mod sortseq_tests {
             T
         );
         // 选择性探针必须是 covering index（只走索引 B-tree、不回表）
-        let probe = format!(
-            "SELECT 1 FROM [{}] WHERE sort_seq >= ? LIMIT 1 OFFSET ?",
-            T
-        );
+        let probe = format!("SELECT 1 FROM [{}] WHERE sort_seq >= ? LIMIT 1 OFFSET ?", T);
         {
             let mut stmt = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {}", probe))
@@ -4284,8 +4300,17 @@ pub async fn q_unread(
     // 先按原有的 filter_set + limit 语义选出"哪些行进入结果"（选择顺序、
     // 提前 break 都不变），再对选中的行批量取群昵称——批量化不改变选择
     // 集合本身，只把"逐行取昵称"挪到选择完成之后一次性做。
-    let mut selected: Vec<(String, i64, Vec<u8>, i64, i64, String, String, bool, &'static str)> =
-        Vec::new();
+    let mut selected: Vec<(
+        String,
+        i64,
+        Vec<u8>,
+        i64,
+        i64,
+        String,
+        String,
+        bool,
+        &'static str,
+    )> = Vec::new();
     for (username, unread, summary_bytes, ts, msg_type, sender, sender_name) in rows {
         let chat_type = chat_type_of(&username, names);
         if let Some(ref set) = filter_set {
@@ -4458,8 +4483,7 @@ pub async fn q_members(db: &DbCache, names: &Names, chat: &str) -> Result<Value>
                     .iter()
                     .map(|(uid, nick, remark)| {
                         let contact_display = contact_display(uid, nick, remark, &names_map2);
-                        let group_nickname =
-                            group_nicknames.get(uid).cloned().unwrap_or_default();
+                        let group_nickname = group_nicknames.get(uid).cloned().unwrap_or_default();
                         let disp = if group_nickname.is_empty() {
                             contact_display.clone()
                         } else {
@@ -4701,10 +4725,9 @@ mod force_invalidate_tests {
 
         let got = shards_to_force_invalidate(&db, &changed, &all_msg_db_keys);
 
-        let expected: HashSet<String> =
-            ["message_0.db".to_string(), "message_1.db".to_string()]
-                .into_iter()
-                .collect();
+        let expected: HashSet<String> = ["message_0.db".to_string(), "message_1.db".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(
             got, expected,
             "changed 全为已知会话时只应精准作废承载分片，不能牵连无关分片 message_2.db"
@@ -4730,10 +4753,7 @@ mod force_invalidate_tests {
 
         // "charlie" 是全新会话：它的 Msg_<md5> 表从未被任何 put_shard_schema
         // 记录过，route_shard_for_table 对它必然返回空。
-        let changed = vec![
-            ("alice".to_string(), 1_i64),
-            ("charlie".to_string(), 2_i64),
-        ];
+        let changed = vec![("alice".to_string(), 1_i64), ("charlie".to_string(), 2_i64)];
         let all_msg_db_keys = vec![
             "message_0.db".to_string(),
             "message_1.db".to_string(),
@@ -4791,7 +4811,10 @@ mod force_invalidate_tests {
 
         let got = shards_to_force_invalidate(&db, &changed, &all_msg_db_keys);
         let expected: HashSet<String> = all_msg_db_keys.iter().cloned().collect();
-        assert_eq!(got, expected, "全量作废时结果必须恰好等于 all_msg_db_keys 全集");
+        assert_eq!(
+            got, expected,
+            "全量作废时结果必须恰好等于 all_msg_db_keys 全集"
+        );
         assert_eq!(got.len(), 4);
     }
 }
@@ -5211,7 +5234,12 @@ mod aggregate_new_messages_by_shard_tests {
                 (
                     table_b.as_str(),
                     &[
-                        (1, 500, 0, "wxid_member1:\nhi from member1 (too old, must not leak)"),
+                        (
+                            1,
+                            500,
+                            0,
+                            "wxid_member1:\nhi from member1 (too old, must not leak)",
+                        ),
                         (2, 1500, 0, "wxid_member2:\nhi from member2"),
                         (3, 2500, 0, "wxid_member1:\nsecond msg from member1"),
                     ],
@@ -5263,7 +5291,10 @@ mod aggregate_new_messages_by_shard_tests {
             .await
             .expect("聚合查询不应失败");
 
-        assert_eq!(agg.scanned_shards, 1, "只有一个分片，且它命中目标表，应该被真正 open 一次");
+        assert_eq!(
+            agg.scanned_shards, 1,
+            "只有一个分片，且它命中目标表，应该被真正 open 一次"
+        );
         assert_eq!(agg.skipped_shards, 0);
         assert!(agg.scanned_rel_keys.contains("message_0.db"));
         assert!(agg.hit_rel_keys.contains("message_0.db"));
@@ -5280,17 +5311,39 @@ mod aggregate_new_messages_by_shard_tests {
             .iter()
             .filter(|m| m["username"].as_str() == Some(uname_b.as_str()))
             .collect();
-        assert_eq!(msgs_a.len(), 2, "会话 A：since_ts=1500，只应命中 ts=2000/3000");
-        assert_eq!(msgs_b.len(), 2, "会话 B：since_ts=800，只应命中 ts=1500/2500");
+        assert_eq!(
+            msgs_a.len(),
+            2,
+            "会话 A：since_ts=1500，只应命中 ts=2000/3000"
+        );
+        assert_eq!(
+            msgs_b.len(),
+            2,
+            "会话 B：since_ts=800，只应命中 ts=1500/2500"
+        );
 
         // ---- 各自 since_ts 下界都不多不少 ----
-        let mut ts_a: Vec<i64> = msgs_a.iter().map(|m| m["timestamp"].as_i64().unwrap()).collect();
+        let mut ts_a: Vec<i64> = msgs_a
+            .iter()
+            .map(|m| m["timestamp"].as_i64().unwrap())
+            .collect();
         ts_a.sort_unstable();
-        assert_eq!(ts_a, vec![2000, 3000], "会话 A 不应包含 ts=1000（<= since_ts=1500）");
+        assert_eq!(
+            ts_a,
+            vec![2000, 3000],
+            "会话 A 不应包含 ts=1000（<= since_ts=1500）"
+        );
 
-        let mut ts_b: Vec<i64> = msgs_b.iter().map(|m| m["timestamp"].as_i64().unwrap()).collect();
+        let mut ts_b: Vec<i64> = msgs_b
+            .iter()
+            .map(|m| m["timestamp"].as_i64().unwrap())
+            .collect();
         ts_b.sort_unstable();
-        assert_eq!(ts_b, vec![1500, 2500], "会话 B 不应包含 ts=500（<= since_ts=800）");
+        assert_eq!(
+            ts_b,
+            vec![1500, 2500],
+            "会话 B 不应包含 ts=500（<= since_ts=800）"
+        );
 
         // ---- 互不串号：会话归属字段精确对应各自会话，没有被对方污染 ----
         for m in &msgs_a {
@@ -5314,7 +5367,11 @@ mod aggregate_new_messages_by_shard_tests {
             .iter()
             .find(|m| m["timestamp"].as_i64() == Some(1500))
             .expect("ts=1500 的消息应该存在");
-        assert_eq!(msg_1500["sender"].as_str(), Some("群昵称2"), "ts=1500 来自 wxid_member2");
+        assert_eq!(
+            msg_1500["sender"].as_str(),
+            Some("群昵称2"),
+            "ts=1500 来自 wxid_member2"
+        );
         assert_eq!(
             msg_1500["content"].as_str(),
             Some("hi from member2"),
@@ -5415,7 +5472,11 @@ mod aggregate_new_messages_by_shard_tests {
             .await
             .expect("q_new_messages 不应失败");
 
-        assert_eq!(result["count"].as_u64(), Some(4), "a 2 条 + b 2 条，c 未变化不产出消息");
+        assert_eq!(
+            result["count"].as_u64(),
+            Some(4),
+            "a 2 条 + b 2 条，c 未变化不产出消息"
+        );
 
         let messages = result["messages"].as_array().expect("messages 应该是数组");
         let ts_a: Vec<i64> = messages
@@ -5428,8 +5489,16 @@ mod aggregate_new_messages_by_shard_tests {
             .filter(|m| m["username"].as_str() == Some(uname_b.as_str()))
             .map(|m| m["timestamp"].as_i64().unwrap())
             .collect();
-        assert_eq!(ts_a, vec![2000, 3000], "a 的消息不应包含 ts=1000（<= since_ts=1500）");
-        assert_eq!(ts_b, vec![1500, 2500], "b 的消息不应包含 ts=400（<= since_ts=800）");
+        assert_eq!(
+            ts_a,
+            vec![2000, 3000],
+            "a 的消息不应包含 ts=1000（<= since_ts=1500）"
+        );
+        assert_eq!(
+            ts_b,
+            vec![1500, 2500],
+            "b 的消息不应包含 ts=400（<= since_ts=800）"
+        );
         assert!(
             messages
                 .iter()
@@ -5438,7 +5507,9 @@ mod aggregate_new_messages_by_shard_tests {
             "不应该出现除 a/b 之外的会话（尤其是未变化的 c）"
         );
 
-        let new_state = result["new_state"].as_object().expect("new_state 应该是对象");
+        let new_state = result["new_state"]
+            .as_object()
+            .expect("new_state 应该是对象");
         assert_eq!(
             new_state[&uname_a].as_i64(),
             Some(3000),
@@ -5484,7 +5555,10 @@ mod aggregate_new_messages_by_shard_tests {
         assert!(agg.messages.is_empty());
         assert!(agg.scanned_rel_keys.is_empty());
         assert!(agg.hit_rel_keys.is_empty());
-        assert_eq!(agg.scanned_shards, 0, "不应该触碰任何分片（包括那个不存在的分片）");
+        assert_eq!(
+            agg.scanned_shards, 0,
+            "不应该触碰任何分片（包括那个不存在的分片）"
+        );
         assert_eq!(agg.skipped_shards, 0);
 
         // 边界的另一面：changed 非空，但其中的 uname 都不在 session_ctx
@@ -5649,8 +5723,7 @@ pub async fn q_new_messages(
     }
 
     let agg =
-        aggregate_new_messages_by_shard(db, names, &changed, &session_ctx, per_table_limit)
-            .await?;
+        aggregate_new_messages_by_shard(db, names, &changed, &session_ctx, per_table_limit).await?;
     eprintln!(
         "[shards] q_new_messages 聚合批次: {} 个会话变化, {} 个分片 open, {} 个分片按 mtime 跳过 (共 {} 个消息分片)",
         changed.len(),
@@ -6946,69 +7019,69 @@ pub async fn q_attachments(
         let rows: Vec<(i64, i64, i64, i64, String, i64, i64)> =
             tokio::task::spawn_blocking(move || {
                 hot.with(|conn| {
-                let id2u = load_id2u(conn);
+                    let id2u = load_id2u(conn);
 
-                // local_type 在 DB 里可能带高位 flag，过滤要 mask 低 32 bit
-                let placeholders = lo32_types2
-                    .iter()
-                    .map(|_| "?")
-                    .collect::<Vec<_>>()
-                    .join(",");
-                let mut clauses: Vec<String> =
-                    vec![format!("(local_type & 4294967295) IN ({})", placeholders)];
-                let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = lo32_types2
-                    .iter()
-                    .map(|t| Box::new(*t) as Box<dyn rusqlite::types::ToSql>)
-                    .collect();
-                if let Some(s) = since2 {
-                    clauses.push("create_time >= ?".into());
-                    params.push(Box::new(s));
-                }
-                if let Some(u) = until2 {
-                    clauses.push("create_time <= ?".into());
-                    params.push(Box::new(u));
-                }
-                let where_clause = format!("WHERE {}", clauses.join(" AND "));
+                    // local_type 在 DB 里可能带高位 flag，过滤要 mask 低 32 bit
+                    let placeholders = lo32_types2
+                        .iter()
+                        .map(|_| "?")
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let mut clauses: Vec<String> =
+                        vec![format!("(local_type & 4294967295) IN ({})", placeholders)];
+                    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = lo32_types2
+                        .iter()
+                        .map(|t| Box::new(*t) as Box<dyn rusqlite::types::ToSql>)
+                        .collect();
+                    if let Some(s) = since2 {
+                        clauses.push("create_time >= ?".into());
+                        params.push(Box::new(s));
+                    }
+                    if let Some(u) = until2 {
+                        clauses.push("create_time <= ?".into());
+                        params.push(Box::new(u));
+                    }
+                    let where_clause = format!("WHERE {}", clauses.join(" AND "));
 
-                let sql = format!(
-                    "SELECT local_id, local_type, create_time, real_sender_id,
+                    let sql = format!(
+                        "SELECT local_id, local_type, create_time, real_sender_id,
                             message_content, WCDB_CT_message_content
                      FROM [{}] {} ORDER BY create_time DESC LIMIT ?",
-                    tname, where_clause
-                );
-                params.push(Box::new(per_db_cap as i64));
+                        tname, where_clause
+                    );
+                    params.push(Box::new(per_db_cap as i64));
 
-                let params_ref: Vec<&dyn rusqlite::types::ToSql> =
-                    params.iter().map(|p| p.as_ref()).collect();
-                let mut stmt = conn.prepare(&sql)?;
-                let rows: Vec<(i64, i64, i64, i64, String, i64, i64)> = stmt
-                    .query_map(params_ref.as_slice(), |row| {
-                        let local_id: i64 = row.get(0)?;
-                        let raw_type: i64 = row.get(1)?;
-                        let lo32 = (raw_type as u64 & 0xFFFFFFFF) as i64;
-                        let ts: i64 = row.get(2)?;
-                        let real_sender_id: i64 = row.get(3)?;
-                        let content_bytes = get_content_bytes(row, 4);
-                        let ct: i64 = row.get::<_, i64>(5).unwrap_or(0);
-                        let content = decompress_message(&content_bytes, ct);
-                        let sender = if is_group2 {
-                            sender_label(
-                                real_sender_id,
-                                &content,
-                                true,
-                                &uname,
-                                &id2u,
-                                &names_map,
-                                &group_nicknames2,
-                            )
-                        } else {
-                            String::new()
-                        };
-                        Ok((local_id, lo32, ts, real_sender_id, sender, ts, db_idx2))
-                    })?
-                    .filter_map(|r| r.ok())
-                    .collect();
-                Ok::<_, anyhow::Error>(rows)
+                    let params_ref: Vec<&dyn rusqlite::types::ToSql> =
+                        params.iter().map(|p| p.as_ref()).collect();
+                    let mut stmt = conn.prepare(&sql)?;
+                    let rows: Vec<(i64, i64, i64, i64, String, i64, i64)> = stmt
+                        .query_map(params_ref.as_slice(), |row| {
+                            let local_id: i64 = row.get(0)?;
+                            let raw_type: i64 = row.get(1)?;
+                            let lo32 = (raw_type as u64 & 0xFFFFFFFF) as i64;
+                            let ts: i64 = row.get(2)?;
+                            let real_sender_id: i64 = row.get(3)?;
+                            let content_bytes = get_content_bytes(row, 4);
+                            let ct: i64 = row.get::<_, i64>(5).unwrap_or(0);
+                            let content = decompress_message(&content_bytes, ct);
+                            let sender = if is_group2 {
+                                sender_label(
+                                    real_sender_id,
+                                    &content,
+                                    true,
+                                    &uname,
+                                    &id2u,
+                                    &names_map,
+                                    &group_nicknames2,
+                                )
+                            } else {
+                                String::new()
+                            };
+                            Ok((local_id, lo32, ts, real_sender_id, sender, ts, db_idx2))
+                        })?
+                        .filter_map(|r| r.ok())
+                        .collect();
+                    Ok::<_, anyhow::Error>(rows)
                 })
             })
             .await??;

@@ -531,8 +531,15 @@ pub fn build_wal_index_cached(
             // 有新帧：深拷贝一次旧快照做种子、只扫增量区间。旧 Arc 不动
             // ——已存在连接的视图保持冻结。
             let seed_idx = (*snapshot).clone();
-            let (merged, end) =
-                scan_wal_frames(&mut file, start, file_len, salt1, salt2, seed_idx, Some(tag))?;
+            let (merged, end) = scan_wal_frames(
+                &mut file,
+                start,
+                file_len,
+                salt1,
+                salt2,
+                seed_idx,
+                Some(tag),
+            )?;
             (Arc::new(merged), end)
         }
         None => {
@@ -695,24 +702,36 @@ mod tests {
 
         std::fs::write(&path, &buf).unwrap();
 
-        let src = build_wal_index(&path).unwrap().expect("应当解析出一个有效 WalSource");
+        let src = build_wal_index(&path)
+            .unwrap()
+            .expect("应当解析出一个有效 WalSource");
         assert_eq!(src.index.frames_total, 4);
         // 帧0（旧salt）被排除，帧1/2/3有效 => frames_valid = 3
         assert_eq!(src.index.frames_valid, 3);
-        assert_eq!(src.index.covered_page_count(), 2, "pgno=7 和 pgno=9 各算一个覆盖页");
+        assert_eq!(
+            src.index.covered_page_count(),
+            2,
+            "pgno=7 和 pgno=9 各算一个覆盖页"
+        );
         assert_eq!(src.index.last_commit_pgcnt(), Some(5));
 
         // pgno=7 应该指向帧2（0x03 填充），不是帧1（0x02）或帧0（0x01，且帧0本就该被排除）。
         let offset_pgno7 = src.index.offset_for(7).expect("pgno=7 应命中 WAL 索引");
         let mut src_mut = src;
         let raw7 = src_mut.read_raw_page(offset_pgno7).unwrap();
-        assert!(raw7.iter().all(|&b| b == 0x03), "pgno=7 必须读到最后写入的那一帧（0x03），而不是更早的 0x01/0x02");
+        assert!(
+            raw7.iter().all(|&b| b == 0x03),
+            "pgno=7 必须读到最后写入的那一帧（0x03），而不是更早的 0x01/0x02"
+        );
 
         let offset_pgno9 = src_mut.index.offset_for(9).expect("pgno=9 应命中 WAL 索引");
         let raw9 = src_mut.read_raw_page(offset_pgno9).unwrap();
         assert!(raw9.iter().all(|&b| b == 0x04));
 
-        assert!(src_mut.index.offset_for(0).is_none(), "pgno=0 恒非法，不应出现在索引里");
+        assert!(
+            src_mut.index.offset_for(0).is_none(),
+            "pgno=0 恒非法，不应出现在索引里"
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -799,7 +818,10 @@ mod tests {
         .unwrap();
         assert_eq!(index.frames_total, 1, "快照之外的帧不得被解析");
         assert!(index.offset_for(1).is_some());
-        assert!(index.offset_for(2).is_none(), "快照后追加的 pgno=2 不得进索引");
+        assert!(
+            index.offset_for(2).is_none(),
+            "快照后追加的 pgno=2 不得进索引"
+        );
         assert_eq!(index.last_commit_pgcnt(), Some(1));
         assert_eq!(
             scan_end, snapshot_len,
@@ -851,13 +873,17 @@ mod tests {
         buf.extend(write_frame(8, 2, s1, s2, 0x02));
         std::fs::write(&path, &buf).unwrap();
 
-        let first = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
+        let first = build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(first.index.frames_total, 2);
         assert_eq!(first.index.covered_page_count(), 2);
         let first_arc = first.index.clone();
 
         // 无变化的重建：必须零拷贝复用同一份快照。
-        let reused = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
+        let reused = build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
         assert!(
             Arc::ptr_eq(&first_arc, &reused.index),
             "无新帧时必须复用缓存的同一份 Arc 快照"
@@ -869,7 +895,9 @@ mod tests {
         appended.extend(write_frame(9, 3, s1, s2, 0x04));
         std::fs::write(&path, &appended).unwrap();
 
-        let mut second = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
+        let mut second = build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(second.index.frames_total, 4, "增量帧数应累积到旧快照之上");
         assert_eq!(second.index.covered_page_count(), 3);
         assert_eq!(second.index.last_commit_pgcnt(), Some(3));
@@ -910,7 +938,9 @@ mod tests {
         let mut buf = write_wal_header(old_s1, old_s2);
         buf.extend(write_frame(5, 1, old_s1, old_s2, 0x01));
         std::fs::write(&path, &buf).unwrap();
-        let first = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
+        let first = build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(first.index.frames_valid, 1);
 
         // reset：新 header + 旧世代残留帧 + 新世代帧（restart 的典型形态）。
@@ -919,7 +949,9 @@ mod tests {
         reset.extend(write_frame(6, 2, new_s1, new_s2, 0x0B));
         std::fs::write(&path, &reset).unwrap();
 
-        let second = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
+        let second = build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(second.index.frames_total, 2, "salt 变化必须触发全量重扫");
         assert_eq!(second.index.frames_valid, 1, "旧世代残留帧必须被过滤");
         assert!(second.index.offset_for(5).is_none());
@@ -940,12 +972,16 @@ mod tests {
         buf.extend(write_frame(1, 1, s1, s2, 0x01));
         buf.extend(write_frame(2, 2, s1, s2, 0x02));
         std::fs::write(&path, &buf).unwrap();
-        build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
+        build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
 
         // 同 salt、但只剩一帧。
         buf.truncate(WAL_HDR_SZ + (WAL_FRAME_HDR + PAGE_SZ));
         std::fs::write(&path, &buf).unwrap();
-        let after = build_wal_index_cached(&path, &cache, None).unwrap().unwrap();
+        let after = build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
         assert_eq!(after.index.frames_total, 1, "缩短的文件必须全量重扫");
         assert!(after.index.offset_for(2).is_none());
 
@@ -968,7 +1004,9 @@ mod tests {
         buf.extend(write_frame(8, 2, s1, s2, 0x02));
         std::fs::write(&path, &buf).unwrap();
         let cache_a = std::sync::Mutex::new(WalIndexCache::default());
-        let a = build_wal_index_cached(&path, &cache_a, Some(&dir)).unwrap().unwrap();
+        let a = build_wal_index_cached(&path, &cache_a, Some(&dir))
+            .unwrap()
+            .unwrap();
         assert_eq!(a.index.covered_page_count(), 2);
         assert!(wal_persist_path(&dir, &path).exists(), "全量扫描后必须落盘");
 
@@ -976,7 +1014,9 @@ mod tests {
         buf.extend(write_frame(9, 3, s1, s2, 0x03));
         std::fs::write(&path, &buf).unwrap();
         let cache_b = std::sync::Mutex::new(WalIndexCache::default());
-        let b = build_wal_index_cached(&path, &cache_b, Some(&dir)).unwrap().unwrap();
+        let b = build_wal_index_cached(&path, &cache_b, Some(&dir))
+            .unwrap()
+            .unwrap();
 
         // 关键断言：frames_total 只反映「本进程实际扫过的帧」。从磁盘种子
         // （2 帧的覆盖页，frames_total 近似记为 2）+ 只续扫 1 个新帧 ⇒ 3，
@@ -1007,14 +1047,18 @@ mod tests {
         buf.extend(write_frame(5, 1, old1, old2, 0x01));
         std::fs::write(&path, &buf).unwrap();
         let cache_a = std::sync::Mutex::new(WalIndexCache::default());
-        build_wal_index_cached(&path, &cache_a, Some(&dir)).unwrap().unwrap();
+        build_wal_index_cached(&path, &cache_a, Some(&dir))
+            .unwrap()
+            .unwrap();
 
         // reset：新 header + 新世代帧（旧持久化记录的 salt 已对不上）。
         let mut reset = write_wal_header(new1, new2);
         reset.extend(write_frame(6, 2, new1, new2, 0x0B));
         std::fs::write(&path, &reset).unwrap();
         let cache_b = std::sync::Mutex::new(WalIndexCache::default());
-        let b = build_wal_index_cached(&path, &cache_b, Some(&dir)).unwrap().unwrap();
+        let b = build_wal_index_cached(&path, &cache_b, Some(&dir))
+            .unwrap()
+            .unwrap();
         assert!(b.index.offset_for(5).is_none(), "旧世代 pgno 不得复活");
         assert!(b.index.offset_for(6).is_some());
         assert_eq!(b.index.frames_total, 1, "salt 变化必须全量重扫新世代");
@@ -1037,7 +1081,9 @@ mod tests {
         std::fs::write(wal_persist_path(&dir, &path), b"garbage not a wix file").unwrap();
 
         let cache = std::sync::Mutex::new(WalIndexCache::default());
-        let src = build_wal_index_cached(&path, &cache, Some(&dir)).unwrap().unwrap();
+        let src = build_wal_index_cached(&path, &cache, Some(&dir))
+            .unwrap()
+            .unwrap();
         assert_eq!(src.index.covered_page_count(), 1);
         assert!(src.index.offset_for(3).is_some());
 

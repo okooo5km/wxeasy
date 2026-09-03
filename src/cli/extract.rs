@@ -1,8 +1,8 @@
 use anyhow::Result;
 
-use crate::ipc::Request;
 use super::output::{print_value, resolve};
 use super::transport;
+use crate::ipc::Request;
 
 /// `wxeasy extract` — 把单个 `attachment_id` 对应的资源解密写到指定路径。
 ///
