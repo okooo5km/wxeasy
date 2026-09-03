@@ -24,19 +24,24 @@
 //! 顺序追加的，因此文件里越靠后出现的同 pgno 帧，数据越新。索引构建时按文件
 //! 顺序正向扫描、直接用 `HashMap::insert` 覆盖旧值，天然得到"最新帧生效"的语义。
 //!
-//! # 核心坑 3（与 wxeasy `crypto::wal::apply_wal` 保持一致的简化行为，务必读完）
+//! # 核心坑 3：只采纳"已提交"的帧（v0.3.4 起，与 `crypto::wal::apply_wal` 同步收紧）
 //! 标准 SQLite 的 wal-index（`-shm` 共享内存 + `xShmMap`）语义是：一个只读事务在
 //! 开始时会固定一个 `mxFrame`（当时 WAL 里最后一个**已提交**帧的位置），只读取
 //! `mxFrame` 之前（含）的帧，从而绝不会看到"尚未提交完的半个事务"。
 //!
-//! 本模块**没有**实现这层"按最后一次提交做截断"的语义——它和 wxeasy 现有的
-//! `crypto::wal::apply_wal` 行为完全一致：只要一帧的 salt 匹配，就会被采纳进
-//! 合并视图，不管它是否处于一个尚未写完 commit 帧的事务尾部。
+//! v0.3.3 及之前本模块没有这层截断：只要 salt 匹配就采纳，不管它是否处于一个
+//! 尚未写完 commit 帧的事务尾部。这在写入稀疏的开发机上没暴露问题，但在群消息
+//! 持续高频写入的用户机上（真实案例：23 个群一天 190 万条报价），几乎每一次
+//! `open()` 都会抓拍到微信正在写、还没 commit 的事务尾巴——B-tree 页处于撕裂
+//! 状态，`prepare(sqlite_master)` 直接报 `database disk image is malformed` /
+//! 解密 HMAC 失败，表现为 `find_msg_shards` 概率性瞬时失败，成功率随写入量下降
+//! 到 10% 以下。
 //!
-//! 这是刻意的选择，不是疏漏：本模块的正确性标准是"与 wxeasy 现有实现内容级
-//! 一致"（oracle = full_decrypt + apply_wal），如果 VFS 自作主张去做更严格的
-//! "仅提交视图"截断，反而会在 oracle 对拍时产生 VFS 更"正确"但与 oracle 不
-//! 一致的差异。
+//! 现在的语义对齐 SQLite 读者：salt 匹配的帧先进 `pending`，遇到 `commit_pgcnt != 0`
+//! 的 commit 帧才把整个事务一起采纳；扫描终点 `scan_end` 停在最后一个 commit 帧之后，
+//! 尾部未提交帧不进索引、不计数，下次续扫从这里重新读——事务随后提交会自然采纳，
+//! 微信回滚后被同 salt 新帧覆盖也能读到正确内容。`apply_wal` 做了同样的收紧，
+//! oracle 对拍语义保持一致。
 //!
 //! # 核心坑 4：WAL 帧的 pgno==1 与主库物理第一页解密路径相同
 //! 已被真实 SQLCipher（pysqlcipher3 造活体 WAL + 独立手写 AES 解密双重验证）
@@ -205,8 +210,18 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
     let frame_size = (WAL_FRAME_HDR + PAGE_SZ) as u64;
     let mut frame_offsets = seed.frame_offsets;
     let mut last_commit_pgcnt = seed.last_commit_pgcnt;
-    let mut frames_total = seed.frames_total;
-    let mut frames_valid = seed.frames_valid;
+    // 提交边界（v0.3.4）：`running_*` 是"本次扫描读到哪"，`committed_*` 是
+    // "最后一个 commit 帧之前（含）的统计"。返回值只暴露 committed 视图，
+    // 尚未提交的尾部帧连同其计数一起被丢弃，等下一次续扫从 `committed_end`
+    // 重新读取——见模块顶部"核心坑 3"。
+    let mut running_total = seed.frames_total;
+    let mut running_valid = seed.frames_valid;
+    let mut committed_total = seed.frames_total;
+    let mut committed_valid = seed.frames_valid;
+    let mut committed_end = start_pos;
+    // 当前未提交事务内、salt 匹配的帧：(pgno, page_data 偏移)。文件序即写入序，
+    // 提交时按顺序 insert 天然保留"后写覆盖先写"。
+    let mut pending: Vec<(u32, u64)> = Vec::new();
 
     let mut pos = start_pos;
     let mut fh_buf = [0u8; WAL_FRAME_HDR];
@@ -233,15 +248,22 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
         let fh = FrameHeader::parse(&fh_buf);
 
         let page_data_offset = pos + WAL_FRAME_HDR as u64;
-        frames_total += 1;
+        running_total += 1;
 
         // pgno 合法性 + salt 匹配，逐字对齐 wxeasy crypto::wal::apply_wal 的判定条件。
         if fh.pgno != 0 && fh.pgno <= 1_000_000 && fh.salt1 == salt1 && fh.salt2 == salt2 {
-            frames_valid += 1;
-            // 同一 pgno 多次出现时，后出现的（文件序靠后 = 更新）覆盖先出现的。
-            frame_offsets.insert(fh.pgno, page_data_offset);
+            running_valid += 1;
+            pending.push((fh.pgno, page_data_offset));
             if fh.commit_pgcnt != 0 {
+                // commit 帧：整个事务落定，才把它和它之前的同事务帧一起采纳。
+                // 同一 pgno 多次出现时，后出现的（文件序靠后 = 更新）覆盖先出现的。
+                for (pgno, offset) in pending.drain(..) {
+                    frame_offsets.insert(pgno, offset);
+                }
                 last_commit_pgcnt = Some(fh.commit_pgcnt);
+                committed_total = running_total;
+                committed_valid = running_valid;
+                committed_end = pos + frame_size;
             }
         }
 
@@ -260,7 +282,7 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
                     done as f64 / 1e9,
                     to_scan as f64 / 1e9,
                     (done as f64 / 1e6) / secs,
-                    frames_total,
+                    running_total,
                     frame_offsets.len()
                 );
                 next_report += WAL_SCAN_PROGRESS_STEP;
@@ -270,24 +292,28 @@ fn scan_wal_frames<R: io::Read + io::Seek>(
 
     if let Some(tag) = progress {
         eprintln!(
-            "[wal-scan] {} 完成: {} 帧, {} 覆盖页, 耗时 {:.1}s",
+            "[wal-scan] {} 完成: {} 帧, {} 覆盖页, 未提交尾帧 {}, 耗时 {:.1}s",
             tag,
-            frames_total,
+            committed_total,
             frame_offsets.len(),
+            pending.len(),
             started.elapsed().as_secs_f64()
         );
     }
 
+    // 尾部未提交帧（`pending` 里剩下的）不进索引、不计数；扫描终点停在最后
+    // 一个 commit 帧之后，下次续扫会把这段尾巴重新读一遍——事务提交后自然
+    // 采纳，微信回滚后被同 salt 新帧覆盖也能正确看到新内容。
     Ok((
         WalFrameIndex {
             frame_offsets,
             last_commit_pgcnt,
             header_salt1: salt1,
             header_salt2: salt2,
-            frames_total,
-            frames_valid,
+            frames_total: committed_total,
+            frames_valid: committed_valid,
         },
-        pos,
+        committed_end,
     ))
 }
 
@@ -737,8 +763,9 @@ mod tests {
     }
 
     /// 没有任何提交帧（`commit_pgcnt` 全为 0）时，`last_commit_pgcnt` 必须是
-    /// `None`，调用方据此回退主库物理页数——这对应"抓拍到一个尚未提交完的
-    /// 事务尾巴"这种边界场景（详见模块顶部"核心坑3"注释）。
+    /// `None`，调用方据此回退主库物理页数；并且这些未提交帧一个都不能进索引
+    /// ——这对应"抓拍到一个尚未提交完的事务尾巴"这种边界场景（详见模块顶部
+    /// "核心坑 3"注释）。
     #[test]
     fn no_commit_frame_yields_none_last_commit_pgcnt() {
         let path = tmp_path("no-commit");
@@ -749,8 +776,84 @@ mod tests {
         std::fs::write(&path, &buf).unwrap();
 
         let src = build_wal_index(&path).unwrap().unwrap();
-        assert_eq!(src.index.frames_valid, 1);
+        assert_eq!(src.index.frames_valid, 0, "未提交帧不得计入有效帧");
+        assert_eq!(src.index.frames_total, 0, "未提交帧不得计入已扫帧数");
+        assert!(src.index.offset_for(3).is_none(), "未提交帧不得进索引");
         assert_eq!(src.index.last_commit_pgcnt(), None);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// 核心坑 3 的完整形态：已提交事务之后跟着一个未提交尾巴，尾巴必须整体
+    /// 排除、扫描终点停在最后一个 commit 帧之后；随后尾巴补上 commit 帧，
+    /// 增量续扫从 commit 边界重读，整个事务（含之前被排除的帧）一起采纳，
+    /// 且同事务内同 pgno 仍是后写覆盖先写。
+    #[test]
+    fn uncommitted_tail_is_excluded_until_commit_then_adopted_incrementally() {
+        let path = tmp_path("uncommitted-tail");
+        let (s1, s2) = (0xD00D_u32, 0xBEEF_u32);
+        let cache = std::sync::Mutex::new(WalIndexCache::default());
+        let frame_size = (WAL_FRAME_HDR + PAGE_SZ) as u64;
+
+        let mut buf = write_wal_header(s1, s2);
+        buf.extend(write_frame(7, 1, s1, s2, 0x01)); // 事务 A，已提交
+        buf.extend(write_frame(8, 0, s1, s2, 0x02)); // 事务 B，未提交
+        buf.extend(write_frame(7, 0, s1, s2, 0x03)); // 事务 B 内又改了 pgno=7
+        std::fs::write(&path, &buf).unwrap();
+
+        let mut first = build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.index.frames_total, 1, "未提交尾巴不计数");
+        assert_eq!(first.index.covered_page_count(), 1);
+        assert!(
+            first.index.offset_for(8).is_none(),
+            "未提交的 pgno=8 不得进索引"
+        );
+        assert_eq!(first.index.last_commit_pgcnt(), Some(1));
+        let raw7 = first
+            .read_raw_page(first.index.offset_for(7).unwrap())
+            .unwrap();
+        assert!(
+            raw7.iter().all(|&b| b == 0x01),
+            "pgno=7 必须仍指向已提交版本，不能被未提交事务里的新帧覆盖"
+        );
+        let expected_end = WAL_HDR_SZ as u64 + frame_size;
+        {
+            let guard = cache.lock().unwrap();
+            assert_eq!(
+                guard.entry.as_ref().unwrap().scan_end,
+                expected_end,
+                "扫描终点必须停在最后一个 commit 帧之后"
+            );
+        }
+
+        // 事务 B 提交：补一个 commit 帧。
+        buf.extend(write_frame(9, 4, s1, s2, 0x04));
+        std::fs::write(&path, &buf).unwrap();
+        let mut second = build_wal_index_cached(&path, &cache, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.index.frames_total, 4, "提交后整个事务的帧都应计入");
+        assert_eq!(second.index.covered_page_count(), 3);
+        assert_eq!(second.index.last_commit_pgcnt(), Some(4));
+        assert!(second.index.offset_for(8).is_some());
+        assert!(second.index.offset_for(9).is_some());
+        let raw7 = second
+            .read_raw_page(second.index.offset_for(7).unwrap())
+            .unwrap();
+        assert!(
+            raw7.iter().all(|&b| b == 0x03),
+            "提交后 pgno=7 应指向事务 B 里的新帧"
+        );
+        // 旧连接的视图冻结不变。
+        assert_eq!(first.index.covered_page_count(), 1);
+
+        // 与无缓存全量扫描对拍。
+        let oracle = build_wal_index(&path).unwrap().unwrap();
+        for pg in [7u32, 8, 9] {
+            assert_eq!(oracle.index.offset_for(pg), second.index.offset_for(pg));
+        }
 
         let _ = std::fs::remove_file(&path);
     }

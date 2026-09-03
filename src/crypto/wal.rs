@@ -36,12 +36,19 @@ pub fn apply_wal(wal_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Result
         .write(true)
         .open(out_path)?;
 
+    // v0.3.4：只应用"已提交"的帧，对齐 SQLite 读者的 mxFrame 语义（与
+    // `daemon::wal_index` 的"核心坑 3"同步收紧）。salt 匹配的帧先攒进
+    // `pending`，遇到 commit 帧（commit_pgcnt != 0）才把整个事务按文件序写入
+    // 输出文件；扫描结束时 `pending` 里剩下的尾部未提交帧直接丢弃——微信正在
+    // 写、还没 commit 的半个事务如果被应用进去，得到的是撕裂的 B-tree。
+    let mut pending: Vec<(u32, &[u8])> = Vec::new();
     let mut pos = 0usize;
     while pos + frame_size <= frame_area.len() {
         let fh = &frame_area[pos..pos + WAL_FRAME_HDR];
         let page_data = &frame_area[pos + WAL_FRAME_HDR..pos + frame_size];
 
         let pgno = u32::from_be_bytes(fh[0..4].try_into().unwrap());
+        let commit_pgcnt = u32::from_be_bytes(fh[4..8].try_into().unwrap());
         let fs1 = u32::from_be_bytes(fh[8..12].try_into().unwrap());
         let fs2 = u32::from_be_bytes(fh[12..16].try_into().unwrap());
 
@@ -56,28 +63,34 @@ pub fn apply_wal(wal_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Result
             continue;
         }
 
-        let mut page_buf = page_data.to_vec();
-        if page_buf.len() < PAGE_SZ {
-            page_buf.resize(PAGE_SZ, 0);
+        pending.push((pgno, page_data));
+        if commit_pgcnt == 0 {
+            continue;
         }
+        for (pgno, page_data) in pending.drain(..) {
+            let mut page_buf = page_data.to_vec();
+            if page_buf.len() < PAGE_SZ {
+                page_buf.resize(PAGE_SZ, 0);
+            }
 
-        // fork patch（修复 WAL 帧 pgno==1 解密路由反了的致命 bug）：
-        // 原上游这里写的是 `if pgno == 1 { 2 } else { pgno }`，把 pgno==1 的
-        // WAL 帧强行当成"非首页"解密。这是一个已被真实 SQLCipher 实锤证伪的
-        // 错误假设——用 pysqlcipher3 造出真实活体 WAL、再配合独立手写的 AES
-        // 解密双重验证后确认：WAL 帧 targeting pgno==1 时，其 page_data 与
-        // 主库物理首页布局完全一致，同样带 16 字节 SALT 前缀，必须走"首页"
-        // 解密路径（跳 SALT、写回 SQLite 魔数）。原实现把它当非首页解密只会
-        // 解出乱码，SQLite 打开直接报 `file is not a database`——这极可能是
-        // 慢机上 wxeasy-daemon 反复出现 NOTADB 的根因之一（凡是导致数据库总页数
-        // 变化，例如收消息扩页，或建表/schema 变更的提交都会写 page1 进
-        // WAL）。修复方式：直接把真实 pgno 传给 decrypt_page，由它自身现成的
-        // pgno==1 分支统一处理"主库首页"和"WAL 首页帧"两种来源，pgno>1 的帧
-        // 行为不变。此修改作为 fork patch 的一部分保留。
-        let dec = decrypt_page(enc_key, &page_buf, pgno)?;
-        let file_offset = (pgno as u64 - 1) * PAGE_SZ as u64;
-        db_file.seek(SeekFrom::Start(file_offset))?;
-        db_file.write_all(&dec)?;
+            // fork patch（修复 WAL 帧 pgno==1 解密路由反了的致命 bug）：
+            // 原上游这里写的是 `if pgno == 1 { 2 } else { pgno }`，把 pgno==1 的
+            // WAL 帧强行当成"非首页"解密。这是一个已被真实 SQLCipher 实锤证伪的
+            // 错误假设——用 pysqlcipher3 造出真实活体 WAL、再配合独立手写的 AES
+            // 解密双重验证后确认：WAL 帧 targeting pgno==1 时，其 page_data 与
+            // 主库物理首页布局完全一致，同样带 16 字节 SALT 前缀，必须走"首页"
+            // 解密路径（跳 SALT、写回 SQLite 魔数）。原实现把它当非首页解密只会
+            // 解出乱码，SQLite 打开直接报 `file is not a database`——这极可能是
+            // 慢机上 wxeasy-daemon 反复出现 NOTADB 的根因之一（凡是导致数据库总页数
+            // 变化，例如收消息扩页，或建表/schema 变更的提交都会写 page1 进
+            // WAL）。修复方式：直接把真实 pgno 传给 decrypt_page，由它自身现成的
+            // pgno==1 分支统一处理"主库首页"和"WAL 首页帧"两种来源，pgno>1 的帧
+            // 行为不变。此修改作为 fork patch 的一部分保留。
+            let dec = decrypt_page(enc_key, &page_buf, pgno)?;
+            let file_offset = (pgno as u64 - 1) * PAGE_SZ as u64;
+            db_file.seek(SeekFrom::Start(file_offset))?;
+            db_file.write_all(&dec)?;
+        }
     }
 
     Ok(())

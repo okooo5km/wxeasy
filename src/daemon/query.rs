@@ -1396,11 +1396,12 @@ async fn find_msg_shards(
         // 与旧实现完全相同。
         let expected_generation = db.route_generation();
 
+        let username_owned = username.to_string();
         spawn_shard_scan(
             &mut join_set,
             &scan_semaphore,
             move || -> Result<ShardScanOutcome> {
-                let (tables_opt, max_ts) = hot.with(|conn| {
+                let scan_once = |conn: &Connection| {
                     if need_rebuild {
                         let mut stmt = conn.prepare(
                         "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'",
@@ -1423,7 +1424,27 @@ async fn find_msg_shards(
                         let ts = max_create_time(conn, &tname);
                         Ok((None, ts))
                     }
-                })?;
+                };
+                // v0.3.4：分片扫描失败先原地重试一次。`HotConnHandle::with` 失败时
+                // 已经丢弃了该连接，重试会重新 open()、重新读 WAL header 并续扫
+                // ——与微信并发写入（WAL restart / 事务提交瞬间）赛跑输掉的那一次，
+                // 隔 50ms 再来通常就赢了。仍失败才把带分片名的完整错误链上抛。
+                let (tables_opt, max_ts) = match hot.clone().with(&scan_once) {
+                    Ok(v) => v,
+                    Err(first) => {
+                        eprintln!(
+                            "[shards] {} 分片 {} 扫描失败，50ms 后重试一次: {:#}",
+                            username_owned, rel_key_owned, first
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        hot.with(&scan_once).map_err(|e| {
+                            e.context(format!(
+                                "扫描 {} 的消息分片 {} 失败",
+                                username_owned, rel_key_owned
+                            ))
+                        })?
+                    }
+                };
                 Ok(ShardScanOutcome {
                     rel_key: rel_key_owned,
                     tables_opt,
@@ -1449,9 +1470,9 @@ async fn find_msg_shards(
     while let Some(joined) = join_set.join_next().await {
         let outcome = match joined {
             Ok(Ok(outcome)) => outcome,
-            Ok(Err(e)) => {
-                return Err(e.context(format!("扫描 {} 的消息分片失败", username)));
-            }
+            // 分片名与内层原因已在扫描闭包里拼进错误链（"扫描 X 的消息分片
+            // message_N.db 失败: …"），这里原样上抛，不再套一层丢信息的外壳。
+            Ok(Err(e)) => return Err(e),
             Err(e) => {
                 anyhow::bail!("扫描 {} 的消息分片任务异常: {}", username, e);
             }

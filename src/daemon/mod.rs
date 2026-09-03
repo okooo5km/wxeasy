@@ -1,3 +1,21 @@
+/// daemon 侧所有 `eprintln!` 统一带本地时间戳（v0.3.4）。daemon 的 stderr 被
+/// `cli/transport.rs` 重定向到 `~/.wxeasy/daemon.log`，此前整份日志没有一个
+/// 时间，远程排障时无法与 PriceKeeper 的调试日志对齐。macro_rules 的文本作用
+/// 域覆盖下面声明的全部子模块，子模块里不加改动即可生效；CLI 侧（`cli/`）不受
+/// 影响，用户可见的 stderr 提示保持原样。
+macro_rules! eprintln {
+    ($($arg:tt)*) => {
+        ::std::eprintln!("{} {}", $crate::daemon::log_timestamp(), ::std::format_args!($($arg)*))
+    };
+}
+
+/// 供上面 `eprintln!` 宏使用的时间戳：本地时间，毫秒精度。
+pub fn log_timestamp() -> String {
+    chrono::Local::now()
+        .format("%Y-%m-%d %H:%M:%S%.3f")
+        .to_string()
+}
+
 pub mod cache;
 pub mod meta;
 mod names_cache;

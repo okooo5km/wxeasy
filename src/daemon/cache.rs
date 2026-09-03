@@ -1593,6 +1593,10 @@ impl HotConnPool {
 /// UB，不是"最坏情况 panic"。`HotConnHandle` 本身不持有 `Connection`
 /// （只持有槽位的 `Arc<Mutex<..>>`），这个类型上没有除 `with()` 之外能碰到
 /// 连接的方法——新增方法时必须保持这个结构不变。
+///
+/// `Clone` 只复制槽位的 `Arc` 与拥有型参数，不复制连接本身；`find_msg_shards`
+/// 用它在 `with()` 失败后原地重试一次（`with` 按值消费句柄）。
+#[derive(Clone)]
 pub struct HotConnHandle {
     slot: Arc<std::sync::Mutex<Option<HotConn>>>,
     conn_params: ConnParams,

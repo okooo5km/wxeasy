@@ -6,6 +6,20 @@ use super::cache::DbCache;
 use super::query::Names;
 use crate::ipc::{Request, Response};
 
+/// 请求处理失败时回给客户端的错误文本（v0.3.4）。
+///
+/// 此前用 `e.to_string()`，anyhow 的 `Display` 只打最外层 context，内层根因
+/// （`file is not a database` / `database disk image is malformed` / VFS 打开
+/// 失败……）在 daemon 出口就被丢掉，客户端只能看到"扫描 X 的消息分片失败"这
+/// 种没有正文的标题，PriceKeeper 那边所有按关键词分类的自愈路径全部哑火。
+/// 现在用 `{:#}` 输出完整错误链（`外层: 中层: 根因`），并同步写一行 daemon.log
+/// 便于事后对齐排障。
+fn request_error_text(e: anyhow::Error) -> String {
+    let text = format!("{e:#}");
+    eprintln!("[server] 请求失败: {text}");
+    text
+}
+
 /// 启动 IPC server（Unix socket / Windows named pipe）
 ///
 /// FIX 4（socket 先于 contact.db 加载可见）：`names` 用 `Option<Arc<Names>>`
@@ -228,7 +242,7 @@ async fn dispatch(
             debug_source,
         } => match query::q_sessions(db, &names_arc, limit, with_meta, debug_source).await {
             Ok(v) => Response::ok(v),
-            Err(e) => Response::err(e.to_string()),
+            Err(e) => Response::err(request_error_text(e)),
         },
         History {
             chat,
@@ -255,7 +269,7 @@ async fn dispatch(
             .await
             {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         Search {
@@ -283,19 +297,19 @@ async fn dispatch(
             .await
             {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         Contacts { query, limit } => {
             match query::q_contacts(&names_arc, query.as_deref(), limit).await {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         Groups { query, limit } => {
             match query::q_groups(db, &names_arc, query.as_deref(), limit).await {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         Unread {
@@ -305,11 +319,11 @@ async fn dispatch(
             debug_source,
         } => match query::q_unread(db, &names_arc, limit, filter, with_meta, debug_source).await {
             Ok(v) => Response::ok(v),
-            Err(e) => Response::err(e.to_string()),
+            Err(e) => Response::err(request_error_text(e)),
         },
         Members { chat } => match query::q_members(db, &names_arc, &chat).await {
             Ok(v) => Response::ok(v),
-            Err(e) => Response::err(e.to_string()),
+            Err(e) => Response::err(request_error_text(e)),
         },
         NewMessages {
             state,
@@ -320,7 +334,7 @@ async fn dispatch(
             match query::q_new_messages(db, &names_arc, state, limit, with_meta, debug_source).await
             {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         Favorites {
@@ -329,7 +343,7 @@ async fn dispatch(
             query,
         } => match query::q_favorites(db, limit, fav_type, query).await {
             Ok(v) => Response::ok(v),
-            Err(e) => Response::err(e.to_string()),
+            Err(e) => Response::err(request_error_text(e)),
         },
         Stats {
             chat,
@@ -341,7 +355,7 @@ async fn dispatch(
             match query::q_stats(db, &names_arc, &chat, since, until, with_meta, debug_source).await
             {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         SnsNotifications {
@@ -354,7 +368,7 @@ async fn dispatch(
                 .await
             {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         SnsFeed {
@@ -364,7 +378,7 @@ async fn dispatch(
             user,
         } => match query::q_sns_feed(db, &names_arc, limit, since, until, user.as_deref()).await {
             Ok(v) => Response::ok(v),
-            Err(e) => Response::err(e.to_string()),
+            Err(e) => Response::err(request_error_text(e)),
         },
         SnsSearch {
             keyword,
@@ -385,7 +399,7 @@ async fn dispatch(
             .await
             {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         BizArticles {
@@ -398,7 +412,7 @@ async fn dispatch(
             match query::q_biz_articles(db, &names_arc, limit, account, since, until, unread).await
             {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         Attachments {
@@ -426,7 +440,7 @@ async fn dispatch(
             .await
             {
                 Ok(v) => Response::ok(v),
-                Err(e) => Response::err(e.to_string()),
+                Err(e) => Response::err(request_error_text(e)),
             }
         }
         Extract {
@@ -435,7 +449,7 @@ async fn dispatch(
             overwrite,
         } => match query::q_extract(db, &names_arc, &attachment_id, &output, overwrite).await {
             Ok(v) => Response::ok(v),
-            Err(e) => Response::err(e.to_string()),
+            Err(e) => Response::err(request_error_text(e)),
         },
     }
 }
