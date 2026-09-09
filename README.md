@@ -16,6 +16,10 @@
 
 ---
 
+公开仓库：[okooo5km/wxeasy](https://github.com/okooo5km/wxeasy) · [最新下载](https://github.com/okooo5km/wxeasy/releases/latest) · [问题反馈](https://github.com/okooo5km/wxeasy/issues)
+
+克隆源码、安装 Skill 和下载 Release 无需 GitHub 登录或 SSH 密钥。
+
 ## AI Agent Skill
 
 通过 [skills CLI](https://github.com/vercel-labs/skills) 一键安装到 Claude Code、Cursor、Codex 等 agent：
@@ -36,7 +40,7 @@ npx skills add okooo5km/wxeasy -g
 
 ## 特性
 
-- **零依赖安装** — 单一 Rust 二进制，一行命令装完
+- **单文件安装** — 查询功能使用单一 Rust 二进制；macOS 实时提钥另需系统 LLDB
 - **毫秒级响应** — 后台 daemon 持久缓存解密数据库，mtime 不变则复用
 - **AI 友好** — `history` / `search` / `sessions` / `new-messages` / `stats` / `attachments` 默认返回 `{..., meta}` wrapper，agent 能直接消费 freshness / source 信息
 - **完全本地** — 数据不出本机，实时解密，无需全量预解密
@@ -55,7 +59,7 @@ v0.4.0 提供 Windows x86_64 与 macOS ARM／Intel 二进制；Linux 请从源�
 curl -fsSL https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.sh | bash
 ```
 
-**Windows**（PowerShell，以管理员身份运行）
+**Windows**（PowerShell；安装到当前用户目录）
 
 ```powershell
 irm https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.ps1 | iex
@@ -70,17 +74,18 @@ irm https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.ps1 | iex
 
 | 平台 | 文件 |
 |------|------|
-| macOS Apple Silicon | `wxeasy-macos-arm64` |
-| macOS Intel | `wxeasy-macos-x86_64` |
-| Windows x86_64 | `wxeasy-windows-x86_64.exe` |
+| macOS Apple Silicon | [wxeasy-macos-arm64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-macos-arm64) |
+| macOS Intel | [wxeasy-macos-x86_64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-macos-x86_64) |
+| Windows x86_64 | [wxeasy-windows-x86_64.exe](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-windows-x86_64.exe) |
 
-macOS / Linux：`chmod +x wxeasy && sudo mv wxeasy /usr/local/bin/`
+手动下载后，Windows 将文件重命名为 `wxeasy.exe` 并放入 PATH；macOS 将对应架构文件重命名为 `wxeasy`，然后执行 `chmod +x wxeasy && sudo mv wxeasy /usr/local/bin/`。
 
 **从源码构建**
 
 ```bash
-git clone git@github.com:okooo5km/wxeasy.git && cd wxeasy
-cargo build --release
+git clone https://github.com/okooo5km/wxeasy.git
+cd wxeasy
+cargo build --release --locked
 # 产物：target/release/wxeasy（Windows: wxeasy.exe）
 ```
 
@@ -324,17 +329,19 @@ daemon 首次解密后将数据库和 mtime 持久化到 `~/.wxeasy/cache/`。�
 
 ## 原理
 
-微信 4.x 使用 SQLCipher 4 风格加密本地数据库（AES-256-CBC + HMAC-SHA512；Windows/macOS 4.x 常见为 **32 字节 raw key 直接作 AES key**，page_size=4096，reserve=80）。
+微信 4.x 的本地数据库使用 SQLCipher 4 风格的加密页布局，常见参数为 AES-256-CBC、HMAC-SHA512、4096 字节页和 80 字节保留区。wxeasy 保存的是逐库 AES `enc_key`，daemon 按需解密并缓存。
 
-历史上 WCDB/SQLCipher 可能在进程内存中留下 `x'<64hex_key><32hex_salt>'` 一类特征串。wxeasy 通过 macOS Mach VM API（`mach_vm_region` + `mach_vm_read`）、Linux `/proc/<pid>/mem` 或 Windows `VirtualQueryEx` + `ReadProcessMemory`（需要 `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION`）扫描微信进程内存并匹配密钥，daemon 按需解密并缓存。
+旧版可通过各平台的进程内存扫描获取派生密钥；新版稳态扫描可能零命中。Windows 会先校验复用历史密钥，再尝试内置硬件断点方案，在 AES 设钥时捕获密钥。macOS Apple Silicon 可显式通过 LLDB 捕获 PBKDF2 原始输入，按每个数据库的 salt 派生 AES 密钥并验证 HMAC。**PBKDF2 原始输入与派生后的 AES 密钥不能混用。**
 
-**Windows 4.1.10+** 常见启用内存密钥保护（如 `cipher_memory_security`）：稳态甚至登录短窗内可读内存中往往 **不再** 暴露可用 raw key，经典扫描会 0 命中。此时 `wxeasy init` 会 **校验复用** 本机已有 `all_keys.json`（page1 魔数强校验，避免弱校验假阳性）。磁盘侧参数与旧密钥兼容时，**重启微信不会使已保存密钥失效**。若完全没有历史密钥，可用 [`tools/frida_capture_keys.py`](tools/frida_capture_keys.py) hook OpenSSL `aesni_set_encrypt_key`（AES-256）在库被使用时截取 raw key，再 `--merge` 回 `all_keys.json`。完整说明见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
+磁盘密钥未轮换时，重启微信通常不会使已保存的密钥失效。详见 [Windows 实现记录](docs/wechat-4.1.11-key-extraction-rust.md) 和 [macOS 上游分析](doc/pandorafuture-wx-cli-analysis.md)。
 
 ---
 
 ## 致谢
 
 本项目受 [ylytdeng/wechat-decrypt](https://github.com/ylytdeng/wechat-decrypt) 启发，在其基础上进行了重新设计与实现。感谢原作者的研究与探索。
+
+macOS LLDB 提钥参考并适配了 [pandorafuture/wx-cli](https://github.com/pandorafuture/wx-cli) 的实现，保留其 [MIT 许可](doc/pandorafuture-MIT.txt)。
 
 ---
 

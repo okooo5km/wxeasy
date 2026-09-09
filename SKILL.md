@@ -20,14 +20,36 @@ description: "wxeasy — 从本地微信数据库查询聊天记录、联系人�
 
 ## 平台与安装
 
+公开仓库：[okooo5km/wxeasy](https://github.com/okooo5km/wxeasy)。源码、安装脚本和 Release 可匿名访问，无需 GitHub token 或 SSH 密钥。
+
 本 Skill 对应 **wxeasy v0.4.0**。macOS LLDB 提钥需要 v0.4.0 或更高版本。
 
 优先使用 wxeasy，避免混用 pandorafuture 的 wx-cli 命令和配置格式。v0.4.0 提供 Windows x86_64、macOS ARM／Intel Release 二进制；Linux 保留源码兼容性检查。npm 发布已停用，不推荐 npm 安装旧包。
 
-- Windows：从 GitHub Release 下载 `wxeasy-windows-x86_64.exe`，或运行仓库 `install.ps1`。
-- macOS：从包含对应产物的 Release 下载 `wxeasy-macos-arm64`／`wxeasy-macos-x86_64`；`install.sh` 使用同名资源。
+- Windows：下载 [Windows 二进制](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-windows-x86_64.exe)，重命名为 `wxeasy.exe` 并加入 PATH；或使用下方安装命令。
+- macOS：按架构下载 [Apple Silicon](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-macos-arm64)／[Intel](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-macos-x86_64)，重命名为 `wxeasy` 并赋予执行权限；或使用下方安装命令。
 - 从 [v0.4.0 Release](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.0) 下载对应平台文件；Linux 使用 `cargo build --release --locked`。历史 Windows-only Release 不会补发 Mac 文件。
 - 用 `wxeasy --version` 和 `wxeasy init --help` 确认实际安装版本。
+
+安装最新 Release：
+
+```powershell
+# Windows，安装到当前用户目录
+irm https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.ps1 | iex
+```
+
+```bash
+# macOS
+curl -fsSL https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.sh | bash
+```
+
+Linux 或需要从源码构建时：
+
+```bash
+git clone https://github.com/okooo5km/wxeasy.git
+cd wxeasy
+cargo build --release --locked
+```
 
 ## 初始化与补齐密钥
 
@@ -49,7 +71,7 @@ wxeasy init --live
 wxeasy init --relaunch
 ```
 
-`--live` 附加已运行微信，需打开缺失会话触发开库；`--relaunch` 会重启微信，登录过程中抓取。现有仓库记录验证过微信 4.1.11.24，不保证未来所有版本。见 [Windows 实现记录](docs/wechat-4.1.11-key-extraction-rust.md)。
+`--live` 附加已运行微信，需打开缺失会话触发开库；`--relaunch` 会重启微信，登录过程中抓取。现有仓库记录验证过微信 4.1.11.24，不保证未来所有版本。见 [Windows 实现记录](https://github.com/okooo5km/wxeasy/blob/main/docs/wechat-4.1.11-key-extraction-rust.md)。
 
 ### macOS
 
@@ -61,7 +83,7 @@ wxeasy init --relaunch
 - 调试失败时检查 SIP、开发者工具授权、LLDB 和微信安装路径。上游说明 SIP 关闭是其提钥前提；不要保证 sudo 或重签名可以绕过 SIP。
 - 不自动关闭 SIP、重签名微信、重置 TCC 或重启微信。只有用户明确选择重启抓取时才执行 `--relaunch`。签名和系统权限由用户自行决定，不把全量 TCC reset 当默认初始化步骤。
 
-原始 PBKDF2 输入与 `all_keys.json` 的派生 AES `enc_key` 不可互换，禁止直接复制上游原始 key 到该字段。候选密钥不展示、不写调试日志。完整原理、许可和验证边界见 [上游分析](doc/pandorafuture-wx-cli-analysis.md)。
+原始 PBKDF2 输入与 `all_keys.json` 的派生 AES `enc_key` 不可互换，禁止直接复制上游原始 key 到该字段。候选密钥不展示、不写调试日志。完整原理、许可和验证边界见 [上游分析](https://github.com/okooo5km/wxeasy/blob/main/doc/pandorafuture-wx-cli-analysis.md)。
 
 ## Linux
 
@@ -336,4 +358,4 @@ CHAT 参数支持昵称、备注名、微信 ID，模糊匹配。不确定准确
 
 **为什么只能获取 500 条消息？**：这是默认输出条数，不是硬限制。显式传 `-n` 即可，例如 `wxeasy history "张三" -n 2000` 或 `wxeasy export "张三" -n 2000 -o chat.md`。
 
-**Windows 升级微信后 init 扫描 0 命中**：可能是新版内存密钥保护；检查历史复用和实时断点抓取日志，必要时显式运行 `wxeasy init --relaunch`。文档：[docs/windows-4.1.10-keys-and-reuse.md](docs/windows-4.1.10-keys-and-reuse.md)。
+**Windows 升级微信后 init 扫描 0 命中**：可能是新版内存密钥保护；检查历史复用和实时断点抓取日志，必要时显式运行 `wxeasy init --relaunch`。文档：[docs/windows-4.1.10-keys-and-reuse.md](https://github.com/okooo5km/wxeasy/blob/main/docs/windows-4.1.10-keys-and-reuse.md)。
