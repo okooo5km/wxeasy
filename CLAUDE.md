@@ -51,11 +51,15 @@ brew install mingw-w64   # 提供 x86_64-w64-mingw32-gcc，zstd-sys 等 C 依赖
 - [ ] `Cargo.toml` dependency section 顺序 → 检查是否有 dep 意外落入 target section
 - [ ] Windows named pipe 代码 → 确认函数都已定义，trait import 齐全
 
+## 当前版本
+
+v0.4.0。更新 Cargo.toml 版本后运行 cargo update --workspace，并同步 npm 源码清单及 optionalDependencies、SKILL.md、README.md 和 doc/release-v版本.md。npm 清单版本同步不代表 npm 注册表已发布。
+
 ## CI 结构
 
 Release workflow 构建 Windows x86_64、macOS Apple Silicon 和 macOS Intel，分别在原生 runner 上运行 cargo check、cargo test 和 release build。Linux 只运行兼容性 check，不发布二进制。npm 发布仍未恢复。
 
-- main push／workflow_dispatch：构建验证；v* tag：上传同名二进制与第三方许可。
+- main push／workflow_dispatch：构建验证；v* tag：全部平台和 Linux check 成功后统一发布二进制、第三方许可和对应版本说明。发布前校验 tag 与 Cargo 版本一致。
 - macOS 产物名保持 install.sh 的约定：wxeasy-macos-arm64、wxeasy-macos-x86_64。
 - macOS ARM 新增显式 init --live／--relaunch，使用系统 LLDB；Intel 仅保留稳态扫描和历史密钥复用。
 - LLDB 捕获的是 PBKDF2 原始输入，必须按每个数据库的 salt 派生并校验 page1 HMAC，再写入 all_keys.json 的 enc_key。严禁把原始输入当 AES key。

@@ -20,11 +20,13 @@ description: "wxeasy — 从本地微信数据库查询聊天记录、联系人�
 
 ## 平台与安装
 
-优先使用 wxeasy，避免混用 pandorafuture 的 wx-cli 命令和配置格式。Windows x86_64、macOS ARM／Intel 有构建任务；Linux 保留源码兼容性检查。npm 发布已停用，不推荐 npm 安装旧包。
+本 Skill 对应 **wxeasy v0.4.0**。macOS LLDB 提钥需要 v0.4.0 或更高版本。
+
+优先使用 wxeasy，避免混用 pandorafuture 的 wx-cli 命令和配置格式。v0.4.0 提供 Windows x86_64、macOS ARM／Intel Release 二进制；Linux 保留源码兼容性检查。npm 发布已停用，不推荐 npm 安装旧包。
 
 - Windows：从 GitHub Release 下载 `wxeasy-windows-x86_64.exe`，或运行仓库 `install.ps1`。
 - macOS：从包含对应产物的 Release 下载 `wxeasy-macos-arm64`／`wxeasy-macos-x86_64`；`install.sh` 使用同名资源。
-- 尚未发布包含 macOS 产物的新版本时，使用 CI artifact 或 `cargo build --release --locked`；不要声称历史 Release 已补齐。
+- 从 [v0.4.0 Release](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.0) 下载对应平台文件；Linux 使用 `cargo build --release --locked`。历史 Windows-only Release 不会补发 Mac 文件。
 - 用 `wxeasy --version` 和 `wxeasy init --help` 确认实际安装版本。
 
 ## 初始化与补齐密钥

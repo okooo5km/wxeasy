@@ -69,21 +69,58 @@ jobs:
             ${{ matrix.asset }}
             doc/pandorafuture-MIT.txt
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
-        with:
-          files: ${{ matrix.asset }}
-
-      - name: Upload third-party license
-        uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/') && matrix.target == 'aarch64-apple-darwin'
-        with:
-          files: doc/pandorafuture-MIT.txt
-
   linux-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo check --locked --target x86_64-unknown-linux-gnu
+
+  publish:
+    needs: [build, linux-check]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          assert os.environ['RELEASE_TAG'] == f'v{version}', 'Tag/Cargo version mismatch'
+          for path in pathlib.Path('npm').rglob('package.json'):
+              package = json.loads(path.read_text())
+              assert package['version'] == version, str(path)
+              assert all(v == version for v in package.get('optionalDependencies', {}).values()), str(path)
+          assert pathlib.Path(f'doc/release-v{version}.md').is_file(), 'Release notes missing'
+          PY
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: wxeasy-*
+          merge-multiple: true
+          path: release-assets
+      - name: Verify release assets
+        run: |
+          test -s release-assets/wxeasy-windows-x86_64.exe
+          test -s release-assets/wxeasy-macos-arm64
+          test -s release-assets/wxeasy-macos-x86_64
+          test -s release-assets/doc/pandorafuture-MIT.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: wxeasy ${{ github.ref_name }}
+          draft: true
+          body_path: doc/release-${{ github.ref_name }}.md
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/wxeasy-windows-x86_64.exe
+            release-assets/wxeasy-macos-arm64
+            release-assets/wxeasy-macos-x86_64
+            release-assets/doc/pandorafuture-MIT.txt
+      - name: Make complete release public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest

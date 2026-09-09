@@ -4,6 +4,8 @@
 
 **从命令行查询本地微信数据**
 
+当前版本：[v0.4.0](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.0) · [更新说明](doc/release-v0.4.0.md)
+
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
@@ -45,9 +47,9 @@ npx skills add okooo5km/wxeasy -g
 
 **优先使用 Release 二进制或源码构建。npm 发布已停用，npm 包可能落后。**
 
-Windows 与 macOS ARM／Intel 已配置构建；尚未发布包含 macOS 资源的新版本时，请使用 CI artifact 或源码构建。
+v0.4.0 提供 Windows x86_64 与 macOS ARM／Intel 二进制；Linux 请从源码构建。
 
-**macOS（Release 包含对应资源后可用 curl 安装）**
+**macOS（curl）**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.sh | bash
@@ -117,7 +119,7 @@ sudo wxeasy init
 wxeasy init
 ```
 
-> **Windows 微信 4.1.10+ 说明**：磁盘加密格式未变，但进程内存中往往不再常驻 `x'<key><salt>'` / 明文 raw key，**纯冷启动扫内存可能 0 命中**。`init` 会在扫描不足时 **page1 强校验复用** `~/.wxeasy/all_keys.json`（并兼容 `~/.wx-cli/all_keys.json`）。升级微信前请备份该文件。无历史密钥时可用可选工具 [`tools/frida_capture_keys.py`](tools/frida_capture_keys.py) 在 AES-NI 设钥瞬间动态捕获（需本机已登录微信）。详见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
+> **Windows 微信 4.1.10+ 说明**：磁盘加密格式未变，但进程内存中往往不再常驻 `x'<key><salt>'` / 明文 raw key，**纯冷启动扫内存可能 0 命中**。`init` 会在扫描不足时 **page1 强校验复用** `~/.wxeasy/all_keys.json`（并兼容 `~/.wx-cli/all_keys.json`）。升级微信前请备份该文件。无历史密钥时，`init` 会自动尝试硬件断点提钥；也可用 `wxeasy init --live` 增量抓取，或 `wxeasy init --relaunch` 显式重启微信后抓取。详见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
 
 验证安装：
 
