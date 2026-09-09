@@ -6,6 +6,8 @@ use std::path::Path;
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "macos", test))]
+mod macos_live;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
@@ -38,7 +40,7 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
     }
 }
 
-/// live-hook 抓取模式（微信 4.1.10+，仅 Windows 有实现）。
+/// live-hook 抓取模式（Windows 和 macOS Apple Silicon）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LiveMode {
     /// 附加已登录的微信，靠日常使用 / 同步逐步抓齐（增量）。
@@ -62,14 +64,23 @@ pub fn capture_keys_live(
     windows_live::run_capture(db_dir, mode, existing)
 }
 
-/// 非 Windows 平台：live-hook 暂不支持（保留旧稳态扫描路径）。
-#[cfg(not(target_os = "windows"))]
+/// macOS：通过 LLDB 捕获 PBKDF2 输入并转换为逐库 AES 密钥。
+#[cfg(target_os = "macos")]
+pub fn capture_keys_live(
+    db_dir: &Path,
+    mode: LiveMode,
+    existing: &[KeyEntry],
+) -> Result<Vec<KeyEntry>> {
+    macos_live::run_capture(db_dir, mode, existing)
+}
+
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub fn capture_keys_live(
     _db_dir: &Path,
     _mode: LiveMode,
     _existing: &[KeyEntry],
 ) -> Result<Vec<KeyEntry>> {
-    anyhow::bail!("live-hook 提钥当前仅支持 Windows（微信 4.1.10+）")
+    anyhow::bail!("live-hook 提钥当前仅支持 Windows 和 macOS Apple Silicon")
 }
 
 /// 读取 DB 文件前 16 字节作为 salt（hex），如果是明文 SQLite 则返回 None

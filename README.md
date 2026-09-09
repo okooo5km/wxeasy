@@ -4,6 +4,8 @@
 
 **从命令行查询本地微信数据**
 
+当前版本：[v0.4.0](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.0) · [更新说明](doc/release-v0.4.0.md)
+
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
 [![Rust](https://img.shields.io/badge/built%20with-Rust-orange.svg)](https://www.rust-lang.org)
@@ -43,13 +45,11 @@ npx skills add okooo5km/wxeasy -g
 
 ## 安装
 
-**npm（推荐，全平台）**
+**优先使用 Release 二进制或源码构建。npm 发布已停用，npm 包可能落后。**
 
-```bash
-npm install -g wxeasy
-```
+v0.4.0 提供 Windows x86_64 与 macOS ARM／Intel 二进制；Linux 请从源码构建。
 
-**macOS / Linux（curl）**
+**macOS（curl）**
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.sh | bash
@@ -72,8 +72,6 @@ irm https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.ps1 | iex
 |------|------|
 | macOS Apple Silicon | `wxeasy-macos-arm64` |
 | macOS Intel | `wxeasy-macos-x86_64` |
-| Linux x86_64 | `wxeasy-linux-x86_64` |
-| Linux arm64 | `wxeasy-linux-arm64` |
 | Windows x86_64 | `wxeasy-windows-x86_64.exe` |
 
 macOS / Linux：`chmod +x wxeasy && sudo mv wxeasy /usr/local/bin/`
@@ -94,34 +92,20 @@ cargo build --release
 
 保持微信运行，然后初始化（只需一次）：
 
-**macOS**（需要先对微信做 ad-hoc 签名，才能扫描其内存）
+**macOS**
+
+旧版稳态扫描和历史密钥复用仍可使用 `sudo wxeasy init`。Apple Silicon 新版增加 LLDB 路径：
 
 ```bash
-# 1. 签名（只需做一次，WeChat 更新后重做）
-codesign --force --deep --sign - /Applications/WeChat.app
-
-# 2. 清理旧 TCC 授权记录（重签名后必做，否则微信截图/通话权限可能 silent 失效）
-for s in ScreenCapture Camera Microphone AppleEvents AddressBook \
-         SystemPolicyDocumentsFolder SystemPolicyDownloadsFolder SystemPolicyDesktopFolder; do
-  tccutil reset "$s" com.tencent.xinWeChat
-done
-
-# 3. 重启微信，等待完全登录
-killall WeChat && open /Applications/WeChat.app
-
-# 4. 初始化
-sudo wxeasy init
+# 附加运行中的微信，打开会话触发开库，最多等待约 120 秒
+wxeasy init --live
+# 显式重启微信，在登录时抓取
+wxeasy init --relaunch
 ```
 
-> 如果 `codesign` 报 `signature in use`，先执行：
-> ```bash
-> codesign --remove-signature "/Applications/WeChat.app/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib"
-> codesign --force --deep --sign - /Applications/WeChat.app
-> ```
->
-> 重签名后 macOS 的 TCC 隐私授权按新 code signature 重新校验，旧记录会失效。如果跳过 `tccutil reset`，微信截图/视频通话/麦克风等权限可能"看起来已开启但实际拒绝"。详见 [macOS 权限与签名指南](docs/macos-permission-guide.md#五重签名后微信权限-silent-失效)。
+需要 Xcode Command Line Tools 的 LLDB／Python 和可用的调试权限。上游提钥流程要求关闭 SIP；wxeasy 不自动修改 SIP、签名或 TCC。Intel 暂不支持新版 LLDB 抓取，但保留构建、稳态扫描和历史密钥复用。上游的 ARM 4.1.7+ 范围不等于本集成的真实设备兼容性保证。
 
-> **副作用提示**：完成上面的 ad-hoc 重签后，macOS 会比较频繁地弹 `"微信" 想访问其他 App 的数据`（在微信里打开公众号文章时尤其容易触发）。这是当前 macOS invasive init 路径的已知副作用：重签后 WeChat 的 code identity 变了，它再访问自己原来的 container / 缓存数据会被系统识别为"跨 App 访问"。点"允许"通常只是放行当前 WeChat 进程；想彻底不弹得恢复官方 WeChat——这只放弃**当前依赖重签的默认路径**，**不等于放弃 memory-scan**：在本机 GUI Terminal 下、Terminal.app 拿到「开发者工具」TCC 授权后，对 Apple 官方签名的 WeChat 应当仍可以走通（实证覆盖只有 Catalina / Big Sur，macOS 14+ 未在本项目内实测）；只有 SSH 远程 + Apple 签名 WeChat 这种组合才必须重签。详见 [macOS 权限与签名指南 §六](docs/macos-permission-guide.md#六微信-想访问其他-app-的数据-弹窗)。
+实现、权限边界与验证状态见 [上游分析](doc/pandorafuture-wx-cli-analysis.md)。
 
 **Linux**
 
@@ -135,7 +119,7 @@ sudo wxeasy init
 wxeasy init
 ```
 
-> **Windows 微信 4.1.10+ 说明**：磁盘加密格式未变，但进程内存中往往不再常驻 `x'<key><salt>'` / 明文 raw key，**纯冷启动扫内存可能 0 命中**。`init` 会在扫描不足时 **page1 强校验复用** `~/.wxeasy/all_keys.json`（并兼容 `~/.wx-cli/all_keys.json`）。升级微信前请备份该文件。无历史密钥时可用可选工具 [`tools/frida_capture_keys.py`](tools/frida_capture_keys.py) 在 AES-NI 设钥瞬间动态捕获（需本机已登录微信）。详见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
+> **Windows 微信 4.1.10+ 说明**：磁盘加密格式未变，但进程内存中往往不再常驻 `x'<key><salt>'` / 明文 raw key，**纯冷启动扫内存可能 0 命中**。`init` 会在扫描不足时 **page1 强校验复用** `~/.wxeasy/all_keys.json`（并兼容 `~/.wx-cli/all_keys.json`）。升级微信前请备份该文件。无历史密钥时，`init` 会自动尝试硬件断点提钥；也可用 `wxeasy init --live` 增量抓取，或 `wxeasy init --relaunch` 显式重启微信后抓取。详见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
 
 验证安装：
 

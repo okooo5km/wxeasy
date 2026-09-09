@@ -11,14 +11,30 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset: wxeasy-windows-x86_64.exe
+            binary: wxeasy.exe
+          - os: macos-14
+            target: aarch64-apple-darwin
+            asset: wxeasy-macos-arm64
+            binary: wxeasy
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            asset: wxeasy-macos-x86_64
+            binary: wxeasy
+    runs-on: ${{ matrix.os }}
 
     steps:
       - uses: actions/checkout@v5
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-pc-windows-msvc
+          targets: ${{ matrix.target }}
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -27,23 +43,84 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: windows-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: windows-x86_64-cargo-
+          key: ${{ matrix.target }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ matrix.target }}-cargo-
+
+      - name: Check and test
+        run: |
+          cargo check --locked --target ${{ matrix.target }}
+          cargo test --locked --target ${{ matrix.target }}
+
+      - name: Test LLDB capture protocol
+        if: runner.os == 'macOS'
+        run: python3 -m unittest discover -s tests -p 'test_macos_capture.py'
 
       - name: Build release
-        run: cargo build --release --locked --target x86_64-pc-windows-msvc
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package binary
         shell: pwsh
-        run: Copy-Item "target\x86_64-pc-windows-msvc\release\wxeasy.exe" "wxeasy-windows-x86_64.exe"
+        run: Copy-Item "target/${{ matrix.target }}/release/${{ matrix.binary }}" "${{ matrix.asset }}"
 
       - uses: actions/upload-artifact@v7
         with:
-          name: wxeasy-windows-x86_64
-          path: wxeasy-windows-x86_64.exe
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}
+            doc/pandorafuture-MIT.txt
 
-      - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v3
-        if: startsWith(github.ref, 'refs/tags/')
+  linux-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo check --locked --target x86_64-unknown-linux-gnu
+
+  publish:
+    needs: [build, linux-check]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Verify release version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, tomllib
+          version = tomllib.loads(pathlib.Path('Cargo.toml').read_text())['package']['version']
+          assert os.environ['RELEASE_TAG'] == f'v{version}', 'Tag/Cargo version mismatch'
+          for path in pathlib.Path('npm').rglob('package.json'):
+              package = json.loads(path.read_text())
+              assert package['version'] == version, str(path)
+              assert all(v == version for v in package.get('optionalDependencies', {}).values()), str(path)
+          assert pathlib.Path(f'doc/release-v{version}.md').is_file(), 'Release notes missing'
+          PY
+      - uses: actions/download-artifact@v8
         with:
-          files: wxeasy-windows-x86_64.exe
+          pattern: wxeasy-*
+          merge-multiple: true
+          path: release-assets
+      - name: Verify release assets
+        run: |
+          test -s release-assets/wxeasy-windows-x86_64.exe
+          test -s release-assets/wxeasy-macos-arm64
+          test -s release-assets/wxeasy-macos-x86_64
+          test -s release-assets/doc/pandorafuture-MIT.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: wxeasy ${{ github.ref_name }}
+          draft: true
+          body_path: doc/release-${{ github.ref_name }}.md
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/wxeasy-windows-x86_64.exe
+            release-assets/wxeasy-macos-arm64
+            release-assets/wxeasy-macos-x86_64
+            release-assets/doc/pandorafuture-MIT.txt
+      - name: Make complete release public
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: gh release edit "$RELEASE_TAG" --draft=false --latest

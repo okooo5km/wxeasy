@@ -51,19 +51,19 @@ brew install mingw-w64   # 提供 x86_64-w64-mingw32-gcc，zstd-sys 等 C 依赖
 - [ ] `Cargo.toml` dependency section 顺序 → 检查是否有 dep 意外落入 target section
 - [ ] Windows named pipe 代码 → 确认函数都已定义，trait import 齐全
 
+## 当前版本
+
+v0.4.0。更新 Cargo.toml 版本后运行 cargo update --workspace，并同步 npm 源码清单及 optionalDependencies、SKILL.md、README.md 和 doc/release-v版本.md。npm 清单版本同步不代表 npm 注册表已发布。
+
 ## CI 结构
 
-自 v0.3.3 起只构建并发布 **Windows** 版本（`release.yml`）：
+Release workflow 构建 Windows x86_64、macOS Apple Silicon 和 macOS Intel，分别在原生 runner 上运行 cargo check、cargo test 和 release build。Linux 只运行兼容性 check，不发布二进制。npm 发布仍未恢复。
 
-```
-build job（windows-latest）
-  ├── cargo build --release --locked --target x86_64-pc-windows-msvc
-  ├── 打包 wxeasy-windows-x86_64.exe → upload-artifact
-  └── 打 tag 时上传到 GitHub Release（softprops/action-gh-release）
-```
-
-- 触发：push main（仅构建验证，不发布）/ push tag `v*`（构建 + 发布）/ workflow_dispatch。
-- 已停用：mac/Linux 构建、独立 check job、整套 npm 发布（`publish-npm`）。
-- 注意：源码仍保留 macOS/Linux 的 `#[cfg]` 分支，本地改动仍按上面「平台兼容性检查清单」做跨平台 `cargo check`；CI 不再产出非 Windows 二进制。
-- **坑：workflow 可能处于 `disabled_manually` 状态**——此时 push/tag 都不触发任何 run（表现为「推了没反应」）。先 `gh workflow list --all` 看状态，禁用了就 `gh workflow enable Release` 重新启用，再用 `gh workflow run Release --ref main` 手动补跑。
-- action 运行时须为 **node24**（GitHub 已弃用 node20，否则 Actions 报警告）：当前锁 `checkout@v5`、`cache@v5`、`upload-artifact@v7`、`softprops/action-gh-release@v3`。反直觉点：`upload-artifact@v5` 仍是 node20，必须用 v7；升版本前先 `gh api repos/<owner>/<action>/contents/action.yml?ref=<tag> --jq .content | base64 -d | grep using:` 逐个核实运行时。
+- main push／workflow_dispatch：构建验证；v* tag：全部平台和 Linux check 成功后统一发布二进制、第三方许可和对应版本说明。发布前校验 tag 与 Cargo 版本一致。
+- macOS 产物名保持 install.sh 的约定：wxeasy-macos-arm64、wxeasy-macos-x86_64。
+- macOS ARM 新增显式 init --live／--relaunch，使用系统 LLDB；Intel 仅保留稳态扫描和历史密钥复用。
+- LLDB 捕获的是 PBKDF2 原始输入，必须按每个数据库的 salt 派生并校验 page1 HMAC，再写入 all_keys.json 的 enc_key。严禁把原始输入当 AES key。
+- 不自动重签名、修改 SIP／TCC，不把候选密钥打印到日志。只有显式 --relaunch 才重启微信。
+- 修改捕获协议后运行 python -m unittest discover -s tests -p 'test_macos_capture.py' 和 cargo test scanner::macos_live。
+- 上游比较基线与限制见 [分析记录](doc/pandorafuture-wx-cli-analysis.md)，新增文档统一放 doc/。
+- workflow 禁用时用 gh workflow list --all 诊断，不以没有 run 作为成功证据。

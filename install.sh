@@ -12,8 +12,10 @@ ARCH=$(uname -m)
 case "${OS}-${ARCH}" in
   Darwin-arm64)   ASSET="wxeasy-macos-arm64" ;;
   Darwin-x86_64)  ASSET="wxeasy-macos-x86_64" ;;
-  Linux-x86_64)   ASSET="wxeasy-linux-x86_64" ;;
-  Linux-aarch64)  ASSET="wxeasy-linux-aarch64" ;;
+  Linux-*)
+    echo "当前版本不提供 Linux 二进制，请从源码执行 cargo build --release --locked"
+    exit 1
+    ;;
   *)
     echo "不支持的平台: ${OS}-${ARCH}"
     echo "请从 https://github.com/${REPO}/releases 手动下载"

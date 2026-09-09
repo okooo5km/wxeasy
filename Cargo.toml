@@ -1,8 +1,8 @@
 [package]
 name = "wxeasy"
-version = "0.3.4"
+version = "0.4.0"
 edition = "2021"
-description = "WeChat 4.x (macOS/Linux) local data CLI — decrypt SQLCipher DBs, query chat history, watch new messages"
+description = "WeChat 4.x (Windows/macOS/Linux) local data CLI — decrypt SQLCipher DBs, query chat history, watch new messages"
 license = "Apache-2.0"
 repository = "https://github.com/okooo5km/wxeasy"
 keywords = ["wechat", "sqlcipher", "decrypt", "cli"]

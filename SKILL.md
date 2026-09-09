@@ -18,109 +18,54 @@ description: "wxeasy — 从本地微信数据库查询聊天记录、联系人�
 - 帮我看看微信里
 - 搜索微信消息
 
-## Prerequisites
+## 平台与安装
 
-- macOS（Apple Silicon / Intel）、Linux 或 **Windows**
-- 微信桌面版 4.x 已安装并登录（Windows 进程名多为 `Weixin.exe`）
-- Node.js >= 14（npm 安装方式）或 curl / 发行版二进制
-- 首次 `wxeasy init`：macOS/Linux 常需 `sudo`；Windows 建议**管理员** PowerShell（便于 `OpenProcess` 读进程内存）
-- **Windows 4.1.10+**：内存扫描常 0 命中，依赖已校验的 `~/.wxeasy/all_keys.json` 复用——见 [docs/windows-4.1.10-keys-and-reuse.md](docs/windows-4.1.10-keys-and-reuse.md)
+本 Skill 对应 **wxeasy v0.4.0**。macOS LLDB 提钥需要 v0.4.0 或更高版本。
 
----
+优先使用 wxeasy，避免混用 pandorafuture 的 wx-cli 命令和配置格式。v0.4.0 提供 Windows x86_64、macOS ARM／Intel Release 二进制；Linux 保留源码兼容性检查。npm 发布已停用，不推荐 npm 安装旧包。
 
-## 安装
+- Windows：从 GitHub Release 下载 `wxeasy-windows-x86_64.exe`，或运行仓库 `install.ps1`。
+- macOS：从包含对应产物的 Release 下载 `wxeasy-macos-arm64`／`wxeasy-macos-x86_64`；`install.sh` 使用同名资源。
+- 从 [v0.4.0 Release](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.0) 下载对应平台文件；Linux 使用 `cargo build --release --locked`。历史 Windows-only Release 不会补发 Mac 文件。
+- 用 `wxeasy --version` 和 `wxeasy init --help` 确认实际安装版本。
 
-### 方式一：npm（推荐）
+## 初始化与补齐密钥
 
-```bash
-npm install -g wxeasy
-```
-
-### 方式二：curl
+先确保微信桌面版已安装、数据目录已建立。普通查询无需提权。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.sh | bash
+wxeasy init
+wxeasy init --force
 ```
 
-安装后验证：
-
-```bash
-wxeasy --version
-```
-
----
-
-## 初始化（首次使用，只需一次）
-
-### macOS（必须按顺序执行）
-
-**第一步：对 WeChat 重新签名**（只需做一次，WeChat 更新后需重做）
-
-```bash
-codesign --force --deep --sign - /Applications/WeChat.app
-```
-
-如果报错 `signature in use` 或某个 dylib 签名损坏，先修复再签名：
-
-```bash
-codesign --remove-signature "/Applications/WeChat.app/Contents/Frameworks/vlc_plugins/librtp_mpeg4_plugin.dylib"
-codesign --force --deep --sign - /Applications/WeChat.app
-```
-
-**第二步：清理 WeChat 在 macOS TCC 隐私数据库里的旧授权记录**（重签名后必做）
-
-macOS TCC 按 `bundle id + csreq` 联合校验权限；csreq 编码自代码签名。重签名后旧 csreq 和新签名不再匹配，旧授权记录会 silent 失效（System Settings 仍把开关画成"已允许"，运行时实际拒绝）。把 WeChat 在 TCC 里的旧记录抹掉，让 macOS 在下次微信请求权限时按新签名重新生成 csreq：
-
-```bash
-tccutil reset ScreenCapture com.tencent.xinWeChat   # 截图 / 屏幕共享
-tccutil reset Camera com.tencent.xinWeChat          # 视频通话 / 扫码
-tccutil reset Microphone com.tencent.xinWeChat      # 语音消息 / 通话
-tccutil reset AppleEvents com.tencent.xinWeChat     # 自动化 / 输入法
-tccutil reset AddressBook com.tencent.xinWeChat     # 通讯录
-tccutil reset SystemPolicyDocumentsFolder com.tencent.xinWeChat
-tccutil reset SystemPolicyDownloadsFolder com.tencent.xinWeChat
-tccutil reset SystemPolicyDesktopFolder com.tencent.xinWeChat
-```
-
-`tccutil` 对没有授权过的 service 会报 "No such bundle identifier"，是 no-op，不影响其他 service 的 reset。
-
-**第三步：重启 WeChat**
-
-```bash
-killall WeChat && open /Applications/WeChat.app
-# 等待微信完全登录后再继续
-```
-
-之后微信触发权限请求时按 GUI 提示重新允许即可。在 macOS 26 上，把 WeChat 加进 **隐私与安全 → 录屏与系统录音** 的上半区，**不要**只勾下半区的"仅系统录音"——后者不能授予截图权限。
-
-**第四步：初始化**
-
-```bash
-sudo wxeasy init
-```
-
-### Linux
-
-```bash
-sudo wxeasy init
-```
+初始化保留稳态扫描和本机历史密钥校验复用。已有密钥重启微信后通常仍有效；不要因为重启就删除配置。数据库出现新分片时重新初始化，再重启 daemon。
 
 ### Windows
 
+管理员 PowerShell 中运行 `wxeasy init`。新版稳态扫描零命中时会自动尝试现有硬件断点方案；这不等于完全不支持新版。
+
 ```powershell
-# 建议管理员 PowerShell；微信已登录更利于（旧版）内存扫描
-wxeasy init
+wxeasy init --live
+wxeasy init --relaunch
 ```
 
-`wxeasy init` 会自动：
-1. 检测微信数据目录（Windows 含 `MyDocument:` 等令牌与 `xwechat_files` 回退）
-2. 扫描进程内存，提取数据库密钥（可能 0 命中）
-3. 若扫描不足：对 `~/.wxeasy/all_keys.json` / `~/.wx-cli/all_keys.json` 等做 **page1 强校验复用**
-4. 写入 `~/.wxeasy/config.json` 与 `all_keys.json`
+`--live` 附加已运行微信，需打开缺失会话触发开库；`--relaunch` 会重启微信，登录过程中抓取。现有仓库记录验证过微信 4.1.11.24，不保证未来所有版本。见 [Windows 实现记录](docs/wechat-4.1.11-key-extraction-rust.md)。
 
-初始化完成后，后续查询一般无需提权，daemon 在首次调用时自动启动。
+### macOS
 
-**Windows 4.1.10+ 冷启动限制**：无任何历史密钥备份时，不保证仅靠内存扫描成功。升级前务必备份 `all_keys.json`。详见 [docs/windows-4.1.10-keys-and-reuse.md](docs/windows-4.1.10-keys-and-reuse.md)。
+- 旧版稳态扫描通常需要 `sudo wxeasy init` 及可用的调试权限。
+- Apple Silicon 新增 LLDB 抓取路径；需要 Xcode Command Line Tools 提供 LLDB 和 Python。建议从当前登录用户的终端运行。
+- `wxeasy init --live` 附加微信，最长约 120 秒；`wxeasy init --relaunch` 会重启微信并捕获登录时的 PBKDF2 调用。
+- Intel 二进制可构建，但新版 LLDB 抓取尚不支持；继续使用稳态扫描或历史密钥。
+- 上游声明支持微信 4.1.7+ ARM；这是上游范围，不代表 wxeasy 集成已经完成真实微信全版本实测。
+- 调试失败时检查 SIP、开发者工具授权、LLDB 和微信安装路径。上游说明 SIP 关闭是其提钥前提；不要保证 sudo 或重签名可以绕过 SIP。
+- 不自动关闭 SIP、重签名微信、重置 TCC 或重启微信。只有用户明确选择重启抓取时才执行 `--relaunch`。签名和系统权限由用户自行决定，不把全量 TCC reset 当默认初始化步骤。
+
+原始 PBKDF2 输入与 `all_keys.json` 的派生 AES `enc_key` 不可互换，禁止直接复制上游原始 key 到该字段。候选密钥不展示、不写调试日志。完整原理、许可和验证边界见 [上游分析](doc/pandorafuture-wx-cli-analysis.md)。
+
+## Linux
+
+可从源码构建并尝试 `sudo wxeasy init`。当前没有 Linux 发布产物，也没有实时断点提钥实现。
 
 ---
 
@@ -383,7 +328,7 @@ CHAT 参数支持昵称、备注名、微信 ID，模糊匹配。不确定准确
 **微信重启后是否要重新 init？**  
 - 磁盘密钥未轮换时，**已保存的 `all_keys.json` 通常仍然有效**，不必因重启而重扫。  
 - 若查询失败、换了账号/数据目录、或新增多分片库：再跑 `wxeasy init --force`（macOS/Linux 常用 `sudo`；Windows 建议管理员）。  
-- **Windows 4.1.10+**：`--force` 时内存扫描常为 0，会走校验复用；完全没有旧密钥则无法保证成功。
+- **Windows 4.1.10+**：稳态扫描常为零；初始化会尝试历史复用和硬件断点抓取，必要时显式使用 `--relaunch`。
 
 **daemon 无响应**：`wxeasy daemon stop` 后重新调用任意命令自动重启。`init --force` 更新密钥后若结果仍旧，先 stop daemon 再查。
 
@@ -391,4 +336,4 @@ CHAT 参数支持昵称、备注名、微信 ID，模糊匹配。不确定准确
 
 **为什么只能获取 500 条消息？**：这是默认输出条数，不是硬限制。显式传 `-n` 即可，例如 `wxeasy history "张三" -n 2000` 或 `wxeasy export "张三" -n 2000 -o chat.md`。
 
-**Windows 升级微信后 init 扫描 0 命中**：多为 4.1.10+ 预期行为；确认 `all_keys.json` 备份仍在并看日志是否「校验复用后可用密钥: N/N」。文档：[docs/windows-4.1.10-keys-and-reuse.md](docs/windows-4.1.10-keys-and-reuse.md)。
+**Windows 升级微信后 init 扫描 0 命中**：可能是新版内存密钥保护；检查历史复用和实时断点抓取日志，必要时显式运行 `wxeasy init --relaunch`。文档：[docs/windows-4.1.10-keys-and-reuse.md](docs/windows-4.1.10-keys-and-reuse.md)。
