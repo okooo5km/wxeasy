@@ -58,8 +58,8 @@ pub fn cmd_init(force: bool, live: bool, relaunch: bool) -> Result<()> {
              经典内存特征串已不存在。\n\
              可行路径：\n\
              1) 若本机有升级前备份的 all_keys.json，放到 {} 后重试\n\
-             2) 暂时保留/回退到仍可扫描的微信版本完成一次 init\n\
-             3) 等待 wxeasy 后续版本的增强提取",
+             2) Windows／macOS Apple Silicon：运行 wxeasy init --live 增量抓取\n\
+             3) 或显式运行 wxeasy init --relaunch，重启微信并在登录时抓取",
             config_path
                 .parent()
                 .unwrap_or(std::path::Path::new("."))
@@ -293,6 +293,11 @@ fn acquire_keys(
                 }
             }
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    if entries.len() < expected {
+        eprintln!("密钥尚未覆盖全部数据库。Apple Silicon 可运行 `wxeasy init --live` 或 `wxeasy init --relaunch`；后者会重启微信。Intel 暂保留稳态扫描和历史密钥复用。");
     }
 
     Ok(entries)

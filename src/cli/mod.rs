@@ -44,10 +44,10 @@ enum Commands {
         /// 强制重新扫描（覆盖已有配置）
         #[arg(long)]
         force: bool,
-        /// 实时提钥（增量）：附加已登录微信，在开库瞬间抓密钥（微信 4.1.10+，仅 Windows，需管理员）
+        /// 实时提钥（增量）：附加微信（Windows 管理员／macOS Apple Silicon LLDB）
         #[arg(long)]
         live: bool,
-        /// 实时提钥（全量）：以调试模式重新带起微信，登录同步一次抓齐（仅 Windows，需管理员）
+        /// 实时提钥：重启微信并在登录时抓取（Windows／macOS Apple Silicon）
         #[arg(long)]
         relaunch: bool,
     },
