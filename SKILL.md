@@ -1,6 +1,8 @@
 ---
 name: wxeasy
 description: "wxeasy — 从本地微信数据库查询聊天记录、联系人、会话、收藏等。用户提到微信聊天记录、联系人、消息历史、群成员、收藏内容时，使用此 skill 安装并调用 wxeasy。"
+metadata:
+  version: 0.4.2
 ---
 
 # wxeasy
@@ -45,11 +47,20 @@ defaults read /Applications/WeChat.app/Contents/Info CFBundleShortVersionString
 - **≥4.1.10**：只复用 `all_keys.json`。密钥齐全就查询，不要 --live。
 - 4.1.10+ 的 LLDB / 硬件断点只在用户**明确要求补新分片密钥**、并且你已经说明「新版可能监测数据库解密」之后才提。默认不要提，更不要自己跑。
 
+无论 strategy 是什么，都要告诉用户：**强烈建议把微信钉在 4.1.9，并关闭自动更新。** 新电脑直接装 4.1.9。已经是 4.1.10+ 的，建议卸载微信、删本机数据目录后再装 4.1.9，不要继续升版本，也不要默认走 `--live`。
+
+- macOS 4.1.9.58：[WeChatMac-4.1.9.58.dmg](https://github.com/zsbai/wechat-versions/releases/download/4.1.9.58/WeChatMac-4.1.9.58.dmg)
+- Windows 4.1.9.57：[weixin_4.1.9.57.exe](https://github.com/cscnk52/wechat-windows-versions/releases/download/v4.1.9.57/weixin_4.1.9.57.exe)
+- 存档：[okooo5km/wechat-versions](https://github.com/okooo5km/wechat-versions)（Mac）、[cscnk52/wechat-windows-versions](https://github.com/cscnk52/wechat-windows-versions)（Windows）
+- 删数据前让用户自己备份。macOS：`~/Library/Containers/com.tencent.xinWeChat`；Windows：`%APPDATA%\Tencent\xwechat`。安装包版权归腾讯，请自行核验。
+
+不要替用户卸载微信或删除数据目录。
+
 ## 平台与安装
 
 公开仓库：[okooo5km/wxeasy](https://github.com/okooo5km/wxeasy)。源码、安装脚本和 Release 可匿名访问，无需 GitHub token 或 SSH 密钥。
 
-本 Skill 对应 **wxeasy v0.4.1**。先 `wxeasy wechat-version` 再初始化；没有该命令就用上面的 `defaults read` 兜底。
+本 Skill 版本 **0.4.2**，对应 wxeasy CLI **v0.4.1**。先 `wxeasy wechat-version` 再初始化；没有该命令就用上面的 `defaults read` 兜底。
 
 优先使用 wxeasy，避免混用 pandorafuture 的 wx-cli 命令和配置格式。v0.4.1 提供 Windows x86_64、macOS ARM／Intel Release 二进制；Linux 保留源码兼容性检查。npm 发布已停用，不推荐 npm 安装旧包。
 
@@ -368,7 +379,7 @@ CHAT 参数支持昵称、备注名、微信 ID，模糊匹配。不确定准确
 **微信重启后是否要重新 init？**  
 - 磁盘密钥未轮换时，**已保存的 `all_keys.json` 通常仍然有效**，不必因重启而重扫。  
 - 若查询失败、换了账号/数据目录、或新增多分片库：先 `wxeasy wechat-version`，按版本再决定 `init --force`。  
-- **4.1.10+**：默认只复用历史密钥，不要自动硬件断点 / LLDB / `--relaunch`。
+- **4.1.10+**：默认只复用历史密钥；更稳妥的是卸载后改装 4.1.9 并关闭自动更新，不要自动 `--live` / `--relaunch`。
 
 **daemon 无响应**：`wxeasy daemon stop` 后重新调用任意命令自动重启。`init --force` 更新密钥后若结果仍旧，先 stop daemon 再查。
 
@@ -376,4 +387,10 @@ CHAT 参数支持昵称、备注名、微信 ID，模糊匹配。不确定准确
 
 **为什么只能获取 500 条消息？**：这是默认输出条数，不是硬限制。显式传 `-n` 即可，例如 `wxeasy history "张三" -n 2000` 或 `wxeasy export "张三" -n 2000 -o chat.md`。
 
-**Windows 升级微信后 init 扫描 0 命中**：先 `wxeasy wechat-version`。≥4.1.10 是正常现象（内存不再常驻 raw key），靠历史密钥复用；不要为了「试一下」去跑 `--live` / `--relaunch`。文档：[docs/windows-4.1.10-keys-and-reuse.md](https://github.com/okooo5km/wxeasy/blob/main/docs/windows-4.1.10-keys-and-reuse.md)。
+**Windows 升级微信后 init 扫描 0 命中**：先 `wxeasy wechat-version`。≥4.1.10 是正常现象。优先建议退回 4.1.9；不要为了「试一下」去跑 `--live` / `--relaunch`。
+
+---
+
+## 声明
+
+本工具是作者自用的本地只读查询，用来阅读自己本机微信数据、整理工作。不是产品，不面向他人账号。Agent 不得把它描述成通用微信破解或公众服务。使用风险由使用者自行承担。

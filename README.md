@@ -95,15 +95,24 @@ cargo build --release --locked
 
 ## 微信版本
 
-提钥路径由**微信桌面版版本**决定，不要一上来就走 4.1.10+ 的 live-hook。从 wx-cli 继承的原始稳态扫描（进程内存里搜 `x'<key><salt>'`）**仍然有效**，代码在 `main` 的 `src/scanner/{macos,windows,linux}.rs`，没有挪到别的分支。
-
-先看版本：
+先看版本，并保持在 **4.1.9 及以下**：
 
 ```bash
 wxeasy wechat-version
 ```
 
-命令会读取本机微信版本，并打印该走哪条路径。Agent 必须先跑这一步再建议 `init`。
+**强烈建议钉在 4.1.9。** 新电脑直接装 4.1.9，登录后在微信设置里关闭自动更新。已经装了 4.1.10+ 的，先卸载微信、删掉本机数据目录，再装 4.1.9。不要「先低后高」。
+
+| 平台 | 推荐版本 | 安装包 |
+|------|----------|--------|
+| macOS | 4.1.9.58 | [WeChatMac-4.1.9.58.dmg](https://github.com/zsbai/wechat-versions/releases/download/4.1.9.58/WeChatMac-4.1.9.58.dmg)（[发布页](https://github.com/zsbai/wechat-versions/releases/tag/4.1.9.58)） |
+| Windows | 4.1.9.57 | [weixin_4.1.9.57.exe](https://github.com/cscnk52/wechat-windows-versions/releases/download/v4.1.9.57/weixin_4.1.9.57.exe)（[发布页](https://github.com/cscnk52/wechat-windows-versions/releases/tag/v4.1.9.57)） |
+
+Mac 历史版本存档：[okooo5km/wechat-versions](https://github.com/okooo5km/wechat-versions)（fork 自 [zsbai/wechat-versions](https://github.com/zsbai/wechat-versions)）。安装包版权归腾讯，链接来自第三方存档，请自行核验文件。
+
+删数据会清掉本机聊天记录，先自行备份。macOS 目录：`~/Library/Containers/com.tencent.xinWeChat`。Windows 目录：`%APPDATA%\Tencent\xwechat`。
+
+提钥路径由微信桌面版版本决定，不要一上来就走 4.1.10+ 的 live-hook。
 
 | 微信版本 | 默认 `wxeasy init` | 缺钥时 |
 |---------|-------------------|--------|
@@ -113,18 +122,14 @@ wxeasy wechat-version
 
 实测结论：
 
-- **4.1.9 + 原始扫描**可以一次成型。新机把微信钉在 4.1.9，并关闭自动更新。
-- **4.1.10+** 内存不再常驻 raw key；新版客户端会监测本地数据库解密／提钥，可能弹出账号提醒。已提取的密钥可以继续复用，不要无故 `--force` / `--live`。
-- 不要「先低后高」。新消息分片出现时还要再解一次；若那时已经升到 4.1.10+，就只能走 live-hook 或把客户端退回 4.1.9。
-- wxeasy 与 wx-cli 同源，都是「找密钥 + 解密库」。换工具不改变技法，**版本才是分流条件**。
-
-本机已是 4.1.10+ 且密钥齐全：保持复用即可。`init --live` 只在缺钥、并且你清楚这是提钥行为时再用。
+- **4.1.9 + 原始扫描**可以一次成型。
+- **4.1.10+** 内存不再常驻 raw key，且可能监测本地数据库解密。不要无故 `--force` / `--live`。正确做法是退回 4.1.9，而不是继续升版本。
 
 ---
 
 ## 快速开始
 
-先看上一节的版本表，再初始化（只需一次）。`init` 会读取本机微信版本后选择路径。
+先把微信钉在 4.1.9 并关闭自动更新，再初始化（只需一次）。`init` 会读取本机微信版本后选择路径。
 
 **macOS**
 
@@ -388,4 +393,10 @@ macOS LLDB 提钥参考并适配了 [pandorafuture/wx-cli](https://github.com/pa
 
 ## 免责声明
 
-本工具仅用于学习和研究目的，用于解密**自己的**微信数据。请遵守相关法律法规，不得用于未经授权的数据访问。
+本仓库是作者自用的本地只读工具，用来阅读本机、自己账号下的微信聊天记录，方便整理工作。它不是产品，不面向公众提供服务，也不承诺可用性。
+
+只允许处理你自己的数据。禁止用于他人账号、未授权访问、传播他人聊天内容，或任何违法用途。
+
+使用即自行承担风险，并遵守法律与微信用户协议。作者不对封号、投诉、数据丢失或其他后果负责。
+
+微信客户端与安装包版权归腾讯所有。本项目不修改、不分发微信安装包；文中下载链接来自第三方历史版本存档，请自行核验。
