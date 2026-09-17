@@ -4,7 +4,7 @@
 
 **从命令行查询本地微信数据**
 
-当前版本：[v0.4.0](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.0) · [更新说明](doc/release-v0.4.0.md)
+当前版本：[v0.4.1](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.1) · [更新说明](doc/release-v0.4.1.md)
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
@@ -51,7 +51,7 @@ npx skills add okooo5km/wxeasy -g
 
 **优先使用 Release 二进制或源码构建。npm 发布已停用，npm 包可能落后。**
 
-v0.4.0 提供 Windows x86_64 与 macOS ARM／Intel 二进制；Linux 请从源码构建。
+v0.4.1 提供 Windows x86_64 与 macOS ARM／Intel 二进制；Linux 请从源码构建。
 
 **macOS（curl）**
 
@@ -74,9 +74,9 @@ irm https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.ps1 | iex
 
 | 平台 | 文件 |
 |------|------|
-| macOS Apple Silicon | [wxeasy-macos-arm64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-macos-arm64) |
-| macOS Intel | [wxeasy-macos-x86_64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-macos-x86_64) |
-| Windows x86_64 | [wxeasy-windows-x86_64.exe](https://github.com/okooo5km/wxeasy/releases/download/v0.4.0/wxeasy-windows-x86_64.exe) |
+| macOS Apple Silicon | [wxeasy-macos-arm64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-macos-arm64) |
+| macOS Intel | [wxeasy-macos-x86_64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-macos-x86_64) |
+| Windows x86_64 | [wxeasy-windows-x86_64.exe](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-windows-x86_64.exe) |
 
 手动下载后，Windows 将文件重命名为 `wxeasy.exe` 并放入 PATH；macOS 将对应架构文件重命名为 `wxeasy`，然后执行 `chmod +x wxeasy && sudo mv wxeasy /usr/local/bin/`。
 
@@ -93,13 +93,49 @@ cargo build --release --locked
 
 ---
 
+## 微信版本
+
+提钥路径由**微信桌面版版本**决定，不要一上来就走 4.1.10+ 的 live-hook。从 wx-cli 继承的原始稳态扫描（进程内存里搜 `x'<key><salt>'`）**仍然有效**，代码在 `main` 的 `src/scanner/{macos,windows,linux}.rs`，没有挪到别的分支。
+
+先看版本：
+
+```bash
+wxeasy wechat-version
+```
+
+命令会读取本机微信版本，并打印该走哪条路径。Agent 必须先跑这一步再建议 `init`。
+
+| 微信版本 | 默认 `wxeasy init` | 缺钥时 |
+|---------|-------------------|--------|
+| **4.1.9.x 及更早** | 原始稳态扫描 + 历史密钥复用 | 确认微信在跑，macOS 用 `sudo wxeasy init` |
+| **4.1.10+** | **只复用**已有 `all_keys.json`（page1 校验），不自动扫描、不自动 live-hook | 显式 `wxeasy init --live` 或 `--relaunch` |
+| 读不到版本 | 先尝试原始扫描再复用 | 看终端提示，确认版本后再选路径 |
+
+实测结论：
+
+- **4.1.9 + 原始扫描**可以一次成型。新机把微信钉在 4.1.9，并关闭自动更新。
+- **4.1.10+** 内存不再常驻 raw key；新版客户端会监测本地数据库解密／提钥，可能弹出账号提醒。已提取的密钥可以继续复用，不要无故 `--force` / `--live`。
+- 不要「先低后高」。新消息分片出现时还要再解一次；若那时已经升到 4.1.10+，就只能走 live-hook 或把客户端退回 4.1.9。
+- wxeasy 与 wx-cli 同源，都是「找密钥 + 解密库」。换工具不改变技法，**版本才是分流条件**。
+
+本机已是 4.1.10+ 且密钥齐全：保持复用即可。`init --live` 只在缺钥、并且你清楚这是提钥行为时再用。
+
+---
+
 ## 快速开始
 
-保持微信运行，然后初始化（只需一次）：
+先看上一节的版本表，再初始化（只需一次）。`init` 会读取本机微信版本后选择路径。
 
 **macOS**
 
-旧版稳态扫描和历史密钥复用仍可使用 `sudo wxeasy init`。Apple Silicon 新版增加 LLDB 路径：
+`4.1.9` 及更早用原始扫描；`4.1.10+` 默认只复用密钥。
+
+```bash
+# 4.1.9：原始稳态扫描（需要 sudo / 调试权限）
+sudo wxeasy init
+```
+
+Apple Silicon 在 **4.1.10+ 且缺钥** 时才用 LLDB：
 
 ```bash
 # 附加运行中的微信，打开会话触发开库，最多等待约 120 秒
@@ -108,7 +144,7 @@ wxeasy init --live
 wxeasy init --relaunch
 ```
 
-需要 Xcode Command Line Tools 的 LLDB／Python 和可用的调试权限。上游提钥流程要求关闭 SIP；wxeasy 不自动修改 SIP、签名或 TCC。Intel 暂不支持新版 LLDB 抓取，但保留构建、稳态扫描和历史密钥复用。上游的 ARM 4.1.7+ 范围不等于本集成的真实设备兼容性保证。
+LLDB 路径需要 Xcode Command Line Tools 的 LLDB／Python 和可用的调试权限。上游提钥流程要求关闭 SIP；wxeasy 不自动修改 SIP、签名或 TCC。Intel 暂不支持 LLDB 抓取，只保留原始扫描和历史密钥复用。上游的 ARM 4.1.7+ 范围不等于本集成的真实设备兼容性保证。
 
 实现、权限边界与验证状态见 [上游分析](doc/pandorafuture-wx-cli-analysis.md)。
 
@@ -124,7 +160,7 @@ sudo wxeasy init
 wxeasy init
 ```
 
-> **Windows 微信 4.1.10+ 说明**：磁盘加密格式未变，但进程内存中往往不再常驻 `x'<key><salt>'` / 明文 raw key，**纯冷启动扫内存可能 0 命中**。`init` 会在扫描不足时 **page1 强校验复用** `~/.wxeasy/all_keys.json`（并兼容 `~/.wx-cli/all_keys.json`）。升级微信前请备份该文件。无历史密钥时，`init` 会自动尝试硬件断点提钥；也可用 `wxeasy init --live` 增量抓取，或 `wxeasy init --relaunch` 显式重启微信后抓取。详见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
+> **Windows 说明**：`4.1.9` 走原始内存扫描。`4.1.10+` 磁盘加密格式未变，但进程内存中往往不再常驻 `x'<key><salt>'` / 明文 raw key，默认 `init` **只 page1 校验复用** `~/.wxeasy/all_keys.json`（并兼容 `~/.wx-cli/all_keys.json`），**不再自动**切硬件断点。升级微信前请备份该文件。缺钥时才显式 `wxeasy init --live` 或 `--relaunch`。详见 [Windows 4.1.10+ 密钥扫描与复用](docs/windows-4.1.10-keys-and-reuse.md)。
 
 验证安装：
 
@@ -331,7 +367,12 @@ daemon 首次解密后将数据库和 mtime 持久化到 `~/.wxeasy/cache/`。�
 
 微信 4.x 的本地数据库使用 SQLCipher 4 风格的加密页布局，常见参数为 AES-256-CBC、HMAC-SHA512、4096 字节页和 80 字节保留区。wxeasy 保存的是逐库 AES `enc_key`，daemon 按需解密并缓存。
 
-旧版可通过各平台的进程内存扫描获取派生密钥；新版稳态扫描可能零命中。Windows 会先校验复用历史密钥，再尝试内置硬件断点方案，在 AES 设钥时捕获密钥。macOS Apple Silicon 可显式通过 LLDB 捕获 PBKDF2 原始输入，按每个数据库的 salt 派生 AES 密钥并验证 HMAC。**PBKDF2 原始输入与派生后的 AES 密钥不能混用。**
+密钥提取按微信版本分流：
+
+- **≤4.1.9**：各平台进程内存扫描 `x'<key><salt>'`（wx-cli 同源的原始方法）。这条路径还在 `main`，没有删。
+- **≥4.1.10**：默认只校验复用已有密钥。Windows 可用硬件断点在 AES 设钥时捕获；macOS Apple Silicon 可显式通过 LLDB 捕获 PBKDF2 原始输入，按每个数据库的 salt 派生 AES 密钥并验证 HMAC。两条都要显式 `--live` / `--relaunch`，默认 `init` 不会自动切过去。
+
+**PBKDF2 原始输入与派生后的 AES 密钥不能混用。**
 
 磁盘密钥未轮换时，重启微信通常不会使已保存的密钥失效。详见 [Windows 实现记录](docs/wechat-4.1.11-key-extraction-rust.md) 和 [macOS 上游分析](doc/pandorafuture-wx-cli-analysis.md)。
 

@@ -47,26 +47,9 @@ pub fn cmd_init(force: bool, live: bool, relaunch: bool) -> Result<()> {
     println!("找到数据目录: {}", db_dir.display());
 
     // Step 2: 获取密钥。自动判断处理方式——
-    //   · 默认：旧稳态扫描 → 历史复用补缺 →（Windows 且仍不足）自动实时断点抓取；
+    //   · 先读微信版本：≤4.1.9 走 wx-cli 同源稳态扫描；≥4.1.10 先复用密钥，不自动 live-hook。
     //   · --live：附加已登录微信实时抓（增量）；--relaunch：带起微信一次抓齐（全量）。
     let entries = acquire_keys(&db_dir, &config_path, live, relaunch)?;
-
-    if entries.is_empty() {
-        anyhow::bail!(
-            "未能获取任何可用数据库密钥。\n\
-             原因可能是微信 4.1.10+ 开启了内存密钥保护（cipher_memory_security），\n\
-             经典内存特征串已不存在。\n\
-             可行路径：\n\
-             1) 若本机有升级前备份的 all_keys.json，放到 {} 后重试\n\
-             2) Windows／macOS Apple Silicon：运行 wxeasy init --live 增量抓取\n\
-             3) 或显式运行 wxeasy init --relaunch，重启微信并在登录时抓取",
-            config_path
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("all_keys.json")
-                .display()
-        );
-    }
 
     // === 权限边界 ===
     // 扫描完成后立即 drop 到调用用户身份，后续文件写入都是用户属主。
@@ -128,6 +111,12 @@ pub fn cmd_init(force: bool, live: bool, relaunch: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+pub fn cmd_wechat_version(json: bool) -> Result<()> {
+    let report = scanner::version_report();
+    let value = serde_json::to_value(&report)?;
+    crate::cli::output::print_value(&value, &crate::cli::output::resolve(json))
 }
 
 /// 如果当前以 root 身份运行且是通过 sudo 启动的，drop 到调用用户身份，
@@ -215,11 +204,12 @@ fn drop_privileges_if_sudo() -> Result<()> {
     Ok(())
 }
 
-/// 获取密钥的决策入口：保留旧稳态扫描，自动判断是否升级到实时断点提钥。
+/// 获取密钥的决策入口：先读微信版本，再决定走哪条提钥路径。
 ///
 /// - 显式 `--live` / `--relaunch`：直接走 live-hook（增量 / 全量），失败上抛。
-/// - 默认：旧稳态扫描 → 历史 all_keys 校验复用补缺 →（仅 Windows 且仍不足）自动
-///   附加微信实时抓取。旧版本（≤4.1.9）稳态扫描即可全中，不会触发 live。
+/// - ≤4.1.9：wx-cli 同源的原始稳态扫描 + 历史复用。不自动 live-hook。
+/// - ≥4.1.10：先校验复用 `all_keys.json`。缺钥时提示显式 `--live`，不自动切换。
+/// - 版本未知：先尝试原始扫描再复用，仍然不自动 live-hook。
 fn acquire_keys(
     db_dir: &Path,
     config_path: &Path,
@@ -227,9 +217,32 @@ fn acquire_keys(
     relaunch: bool,
 ) -> Result<Vec<scanner::KeyEntry>> {
     let expected = scanner::collect_db_salts(db_dir).len();
+    let version = scanner::detect_wechat_version();
+    match version {
+        Some(v) if v.uses_classic_scan() => {
+            println!("检测到微信 {v}（≤4.1.9）：走原始稳态扫描，不自动切换 live-hook。");
+        }
+        Some(v) => {
+            println!("检测到微信 {v}（≥4.1.10）：内存不再常驻 raw key。默认先复用已有密钥。");
+        }
+        None => {
+            println!("未能读取微信客户端版本，先按原始稳态扫描 + 历史密钥复用处理。");
+        }
+    }
 
     // 显式实时抓取
     if live || relaunch {
+        if let Some(v) = version {
+            if v.uses_classic_scan() {
+                eprintln!(
+                    "提示：当前微信 {v} 通常用 `wxeasy init` 稳态扫描即可；`--live` / `--relaunch` 是 4.1.10+ 路径。仍按指定执行。"
+                );
+            } else {
+                eprintln!(
+                    "注意：4.1.10+ 客户端可能监测数据库解密／提钥。已有密钥请优先复用，不要无故重新抓取。"
+                );
+            }
+        }
         let mode = if relaunch {
             scanner::LiveMode::Relaunch
         } else {
@@ -238,17 +251,26 @@ fn acquire_keys(
         return live_flow(db_dir, config_path, mode, expected);
     }
 
-    // 默认：旧稳态扫描（≤4.1.9 直接全中；4.1.10+ 常 0 命中）
-    println!("扫描加密密钥（需要管理员/root 权限）...");
-    let mut entries = scanner::scan_keys(db_dir).unwrap_or_else(|e| {
-        eprintln!("内存扫描失败: {}", e);
-        Vec::new()
-    });
+    // 已确认的 4.1.10+ 跳过原始扫描：特征串不在内存里，macOS 还可能逼出 ad-hoc 重签。
+    let try_classic = version.map(|v| v.uses_classic_scan()).unwrap_or(true);
+    let mut entries = Vec::new();
+    if try_classic {
+        println!("扫描加密密钥（需要管理员/root 权限）...");
+        entries = scanner::scan_keys(db_dir).unwrap_or_else(|e| {
+            eprintln!("内存扫描失败: {}", e);
+            Vec::new()
+        });
+    }
 
     // 历史 all_keys.json 校验复用补缺
     if entries.len() < expected {
         println!(
-            "内存扫描命中 {}/{}，尝试复用本机已有密钥并校验...",
+            "{} {}/{}，尝试复用本机已有密钥并校验...",
+            if try_classic {
+                "内存扫描命中"
+            } else {
+                "高版本跳过内存扫描，当前密钥"
+            },
             entries.len(),
             expected
         );
@@ -259,48 +281,67 @@ fn acquire_keys(
         }
     }
 
-    // 仍不足 → 自动升级到实时断点抓取（仅 Windows，微信 4.1.10+）
-    #[cfg(target_os = "windows")]
-    {
-        if entries.len() < expected {
-            println!();
-            println!(
-                "稳态扫描 + 历史复用得到 {}/{} 个密钥，判断微信可能为 4.1.10+（内存密钥用完即擦）。",
-                entries.len(),
-                expected
-            );
-            println!("自动切换到实时断点抓取，补齐缺失的库……");
-            // 保命：先把已拿到的落盘，避免实时抓取被中断时丢失
-            if !entries.is_empty() {
-                let _ = persist_keys(&keys_file_path_of(config_path), &entries);
-            }
-            match scanner::capture_keys_live(db_dir, scanner::LiveMode::Attach, &entries) {
-                Ok(mut live_found) => {
-                    merge_entries(&mut entries, live_found.drain(..));
-                    if entries.len() < expected {
-                        let reused = reuse_verified_keys(db_dir, config_path, &entries);
-                        if reused.len() > entries.len() {
-                            entries = reused;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("实时抓取未完成：{}", e);
-                    eprintln!(
-                        "可稍后启动并登录微信后运行 `wxeasy init --live` 增量补齐，\n\
-                         或 `wxeasy init --relaunch` 一次带起抓齐。"
-                    );
-                }
-            }
-        }
+    if entries.len() < expected {
+        print_incomplete_guidance(version, entries.len(), expected);
     }
 
-    #[cfg(target_os = "macos")]
-    if entries.len() < expected {
-        eprintln!("密钥尚未覆盖全部数据库。Apple Silicon 可运行 `wxeasy init --live` 或 `wxeasy init --relaunch`；后者会重启微信。Intel 暂保留稳态扫描和历史密钥复用。");
+    if entries.is_empty() {
+        anyhow::bail!("{}", empty_keys_hint(version, config_path));
     }
 
     Ok(entries)
+}
+
+fn print_incomplete_guidance(version: Option<scanner::WeChatVersion>, got: usize, expected: usize) {
+    eprintln!("密钥尚未覆盖全部数据库（{got}/{expected}）。");
+    match version {
+        Some(v) if v.uses_classic_scan() => {
+            eprintln!(
+                "当前微信 {v} 应走原始稳态扫描。请确认微信正在运行，并在 macOS 上用 sudo / 必要的调试权限重试。"
+            );
+        }
+        Some(v) => {
+            eprintln!("当前微信 {v} ≥ 4.1.10，原始内存扫描通常 0 命中。");
+            eprintln!("已有 all_keys.json 会自动校验复用；缺的库需要显式：");
+            eprintln!("  wxeasy init --live      # 附加已登录微信，打开缺失会话触发开库");
+            eprintln!("  wxeasy init --relaunch  # 重启微信并在登录时抓取");
+            eprintln!(
+                "新版客户端可能监测数据库解密／提钥。密钥已齐时不要 --force，也不要无故 live。"
+            );
+            #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+            eprintln!("本机是 Intel Mac，LLDB 抓取尚未支持；缺钥时只能复用历史密钥，或把微信钉在 4.1.9 再扫描。");
+        }
+        None => {
+            eprintln!("未能识别微信版本。已尝试原始稳态扫描 + 历史复用。");
+            eprintln!("若微信是 4.1.9 及更早：确认进程在跑后重试 `wxeasy init`。");
+            eprintln!("若微信是 4.1.10+：不要再盲扫，改用 `wxeasy init --live` 或 `--relaunch`。");
+        }
+    }
+}
+
+fn empty_keys_hint(version: Option<scanner::WeChatVersion>, config_path: &Path) -> String {
+    let keys_path = config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join("all_keys.json");
+    let version_line = match version {
+        Some(v) if v.uses_classic_scan() => format!(
+            "当前微信 {v} ≤ 4.1.9，原始稳态扫描应收齐密钥。请确认微信正在运行，并在 macOS 上使用 sudo。"
+        ),
+        Some(v) => format!(
+            "当前微信 {v} ≥ 4.1.10，进程内存不再常驻 raw key。不要再用默认 `init` 盲扫。"
+        ),
+        None => "未能读取微信版本。4.1.9 及更早走默认扫描；4.1.10+ 必须显式 live-hook。".into(),
+    };
+    format!(
+        "未能获取任何可用数据库密钥。\n\
+         {version_line}\n\
+         可行路径：\n\
+         1) 把已有 all_keys.json 放到 {} 后重试（会做 page1 校验）\n\
+         2) 微信 4.1.9 及更早：保持微信运行，再执行 `wxeasy init` / `sudo wxeasy init`\n\
+         3) 微信 4.1.10+（Windows／macOS Apple Silicon）：`wxeasy init --live` 或 `--relaunch`",
+        keys_path.display()
+    )
 }
 
 /// 显式实时抓取流程。

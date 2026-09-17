@@ -39,17 +39,23 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 初始化：检测数据目录并扫描加密密钥（自动判断稳态扫描 / 实时断点提钥）
+    /// 初始化：按微信版本选择稳态扫描或密钥复用（不自动 live-hook）
     Init {
         /// 强制重新扫描（覆盖已有配置）
         #[arg(long)]
         force: bool,
-        /// 实时提钥（增量）：附加微信（Windows 管理员／macOS Apple Silicon LLDB）
+        /// 实时提钥（4.1.10+ 增量）：附加微信。≤4.1.9 请用默认 init 稳态扫描
         #[arg(long)]
         live: bool,
-        /// 实时提钥：重启微信并在登录时抓取（Windows／macOS Apple Silicon）
+        /// 实时提钥（4.1.10+）：重启微信并在登录时抓取
         #[arg(long)]
         relaunch: bool,
+    },
+    /// 读取本机微信桌面版版本，并给出提钥路径
+    WechatVersion {
+        /// 输出 JSON（默认 YAML）
+        #[arg(long)]
+        json: bool,
     },
     /// 列出最近会话
     Sessions {
@@ -368,6 +374,7 @@ fn dispatch(cli: Cli) -> Result<()> {
             live,
             relaunch,
         } => init::cmd_init(force, live, relaunch),
+        Commands::WechatVersion { json } => init::cmd_wechat_version(json),
         Commands::Sessions { limit, json } => sessions::cmd_sessions(
             limit,
             OutputOpts {

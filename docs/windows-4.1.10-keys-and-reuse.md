@@ -123,11 +123,14 @@ Windows 扫描器（`src/scanner/windows.rs`）当前仍会：
 ```text
 wxeasy init [--force]
   ├─ 自动探测 db_dir
-  ├─ 内存扫描（可能 0 命中）
-  ├─ 若命中数 < 加密库数量：
+  ├─ 读取 Weixin.exe 版本
+  ├─ ≤4.1.9：原始内存扫描（wx-cli 同源特征串）
+  ├─ ≥4.1.10：跳过内存扫描，不自动切硬件断点
+  ├─ 若密钥数 < 加密库数量：
   │    从本机候选 all_keys.json 读取 enc_key
   │    对每个尚未命中的库做 page1 强校验
   │    扫描结果优先，旧密钥只补缺
+  │    仍缺钥时提示显式 --live / --relaunch，不自动 live-hook
   └─ 写入 ~/.wxeasy/all_keys.json + config.json
 ```
 

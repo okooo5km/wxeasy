@@ -8,6 +8,7 @@ mod linux;
 mod macos;
 #[cfg(any(target_os = "macos", test))]
 mod macos_live;
+mod wechat_version;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
@@ -39,6 +40,8 @@ pub fn scan_keys(db_dir: &Path) -> Result<Vec<KeyEntry>> {
         anyhow::bail!("当前平台不支持自动密钥扫描")
     }
 }
+
+pub use wechat_version::{detect_wechat_version, version_report, WeChatVersion};
 
 /// live-hook 抓取模式（Windows 和 macOS Apple Silicon）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
