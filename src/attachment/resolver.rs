@@ -151,8 +151,8 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 /// 在 `<attach_root>/<md5(chat)>/<YYYY-MM>/Img/<md5>[_t|_h].dat` 下找文件。
 ///
-/// 优先级：full > `_h`（HD thumbnail）> `_t`（thumbnail）。返回最优的一个；
-/// 找不到返回 None。
+/// 优先级：`_h`（高清原图，用户点开/下载过才有）> 无后缀（中尺寸，常为 HEVC）
+/// > `_t`（缩略图）。返回最优的一个；找不到返回 None。
 ///
 /// `attach_root` = `<wxchat_base>/msg/attach`。
 /// `create_time` 用于先定位 `<YYYY-MM>` 子目录；找不到时再 fallback 全月份扫描，
@@ -200,19 +200,10 @@ fn pick_best_in_img_dir(img_dir: &Path, file_md5: &str) -> Option<PathBuf> {
     if !img_dir.is_dir() {
         return None;
     }
-    let full = img_dir.join(format!("{}.dat", file_md5));
-    if full.is_file() {
-        return Some(full);
-    }
-    let hd = img_dir.join(format!("{}_h.dat", file_md5));
-    if hd.is_file() {
-        return Some(hd);
-    }
-    let thumb = img_dir.join(format!("{}_t.dat", file_md5));
-    if thumb.is_file() {
-        return Some(thumb);
-    }
-    None
+    ["_h", "", "_t"]
+        .iter()
+        .map(|suffix| img_dir.join(format!("{}{}.dat", file_md5, suffix)))
+        .find(|p| p.is_file())
 }
 
 fn three_month_candidates(unix_ts: i64) -> Vec<String> {
@@ -407,30 +398,38 @@ mod tests {
     }
 
     #[test]
-    fn pick_best_prefers_full_then_h_then_t() {
-        let tmp = tempdir_for_test();
-        let img = tmp.join("Img");
-        std::fs::create_dir_all(&img).unwrap();
+    fn pick_best_prefers_h_then_full_then_t() {
         let md5 = "abcd1234";
-        std::fs::write(img.join(format!("{}_t.dat", md5)), b"thumb").unwrap();
-        std::fs::write(img.join(format!("{}_h.dat", md5)), b"hd").unwrap();
-        // 只有 _t / _h 时取 _h
-        assert_eq!(
-            pick_best_in_img_dir(&img, md5)
-                .unwrap()
-                .file_name()
-                .unwrap(),
-            format!("{}_h.dat", md5).as_str()
-        );
-        // 加 full 后取 full
-        std::fs::write(img.join(format!("{}.dat", md5)), b"full").unwrap();
-        assert_eq!(
-            pick_best_in_img_dir(&img, md5)
-                .unwrap()
-                .file_name()
-                .unwrap(),
-            format!("{}.dat", md5).as_str()
-        );
+        // (有 _h, 有 full, 有 _t) → 期望文件名后缀；None 表示找不到
+        let cases: [(bool, bool, bool, Option<&str>); 8] = [
+            (false, false, false, None),
+            (false, false, true, Some("_t")),
+            (false, true, false, Some("")),
+            (false, true, true, Some("")),
+            (true, false, false, Some("_h")),
+            (true, false, true, Some("_h")),
+            (true, true, false, Some("_h")),
+            (true, true, true, Some("_h")),
+        ];
+        for (has_h, has_full, has_t, expected) in cases {
+            let img = tempdir_for_test().join("Img");
+            std::fs::create_dir_all(&img).unwrap();
+            for (present, suffix) in [(has_h, "_h"), (has_full, ""), (has_t, "_t")] {
+                if present {
+                    std::fs::write(img.join(format!("{}{}.dat", md5, suffix)), b"x").unwrap();
+                }
+            }
+            let got = pick_best_in_img_dir(&img, md5)
+                .map(|p| p.file_name().unwrap().to_string_lossy().into_owned());
+            let want = expected.map(|suffix| format!("{}{}.dat", md5, suffix));
+            assert_eq!(got, want, "h={} full={} t={}", has_h, has_full, has_t);
+        }
+    }
+
+    #[test]
+    fn pick_best_missing_dir_returns_none() {
+        let missing = tempdir_for_test().join("NoSuchImg");
+        assert_eq!(pick_best_in_img_dir(&missing, "abcd1234"), None);
     }
 
     fn tempdir_for_test() -> PathBuf {
