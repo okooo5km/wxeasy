@@ -38,9 +38,9 @@ brew install mingw-w64   # 提供 x86_64-w64-mingw32-gcc，zstd-sys 等 C 依赖
 
 ## Git 规则
 
-- 每次 commit 后必须 push（`git push wxeasy main`）
+- 每次 commit 后必须 push（`git push origin main`）
 - 打 tag 前确认 `cargo check` 和 `cargo update --workspace` 都已完成
-- remote 使用 `wxeasy`（SSH），不用 `origin`
+- remote 使用 `origin`（SSH）
 
 ## 平台兼容性检查清单
 
@@ -53,7 +53,7 @@ brew install mingw-w64   # 提供 x86_64-w64-mingw32-gcc，zstd-sys 等 C 依赖
 
 ## 当前版本
 
-v0.4.1。更新 Cargo.toml 版本后运行 cargo update --workspace，并同步 npm 源码清单及 optionalDependencies、SKILL.md、README.md 和 doc/release-v版本.md。npm 清单版本同步不代表 npm 注册表已发布。
+v0.4.2。更新 Cargo.toml 版本后运行 cargo update --workspace，并同步 npm 源码清单及 optionalDependencies、SKILL.md、README.md 和 doc/release-v版本.md。npm 清单版本同步不代表 npm 注册表已发布。
 
 ## CI 结构
 

@@ -2,7 +2,7 @@
 name: wxeasy
 description: "wxeasy — 从本地微信数据库查询聊天记录、联系人、会话、收藏等。用户提到微信聊天记录、联系人、消息历史、群成员、收藏内容时，使用此 skill 安装并调用 wxeasy。"
 metadata:
-  version: 0.4.2
+  version: 0.4.3
 ---
 
 # wxeasy
@@ -60,13 +60,13 @@ defaults read /Applications/WeChat.app/Contents/Info CFBundleShortVersionString
 
 公开仓库：[okooo5km/wxeasy](https://github.com/okooo5km/wxeasy)。源码、安装脚本和 Release 可匿名访问，无需 GitHub token 或 SSH 密钥。
 
-本 Skill 版本 **0.4.2**，对应 wxeasy CLI **v0.4.1**。先 `wxeasy wechat-version` 再初始化；没有该命令就用上面的 `defaults read` 兜底。
+本 Skill 版本 **0.4.3**，对应 wxeasy CLI **v0.4.2**。先 `wxeasy wechat-version` 再初始化；没有该命令就用上面的 `defaults read` 兜底。
 
-优先使用 wxeasy，避免混用 pandorafuture 的 wx-cli 命令和配置格式。v0.4.1 提供 Windows x86_64、macOS ARM／Intel Release 二进制；Linux 保留源码兼容性检查。npm 发布已停用，不推荐 npm 安装旧包。
+优先使用 wxeasy，避免混用 pandorafuture 的 wx-cli 命令和配置格式。v0.4.2 提供 Windows x86_64、macOS ARM／Intel Release 二进制；Linux 保留源码兼容性检查。npm 发布已停用，不推荐 npm 安装旧包。
 
-- Windows：下载 [Windows 二进制](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-windows-x86_64.exe)，重命名为 `wxeasy.exe` 并加入 PATH；或使用下方安装命令。
-- macOS：按架构下载 [Apple Silicon](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-macos-arm64)／[Intel](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-macos-x86_64)，重命名为 `wxeasy` 并赋予执行权限；或使用下方安装命令。
-- 从 [v0.4.1 Release](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.1) 下载对应平台文件；Linux 使用 `cargo build --release --locked`。历史 Windows-only Release 不会补发 Mac 文件。
+- Windows：下载 [Windows 二进制](https://github.com/okooo5km/wxeasy/releases/download/v0.4.2/wxeasy-windows-x86_64.exe)，重命名为 `wxeasy.exe` 并加入 PATH；或使用下方安装命令。
+- macOS：按架构下载 [Apple Silicon](https://github.com/okooo5km/wxeasy/releases/download/v0.4.2/wxeasy-macos-arm64)／[Intel](https://github.com/okooo5km/wxeasy/releases/download/v0.4.2/wxeasy-macos-x86_64)，重命名为 `wxeasy` 并赋予执行权限；或使用下方安装命令。
+- 从 [v0.4.2 Release](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.2) 下载对应平台文件；Linux 使用 `cargo build --release --locked`。历史 Windows-only Release 不会补发 Mac 文件。
 - 用 `wxeasy --version` 和 `wxeasy init --help` 确认实际安装版本。
 
 安装最新 Release：
@@ -294,6 +294,8 @@ wxeasy extract <attachment_id> -o /tmp/x.jpg --overwrite
 ```
 
 `attachments` 输出每条带：`attachment_id` / `kind`（当前固定 `image`）/ `type` / `local_id` / `timestamp` / `time`，群聊里另带 `sender`。命令名保留成 `attachments` 是为了后续扩到其他附件类型时不 break CLI。
+
+同一张图在 `Img/` 下最多有三档：`<md5>_h.dat`（高清原图，在微信里点开或下载过才有）、`<md5>.dat`（中尺寸，常为 HEVC）、`<md5>_t.dat`（缩略图）。`extract` 按 `_h` > 无后缀 > `_t` 取最好的一档；想要原图但 `dat_path` 不是 `_h.dat`，说明本地还没有高清版本。
 
 `extract` 报告里带：`md5` / `dat_path` / `dat_size` / `output` / `output_size` / `format`（实际识别出的图片格式：jpg / png / gif / webp / hevc 等）/ `decoder`（实际选用的解码器：`legacy_xor` / `v1_aes` / `v2`）。
 

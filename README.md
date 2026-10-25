@@ -4,7 +4,7 @@
 
 **从命令行查询本地微信数据**
 
-当前版本：[v0.4.1](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.1) · [更新说明](doc/release-v0.4.1.md)
+当前版本：[v0.4.2](https://github.com/okooo5km/wxeasy/releases/tag/v0.4.2) · [更新说明](doc/release-v0.4.2.md)
 
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey.svg)](#安装)
@@ -51,7 +51,7 @@ npx skills add okooo5km/wxeasy -g
 
 **优先使用 Release 二进制或源码构建。npm 发布已停用，npm 包可能落后。**
 
-v0.4.1 提供 Windows x86_64 与 macOS ARM／Intel 二进制；Linux 请从源码构建。
+v0.4.2 提供 Windows x86_64 与 macOS ARM／Intel 二进制；Linux 请从源码构建。
 
 **macOS（curl）**
 
@@ -74,9 +74,9 @@ irm https://raw.githubusercontent.com/okooo5km/wxeasy/main/install.ps1 | iex
 
 | 平台 | 文件 |
 |------|------|
-| macOS Apple Silicon | [wxeasy-macos-arm64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-macos-arm64) |
-| macOS Intel | [wxeasy-macos-x86_64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-macos-x86_64) |
-| Windows x86_64 | [wxeasy-windows-x86_64.exe](https://github.com/okooo5km/wxeasy/releases/download/v0.4.1/wxeasy-windows-x86_64.exe) |
+| macOS Apple Silicon | [wxeasy-macos-arm64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.2/wxeasy-macos-arm64) |
+| macOS Intel | [wxeasy-macos-x86_64](https://github.com/okooo5km/wxeasy/releases/download/v0.4.2/wxeasy-macos-x86_64) |
+| Windows x86_64 | [wxeasy-windows-x86_64.exe](https://github.com/okooo5km/wxeasy/releases/download/v0.4.2/wxeasy-windows-x86_64.exe) |
 
 手动下载后，Windows 将文件重命名为 `wxeasy.exe` 并放入 PATH；macOS 将对应架构文件重命名为 `wxeasy`，然后执行 `chmod +x wxeasy && sudo mv wxeasy /usr/local/bin/`。
 
@@ -270,6 +270,8 @@ wxeasy extract <attachment_id> -o /tmp/x.jpg --overwrite
 ```
 
 `attachments` 输出每条带：`attachment_id` / `kind` / `type` / `local_id` / `timestamp` / `time`，群聊里还有 `sender`。当前 `kind` 固定为 `image`；命令名保留成 `attachments` 是为了后续扩到其他附件类型时不 break CLI。
+
+同一张图在 `Img/` 下最多有三档：`<md5>_h.dat`（高清原图，在微信里点开或下载过才有）、`<md5>.dat`（中尺寸，常为 HEVC）、`<md5>_t.dat`（缩略图）。`extract` 按 `_h` > 无后缀 > `_t` 取最好的一档；想要原图但 `dat_path` 不是 `_h.dat`，说明本地还没有高清版本。
 
 `extract` 输出报告里带：`md5` / `dat_path` / `dat_size` / `output` / `output_size` / `format`（实际识别出的图片格式：jpg / png / gif / webp / hevc 等）/ `decoder`（实际选用的解码器：`legacy_xor` / `v1_aes` / `v2`）。
 
