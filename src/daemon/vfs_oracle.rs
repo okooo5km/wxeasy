@@ -200,8 +200,7 @@ fn stage_case(spec: &CaseSpec, scratch_root: &Path) -> Result<(DbCache, String)>
     // rel_key 形如 "message/message_0.db"，按其目录结构在 scratch db_dir 下复刻。
     let staged_db_path = db_dir.join(
         spec.rel_key
-            .replace('\\', std::path::MAIN_SEPARATOR_STR)
-            .replace('/', std::path::MAIN_SEPARATOR_STR),
+            .replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR),
     );
     if let Some(parent) = staged_db_path.parent() {
         std::fs::create_dir_all(parent)?;

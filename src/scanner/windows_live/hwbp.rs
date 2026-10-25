@@ -35,9 +35,10 @@ fn ctx_flags() -> CONTEXT_FLAGS {
 
 /// 取一个已置好 ContextFlags 的空 CONTEXT（`#[repr(align(16))]` 由 windows crate 保证）。
 fn fresh_context() -> CONTEXT {
-    let mut ctx = CONTEXT::default();
-    ctx.ContextFlags = ctx_flags();
-    ctx
+    CONTEXT {
+        ContextFlags: ctx_flags(),
+        ..Default::default()
+    }
 }
 
 /// 在一个线程上铺设最多 4 个执行断点（Dr0..Dr3）。

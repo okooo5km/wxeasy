@@ -106,8 +106,7 @@ fn find_wechat_pid() -> Option<u32> {
             return None;
         }
         loop {
-            let name =
-                std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8).to_string_lossy();
+            let name = std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr()).to_string_lossy();
             if name.eq_ignore_ascii_case("Weixin.exe") {
                 let pid = entry.th32ProcessID;
                 let _ = CloseHandle(snapshot);

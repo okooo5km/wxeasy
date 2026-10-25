@@ -50,7 +50,7 @@ impl CacheMode {
     /// 迁移后 `query.rs` 不再调用它（VFS 路径下没有分级缓存模式的概念了），
     /// 只在非 `test` 构建下才是"死代码"——`cargo test` 里 `vfs_oracle.rs`
     /// 仍然经 `DbCache::get`/`get_with_mode` 走这条旧路径做 oracle 对拍。
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn as_str(self) -> &'static str {
         match self {
             CacheMode::CacheHit => "cache_hit",
@@ -185,11 +185,9 @@ impl DbCache {
             if !dec_path.exists() {
                 continue;
             }
-            let db_path = self.db_dir.join(
-                rel_key
-                    .replace('\\', std::path::MAIN_SEPARATOR_STR)
-                    .replace('/', std::path::MAIN_SEPARATOR_STR),
-            );
+            let db_path = self
+                .db_dir
+                .join(rel_key.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR));
             let wal_path = wal_path_for(&db_path);
 
             let db_mt = mtime_nanos(&db_path);
@@ -278,11 +276,9 @@ impl DbCache {
     /// 仍保留给未来可能的独立调用方，并继续被下方单元测试直接验证。
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn source_freshness_secs(&self, rel_key: &str) -> Option<i64> {
-        let db_path = self.db_dir.join(
-            rel_key
-                .replace('\\', std::path::MAIN_SEPARATOR_STR)
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
+        let db_path = self
+            .db_dir
+            .join(rel_key.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR));
 
         let db_mt = mtime_nanos(&db_path);
         if db_mt == 0 {
@@ -307,11 +303,9 @@ impl DbCache {
             None => return Ok(None),
         };
 
-        let db_path = self.db_dir.join(
-            rel_key
-                .replace('\\', std::path::MAIN_SEPARATOR_STR)
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
+        let db_path = self
+            .db_dir
+            .join(rel_key.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR));
         if !db_path.exists() {
             return Ok(None);
         }
@@ -441,7 +435,7 @@ impl DbCache {
     /// 这条更细粒度的路径（同步解析参数、阻塞 I/O 延后到 `spawn_blocking`
     /// 内部），本方法目前只被 `#[cfg(test)]` 的 `vfs_oracle.rs` 直接调用做
     /// 对拍，非 test 构建下会报 dead_code，属预期。
-    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(dead_code)]
     pub fn open_conn(&self, rel_key: &str) -> Result<rusqlite::Connection> {
         self.resolve_conn_params(rel_key)?.open()
     }
@@ -494,11 +488,9 @@ impl DbCache {
         let key =
             hex_to_32bytes(enc_key_hex).with_context(|| format!("密钥格式错误: {}", rel_key))?;
 
-        let enc_db_path = self.db_dir.join(
-            rel_key
-                .replace('\\', std::path::MAIN_SEPARATOR_STR)
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
+        let enc_db_path = self
+            .db_dir
+            .join(rel_key.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR));
         if !enc_db_path.exists() {
             anyhow::bail!("加密库不存在: {:?}", enc_db_path);
         }
@@ -529,11 +521,9 @@ impl DbCache {
     /// / [`Self::hot_conn_handle_with_snapshot`]），消除原本三处各自独立
     /// `fs::metadata` 造成的重复系统调用。
     pub(crate) fn source_snapshot(&self, rel_key: &str) -> SourceSnapshot {
-        let db_path = self.db_dir.join(
-            rel_key
-                .replace('\\', std::path::MAIN_SEPARATOR_STR)
-                .replace('/', std::path::MAIN_SEPARATOR_STR),
-        );
+        let db_path = self
+            .db_dir
+            .join(rel_key.replace(['\\', '/'], std::path::MAIN_SEPARATOR_STR));
         let wal_path = wal_path_for(&db_path);
         SourceSnapshot::capture(&db_path, &wal_path)
     }
@@ -1703,6 +1693,7 @@ mod tests {
     /// - 完全 hit / WAL 增量 → `decrypted_path` **内容不变**
     /// - 全量解密 → `crypto::full_decrypt` 把 cached file **重写为 PAGE_SZ 倍数**
     ///   （fake key 解出 4096 字节垃圾，但仍写入 — 不验证内容合法性）
+    ///
     /// 因此用 cached file 的"size 是否被改"来判断走了哪条路径。
     const ORIGINAL_CACHED_BYTES: &[u8] = b"original cached contents";
 

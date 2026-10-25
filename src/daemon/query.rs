@@ -16,6 +16,25 @@ use super::meta::{derive_status, discover_unknown_shards, Meta};
 /// 避免下游消费者（CLI --debug-source / 监控队列页）解析时突然缺字段。
 const VFS_CACHE_MODE_LABEL: &str = "vfs";
 
+/// SessionTable 一行：`(username, unread_count, summary, last_timestamp, last_msg_type, last_msg_sender, last_sender_display_name)`。
+#[cfg(test)]
+type TableSpec<'a> = (&'a str, &'a [(i64, i64, i64, &'a str)]);
+
+type SessionRow = (String, i64, Vec<u8>, i64, i64, String, String);
+
+/// 已选中会话行 + `(is_biz, 展示标签)`。
+type SelectedSessionRow = (
+    String,
+    i64,
+    Vec<u8>,
+    i64,
+    i64,
+    String,
+    String,
+    bool,
+    &'static str,
+);
+
 /// 静态编译的 Msg 表名正则，避免在热路径中重复编译
 fn msg_table_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
@@ -95,6 +114,7 @@ fn current_unknown_shards(db: &DbCache, names: &Names) -> Vec<String> {
     discover_unknown_shards(db.db_dir(), &names.msg_db_keys)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn meta_for_shards(
     scanned: usize,
     shards: &[MessageShard],
@@ -153,6 +173,7 @@ fn meta_for_shards(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn meta_for_global_query(
     scanned: usize,
     hit: usize,
@@ -294,7 +315,7 @@ pub async fn load_names(db: &DbCache) -> Result<Names> {
                     row.get::<_, i64>(3).unwrap_or(0),
                 ));
                 scanned += 1;
-                if scanned % PROGRESS_LOG_EVERY_ROWS == 0 {
+                if scanned.is_multiple_of(PROGRESS_LOG_EVERY_ROWS) {
                     eprintln!("[names] 联系人加载中... 已扫描 {} 行", scanned);
                 }
             }
@@ -357,32 +378,31 @@ pub async fn q_sessions(
         .context("无法解密 session.db")?;
 
     let limit_val = limit;
-    let rows: Vec<(String, i64, Vec<u8>, i64, i64, String, String)> =
-        tokio::task::spawn_blocking(move || {
-            let conn = conn_params.open()?;
-            let mut stmt = conn.prepare(
-                "SELECT username, unread_count, summary, last_timestamp,
+    let rows: Vec<SessionRow> = tokio::task::spawn_blocking(move || {
+        let conn = conn_params.open()?;
+        let mut stmt = conn.prepare(
+            "SELECT username, unread_count, summary, last_timestamp,
                     last_msg_type, last_msg_sender, last_sender_display_name
              FROM SessionTable
              WHERE last_timestamp > 0
              ORDER BY last_timestamp DESC LIMIT ?",
-            )?;
-            let rows = stmt
-                .query_map([limit_val as i64], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, i64>(1).unwrap_or(0),
-                        get_content_bytes(row, 2),
-                        row.get::<_, i64>(3).unwrap_or(0),
-                        row.get::<_, i64>(4).unwrap_or(0),
-                        row.get::<_, String>(5).unwrap_or_default(),
-                        row.get::<_, String>(6).unwrap_or_default(),
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            Ok::<_, anyhow::Error>(rows)
-        })
-        .await??;
+        )?;
+        let rows = stmt
+            .query_map([limit_val as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1).unwrap_or(0),
+                    get_content_bytes(row, 2),
+                    row.get::<_, i64>(3).unwrap_or(0),
+                    row.get::<_, i64>(4).unwrap_or(0),
+                    row.get::<_, String>(5).unwrap_or_default(),
+                    row.get::<_, String>(6).unwrap_or_default(),
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok::<_, anyhow::Error>(rows)
+    })
+    .await??;
 
     // 批量化：先算出本批需要群昵称的会话集合，一次性从 contact.db 热连接
     // 取出全部 map，避免循环内逐会话各开一次连接（`load_group_nickname_maps`
@@ -454,6 +474,7 @@ pub async fn q_sessions(
 }
 
 /// 查询聊天记录
+#[allow(clippy::too_many_arguments)]
 pub async fn q_history(
     db: &DbCache,
     names: &Names,
@@ -582,6 +603,7 @@ pub async fn q_history(
 }
 
 /// 搜索消息
+#[allow(clippy::too_many_arguments)]
 pub async fn q_search(
     db: &DbCache,
     names: &Names,
@@ -751,7 +773,7 @@ pub async fn q_search(
                     match search_in_table(
                         conn,
                         tname,
-                        &uname,
+                        uname,
                         is_group,
                         &names_map2,
                         group_nicknames,
@@ -1429,7 +1451,7 @@ async fn find_msg_shards(
                 // 已经丢弃了该连接，重试会重新 open()、重新读 WAL header 并续扫
                 // ——与微信并发写入（WAL restart / 事务提交瞬间）赛跑输掉的那一次，
                 // 隔 50ms 再来通常就赢了。仍失败才把带分片名的完整错误链上抛。
-                let (tables_opt, max_ts) = match hot.clone().with(&scan_once) {
+                let (tables_opt, max_ts) = match hot.clone().with(scan_once) {
                     Ok(v) => v,
                     Err(first) => {
                         eprintln!(
@@ -1437,7 +1459,7 @@ async fn find_msg_shards(
                             username_owned, rel_key_owned, first
                         );
                         std::thread::sleep(std::time::Duration::from_millis(50));
-                        hot.with(&scan_once).map_err(|e| {
+                        hot.with(scan_once).map_err(|e| {
                             e.context(format!(
                                 "扫描 {} 的消息分片 {} 失败",
                                 username_owned, rel_key_owned
@@ -2141,6 +2163,7 @@ fn sortseq_floor_ge(since: i64) -> i64 {
     since.saturating_mul(1000)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn query_messages(
     conn: &Connection,
     table: &str,
@@ -2878,9 +2901,10 @@ mod sortseq_tests {
             let mut stmt = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {}", probe))
                 .unwrap();
-            let nulls = rusqlite::params_from_iter(
-                std::iter::repeat(rusqlite::types::Value::Null).take(stmt.parameter_count()),
-            );
+            let nulls = rusqlite::params_from_iter(std::iter::repeat_n(
+                rusqlite::types::Value::Null,
+                stmt.parameter_count(),
+            ));
             let details: Vec<String> = stmt
                 .query_map(nulls, |row| row.get::<_, String>(3))
                 .unwrap()
@@ -2898,9 +2922,10 @@ mod sortseq_tests {
             let mut stmt = conn
                 .prepare(&format!("EXPLAIN QUERY PLAN {}", sql))
                 .unwrap();
-            let nulls = rusqlite::params_from_iter(
-                std::iter::repeat(rusqlite::types::Value::Null).take(stmt.parameter_count()),
-            );
+            let nulls = rusqlite::params_from_iter(std::iter::repeat_n(
+                rusqlite::types::Value::Null,
+                stmt.parameter_count(),
+            ));
             let details: Vec<String> = stmt
                 .query_map(nulls, |row| row.get::<_, String>(3))
                 .unwrap()
@@ -2942,6 +2967,7 @@ mod sortseq_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_in_table(
     conn: &Connection,
     table: &str,
@@ -3231,7 +3257,7 @@ fn decode_proto_varint(raw: &[u8], offset: usize) -> Option<(u64, usize)> {
     None
 }
 
-fn proto_len_fields<'a>(raw: &'a [u8]) -> Vec<(u64, &'a [u8])> {
+fn proto_len_fields(raw: &[u8]) -> Vec<(u64, &[u8])> {
     let mut fields = Vec::new();
     let mut idx = 0usize;
     while idx < raw.len() {
@@ -3521,7 +3547,7 @@ fn sender_label(
             return sender_display(&sender_uname, "", names, group_nicknames);
         }
         if content.contains(":\n") {
-            let raw = content.splitn(2, ":\n").next().unwrap_or("");
+            let raw = content.split(":\n").next().unwrap_or("");
             return sender_display(raw, "", names, group_nicknames);
         }
         return String::new();
@@ -3568,7 +3594,7 @@ fn decompress_or_str(data: &[u8]) -> String {
 
 fn strip_group_prefix(s: &str) -> String {
     if s.contains(":\n") {
-        s.splitn(2, ":\n").nth(1).unwrap_or(s).to_string()
+        s.split_once(":\n").map(|x| x.1).unwrap_or(s).to_string()
     } else {
         s.to_string()
     }
@@ -3606,7 +3632,7 @@ fn fmt_content(local_id: i64, local_type: i64, content: &str, is_group: bool) ->
     }
 
     let text = if is_group && content.contains(":\n") {
-        content.splitn(2, ":\n").nth(1).unwrap_or(content)
+        content.split_once(":\n").map(|x| x.1).unwrap_or(content)
     } else {
         content
     };
@@ -4281,57 +4307,46 @@ pub async fn q_unread(
     // 无 filter 时保留 LIMIT，避免重度用户的大量未读会话拖慢默认路径。
     let has_filter = filter_set.is_some();
     let limit_val = limit;
-    let rows: Vec<(String, i64, Vec<u8>, i64, i64, String, String)> =
-        tokio::task::spawn_blocking(move || {
-            let conn = conn_params.open()?;
-            let sql = if has_filter {
-                "SELECT username, unread_count, summary, last_timestamp,
+    let rows: Vec<SessionRow> = tokio::task::spawn_blocking(move || {
+        let conn = conn_params.open()?;
+        let sql = if has_filter {
+            "SELECT username, unread_count, summary, last_timestamp,
                     last_msg_type, last_msg_sender, last_sender_display_name
              FROM SessionTable WHERE unread_count > 0
              ORDER BY last_timestamp DESC"
-            } else {
-                "SELECT username, unread_count, summary, last_timestamp,
+        } else {
+            "SELECT username, unread_count, summary, last_timestamp,
                     last_msg_type, last_msg_sender, last_sender_display_name
              FROM SessionTable WHERE unread_count > 0
              ORDER BY last_timestamp DESC LIMIT ?"
-            };
-            let mut stmt = conn.prepare(sql)?;
-            let map_row = |row: &rusqlite::Row<'_>| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1).unwrap_or(0),
-                    get_content_bytes(row, 2),
-                    row.get::<_, i64>(3).unwrap_or(0),
-                    row.get::<_, i64>(4).unwrap_or(0),
-                    row.get::<_, String>(5).unwrap_or_default(),
-                    row.get::<_, String>(6).unwrap_or_default(),
-                ))
-            };
-            let rows = if has_filter {
-                stmt.query_map([], map_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            } else {
-                stmt.query_map([limit_val as i64], map_row)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?
-            };
-            Ok::<_, anyhow::Error>(rows)
-        })
-        .await??;
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let map_row = |row: &rusqlite::Row<'_>| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1).unwrap_or(0),
+                get_content_bytes(row, 2),
+                row.get::<_, i64>(3).unwrap_or(0),
+                row.get::<_, i64>(4).unwrap_or(0),
+                row.get::<_, String>(5).unwrap_or_default(),
+                row.get::<_, String>(6).unwrap_or_default(),
+            ))
+        };
+        let rows = if has_filter {
+            stmt.query_map([], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            stmt.query_map([limit_val as i64], map_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        Ok::<_, anyhow::Error>(rows)
+    })
+    .await??;
 
     // 先按原有的 filter_set + limit 语义选出"哪些行进入结果"（选择顺序、
     // 提前 break 都不变），再对选中的行批量取群昵称——批量化不改变选择
     // 集合本身，只把"逐行取昵称"挪到选择完成之后一次性做。
-    let mut selected: Vec<(
-        String,
-        i64,
-        Vec<u8>,
-        i64,
-        i64,
-        String,
-        String,
-        bool,
-        &'static str,
-    )> = Vec::new();
+    let mut selected: Vec<SelectedSessionRow> = Vec::new();
     for (username, unread, summary_bytes, ts, msg_type, sender, sender_name) in rows {
         let chat_type = chat_type_of(&username, names);
         if let Some(ref set) = filter_set {
@@ -5174,13 +5189,14 @@ mod aggregate_new_messages_by_shard_tests {
     fn build_shard_with_message_tables(
         enc_path: &std::path::Path,
         key: &[u8; 32],
-        tables: &[(&str, &[(i64, i64, i64, &str)])],
+        tables: &[TableSpec<'_>],
     ) {
         // 先转成拥有型数据，一次性 move 进 `build_encrypted_fixture_with`
         // 的 `FnOnce(&Connection)` 回调（回调不能借用外部传入的 `&[...]`
         // 引用，闭包本身要求 `'static`-free 但仍需在回调内部拥有自己的
         // 数据副本，避免生命周期纠缠)。
-        let tables_owned: Vec<(String, Vec<(i64, i64, i64, String)>)> = tables
+        type OwnedTable = (String, Vec<(i64, i64, i64, String)>);
+        let tables_owned: Vec<OwnedTable> = tables
             .iter()
             .map(|(name, rows)| {
                 (
@@ -6203,8 +6219,7 @@ pub async fn q_sns_notifications(
             return Ok::<_, anyhow::Error>(HashMap::new());
         }
         let conn = conn_params3.open()?;
-        let placeholders = std::iter::repeat("?")
-            .take(feed_ids_clone.len())
+        let placeholders = std::iter::repeat_n("?", feed_ids_clone.len())
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
@@ -6657,10 +6672,7 @@ struct BizArticle {
 fn parse_biz_xml_items(recv_time: i64, account_username: &str, xml: &str) -> Vec<BizArticle> {
     let mut items = Vec::new();
     let mut search_from = 0;
-    loop {
-        let Some(item_start) = xml[search_from..].find("<item>") else {
-            break;
-        };
+    while let Some(item_start) = xml[search_from..].find("<item>") {
         let abs_start = search_from + item_start;
         let Some(item_end) = xml[abs_start..].find("</item>") else {
             break;
@@ -6705,9 +6717,8 @@ fn extract_cdata(xml: &str, tag: &str) -> Option<String> {
     let start = xml.find(&open)? + open.len();
     let end = xml[start..].find(&close)?;
     let inner = xml[start..start + end].trim();
-    if inner.starts_with("<![CDATA[") {
+    if let Some(body) = inner.strip_prefix("<![CDATA[") {
         // inner = `<![CDATA[content]]>` → strip 9-char `<![CDATA[` prefix + 3-char `]]>` suffix
-        let body = &inner[9..];
         // Strip `]]>` (normal) or `]]` (edge case)
         let cdata_end = b"]]>";
         let cdata_end2 = b"]]";
@@ -6972,6 +6983,7 @@ pub async fn q_biz_articles(
 
 /// 列出某会话内的附件消息（当前仅 image）。返回每条的 `attachment_id`，
 /// 后续传给 `Extract` 才真正读 message_resource.db + 解密 .dat。
+#[allow(clippy::too_many_arguments)]
 pub async fn q_attachments(
     db: &DbCache,
     names: &Names,

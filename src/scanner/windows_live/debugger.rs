@@ -145,7 +145,7 @@ pub fn run_capture(db_dir: &Path, mode: LiveMode, existing: &[KeyEntry]) -> Resu
                 break;
             }
             idle_ticks += 1;
-            if idle_ticks % 20 == 0 {
+            if idle_ticks.is_multiple_of(20) {
                 eprintln!(
                     "… 仍在等待微信开库（已 {}/{}）。可在微信里打开会话 / 等同步；Ctrl-C 结束。",
                     done.len(),
@@ -503,8 +503,7 @@ fn find_all_wechat_pids() -> Vec<u32> {
     unsafe {
         if Process32First(snap, &mut entry).is_ok() {
             loop {
-                let name = std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr() as *const i8)
-                    .to_string_lossy();
+                let name = std::ffi::CStr::from_ptr(entry.szExeFile.as_ptr()).to_string_lossy();
                 if name.eq_ignore_ascii_case("Weixin.exe") {
                     pids.push(entry.th32ProcessID);
                 }

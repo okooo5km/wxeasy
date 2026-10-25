@@ -628,6 +628,7 @@ pub fn build_wal_index_cached(
 ///   `FILE_FLAG_SEQUENTIAL_SCAN` 之类的访问模式提示：该句柄的主要用途是
 ///   `read_raw_page` 的随机 seek，SEQUENTIAL_SCAN 会让 cache manager 对它
 ///   激进 evict-behind，反伤后续随机读。
+///
 /// 生产路径已改走 [`build_wal_index_cached`]；这个无缓存版本保留给单测与
 /// oracle 对拍（每次全量扫描、无跨调用状态，是增量版的对拍基准）。
 #[cfg_attr(not(test), allow(dead_code))]
@@ -1125,7 +1126,7 @@ mod tests {
         // （2 帧的覆盖页，frames_total 近似记为 2）+ 只续扫 1 个新帧 ⇒ 3，
         // 而不是重扫全部 3 帧后从 0 累积——证明没有全量重扫。
         assert_eq!(b.index.covered_page_count(), 3);
-        assert_eq!(b.index.offset_for(9).is_some(), true);
+        assert!(b.index.offset_for(9).is_some());
         assert_eq!(b.index.last_commit_pgcnt(), Some(3));
         // 与无缓存全量扫描对拍：内容级一致。
         let oracle = build_wal_index(&path).unwrap().unwrap();

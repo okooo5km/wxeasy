@@ -175,7 +175,7 @@ mod tests {
             0xde, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a,
             0x0b, 0x0c,
         ];
-        fs::write(&path, &header).unwrap();
+        fs::write(&path, header).unwrap();
 
         let salt = read_db_salt(&path).expect("加密 DB 应返回 Some");
         assert_eq!(salt, "deadbeef0102030405060708090a0b0c");
@@ -202,7 +202,7 @@ mod tests {
         let dir = make_temp_dir("salt-16");
         let path = dir.join("exact.db");
         let header = [0xabu8; 16];
-        fs::write(&path, &header).unwrap();
+        fs::write(&path, header).unwrap();
 
         let salt = read_db_salt(&path).unwrap();
         // 0xab × 16 → "ab" × 16 = 32 chars
@@ -235,7 +235,7 @@ mod tests {
     fn test_collect_db_salts_finds_encrypted() {
         let dir = make_temp_dir("collect-enc");
         let header = [0x11u8; 16];
-        fs::write(dir.join("msg.db"), &header).unwrap();
+        fs::write(dir.join("msg.db"), header).unwrap();
 
         let salts = collect_db_salts(&dir);
         assert_eq!(salts.len(), 1);
@@ -251,8 +251,8 @@ mod tests {
         fs::create_dir_all(&subdir).unwrap();
 
         let header = [0xaau8; 16];
-        fs::write(dir.join("root.db"), &header).unwrap();
-        fs::write(subdir.join("nested.db"), &header).unwrap();
+        fs::write(dir.join("root.db"), header).unwrap();
+        fs::write(subdir.join("nested.db"), header).unwrap();
         fs::write(dir.join("ignored.txt"), b"text file").unwrap();
 
         let salts = collect_db_salts(&dir);
@@ -268,9 +268,9 @@ mod tests {
     fn test_collect_db_salts_ignores_non_db_extensions() {
         let dir = make_temp_dir("collect-ext");
         let header = [0xbbu8; 16];
-        fs::write(dir.join("data.txt"), &header).unwrap();
-        fs::write(dir.join("data.json"), &header).unwrap();
-        fs::write(dir.join("data.sqlite"), &header).unwrap();
+        fs::write(dir.join("data.txt"), header).unwrap();
+        fs::write(dir.join("data.json"), header).unwrap();
+        fs::write(dir.join("data.sqlite"), header).unwrap();
 
         assert!(collect_db_salts(&dir).is_empty(), "非 .db 文件应被忽略");
         fs::remove_dir_all(&dir).ok();
@@ -279,9 +279,9 @@ mod tests {
     #[test]
     fn test_collect_db_salts_multiple_files_unique_salts() {
         let dir = make_temp_dir("collect-multi");
-        fs::write(dir.join("a.db"), &[0x11u8; 16]).unwrap();
-        fs::write(dir.join("b.db"), &[0x22u8; 16]).unwrap();
-        fs::write(dir.join("c.db"), &[0x33u8; 16]).unwrap();
+        fs::write(dir.join("a.db"), [0x11u8; 16]).unwrap();
+        fs::write(dir.join("b.db"), [0x22u8; 16]).unwrap();
+        fs::write(dir.join("c.db"), [0x33u8; 16]).unwrap();
 
         let salts = collect_db_salts(&dir);
         assert_eq!(salts.len(), 3);

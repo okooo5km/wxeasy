@@ -105,6 +105,7 @@ pub fn locate_key_schedule_funcs(dll_path: &Path, take_top: usize) -> Result<Vec
 /// 解析 .pdata：x64 `RUNTIME_FUNCTION` 数组，每 12 字节
 /// `(begin_rva: u32, end_rva: u32, unwind_rva: u32)`，小端。返回按 begin 排序的
 /// `(begin, end)` 区间。
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn parse_pdata(pdata: Option<&[u8]>) -> Vec<(u32, u32)> {
     let mut out = Vec::new();
     if let Some(d) = pdata {

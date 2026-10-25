@@ -483,12 +483,11 @@ fn windows_process_exists(pid: u32) -> bool {
         Err(_) => return false,
     };
     let mut code: u32 = 0;
-    let alive = unsafe {
+    unsafe {
         let ok = GetExitCodeProcess(handle, &mut code).is_ok();
         let _ = CloseHandle(handle);
         ok && code == STILL_ACTIVE
-    };
-    alive
+    }
 }
 
 /// 向 daemon 发送请求并返回响应

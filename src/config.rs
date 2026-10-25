@@ -73,7 +73,7 @@ fn find_config_file() -> Result<PathBuf> {
         .ok()
         .and_then(|exe| exe.parent().map(PathBuf::from));
     let cli_home = cli_home_dir();
-    let home_dir = (cli_home != PathBuf::from("/tmp")).then_some(cli_home.as_path());
+    let home_dir = (cli_home != *"/tmp").then_some(cli_home.as_path());
 
     if let Some(path) = find_existing_config_path(cwd_dir.as_deref(), exe_dir.as_deref(), home_dir)
     {

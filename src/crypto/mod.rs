@@ -60,8 +60,9 @@ pub fn decrypt_page(enc_key: &[u8; 32], page_data: &[u8], pgno: u32) -> Result<V
 }
 
 /// AES-256-CBC 解密（不去除 padding，SQLCipher 不使用 PKCS#7 padding）
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn aes_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>> {
-    if data.is_empty() || data.len() % 16 != 0 {
+    if data.is_empty() || !data.len().is_multiple_of(16) {
         bail!("密文长度不是 AES 块大小的倍数: {}", data.len());
     }
     // 将 &[u8] 复制为 Block 数组，避免 unsafe from_raw_parts_mut
@@ -80,6 +81,7 @@ fn aes_cbc_decrypt(key: &[u8; 32], iv: &[u8; 16], data: &[u8]) -> Result<Vec<u8>
 ///   加密侧无需还原）；
 /// - `pgno != 1` 时，参与加密的是 `logical_page[0..PAGE_SZ-RESERVE_SZ]`。
 #[cfg(test)]
+#[allow(clippy::chunks_exact_to_as_chunks)]
 pub(crate) fn encrypt_page(
     enc_key: &[u8; 32],
     logical_page: &[u8],
@@ -172,7 +174,7 @@ pub fn full_decrypt(db_path: &Path, out_path: &Path, enc_key: &[u8; 32]) -> Resu
     }
 
     let mut output = std::fs::File::create(out_path)?;
-    let total_pages = (file_size + PAGE_SZ - 1) / PAGE_SZ;
+    let total_pages = file_size.div_ceil(PAGE_SZ);
     let mut page_buf = vec![0u8; PAGE_SZ];
 
     for pgno in 1..=total_pages {

@@ -102,9 +102,10 @@ pub fn decode(file_bytes: &[u8], key: V2KeyMaterial<'_>) -> Result<DecodedImage>
 ///
 /// 不引第三方 ECB 包；ECB 本身就是 block-by-block，手工跑就行。
 /// PKCS7 padding 由本函数最后一段做 strict 校验：长度 1..=16，且尾部全是同值字节。
+#[allow(clippy::chunks_exact_to_as_chunks)]
 fn aes_ecb_decrypt_pkcs7(key: &[u8; 16], cipher: &[u8]) -> Result<Vec<u8>> {
     use aes::cipher::{generic_array::GenericArray, BlockDecrypt, KeyInit};
-    if cipher.is_empty() || cipher.len() % 16 != 0 {
+    if cipher.is_empty() || !cipher.len().is_multiple_of(16) {
         bail!("AES 输入长度 {} 不是 16 的倍数", cipher.len());
     }
     let aes = aes::Aes128::new(key.into());

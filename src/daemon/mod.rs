@@ -147,7 +147,7 @@ async fn async_run() -> Result<()> {
         tokio::spawn(async move {
             eprintln!("[daemon] 后台加载联系人...");
             let t0 = std::time::Instant::now();
-            let names_raw = query::load_names(&*db_for_names).await.unwrap_or_else(|e| {
+            let names_raw = query::load_names(&db_for_names).await.unwrap_or_else(|e| {
                 eprintln!("[daemon] 加载联系人失败: {}", e);
                 query::Names {
                     map: HashMap::new(),

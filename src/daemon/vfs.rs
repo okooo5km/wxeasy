@@ -631,7 +631,7 @@ pub fn open_conn_with_stats(
 /// 全局 VFS 注册表里留下一条新记录，长期调用会无限增长，只适合"跑一次就退出
 /// 的进程"（例如 oracle 对拍测试）。目前只被 `#[cfg(test)]` 使用，非 test
 /// 构建下报 dead_code 属预期。
-#[cfg_attr(not(test), allow(dead_code))]
+#[allow(dead_code)]
 pub fn open_fresh_with_stats(
     enc_db_path: &Path,
     key: [u8; 32],

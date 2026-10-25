@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn test_is_hex_char_invalid() {
-        for c in [b'g', b'G', b'x', b'\'', b' ', b'\0', b'z', b'Z'] {
+        for c in *b"gGx' \0zZ" {
             assert!(!is_hex_char(c), "expected non-hex: {}", c as char);
         }
     }
@@ -431,7 +431,7 @@ mod tests {
     #[test]
     fn test_search_pattern_too_short() {
         // 缓冲区太小，无法容纳完整模式
-        let buf = [b'x', b'\'', b'a', b'b'];
+        let buf = *b"x'ab";
         let mut results = Vec::new();
         search_pattern(&buf, &mut results);
         assert!(results.is_empty());
